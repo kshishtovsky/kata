@@ -292,6 +292,28 @@ void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0
 
 // ------------------------------------------------------------- q4_K kernels
 
+void gemv_q4_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * out,
+                             const block_q4_K * const * w, const block_q8_K * const * x,
+                             ThreadPool & pool) {
+    if (n_batch == 0 || rows == 0) return;
+    const GemvKNfn fn = gemv_q4_K_q8_K_best();
+    const unsigned nt = pool.size();
+    const size_t total = n_batch * rows;
+    const size_t chunk = (total + nt - 1) / nt;
+    const size_t nb = cols / QK_K;
+    pool.run([&](unsigned tid) {
+        size_t r = (size_t)tid * chunk;
+        const size_t rend = std::min(total, r + chunk);
+        while (r < rend) {
+            const size_t b = r / rows;
+            const size_t lo = r - b * rows;
+            const size_t hi = std::min(rows, lo + (rend - r));
+            fn(hi - lo, cols, out + b * rows + lo, w[b] + lo * nb, x[b]);
+            r += hi - lo;
+        }
+    });
+}
+
 void gemv_q4_K_q8_K_ref(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
     const size_t nb = cols / QK_K;
     for (size_t r = 0; r < rows; ++r) out[r] = vec_dot_q4_K_q8_K_ref(cols, w + r * nb, x);
@@ -500,6 +522,28 @@ void gemv_q6_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q6_K *
         const size_t r0 = (size_t)tid * chunk;
         const size_t r1 = std::min(rows, r0 + chunk);
         if (r0 < r1) fn(r1 - r0, cols, out + r0, w + r0 * (cols / QK_K), x);
+    });
+}
+
+void gemv_q6_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * out,
+                             const block_q6_K * const * w, const block_q8_K * const * x,
+                             ThreadPool & pool) {
+    if (n_batch == 0 || rows == 0) return;
+    const GemvK6fn fn = gemv_q6_K_q8_K_best();
+    const unsigned nt = pool.size();
+    const size_t total = n_batch * rows;
+    const size_t chunk = (total + nt - 1) / nt;
+    const size_t nb = cols / QK_K;
+    pool.run([&](unsigned tid) {
+        size_t r = (size_t)tid * chunk;
+        const size_t rend = std::min(total, r + chunk);
+        while (r < rend) {
+            const size_t b = r / rows;
+            const size_t lo = r - b * rows;
+            const size_t hi = std::min(rows, lo + (rend - r));
+            fn(hi - lo, cols, out + b * rows + lo, w[b] + lo * nb, x[b]);
+            r += hi - lo;
+        }
     });
 }
 

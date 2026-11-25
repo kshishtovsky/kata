@@ -169,6 +169,28 @@ struct Model::Impl {
         }
     }
 
+    // `n` matvecs sharing one already-quantised activation, issued as a single
+    // pool wake-up. This is the fix for EXP-0020: 1536-row calls are too small
+    // to amortise a fan-out.
+    void mm_batch(uint32_t type, size_t n, size_t rows, size_t cols, float * out,
+                  const void * const * w, const block_q8_K * const * x) {
+        const auto q0 = std::chrono::steady_clock::now();
+        if (type == 12) {
+            const block_q4_K * wp[8];
+            for (size_t i = 0; i < n; ++i) wp[i] = static_cast<const block_q4_K *>(w[i]);
+            gemv_q4_K_q8_K_mt_batch(n, rows, cols, out, wp, x, pool);
+        } else {
+            const block_q6_K * wp[8];
+            for (size_t i = 0; i < n; ++i) wp[i] = static_cast<const block_q6_K *>(w[i]);
+            gemv_q6_K_q8_K_mt_batch(n, rows, cols, out, wp, x, pool);
+        }
+        const auto q1 = std::chrono::steady_clock::now();
+        if (prof) {
+            t_mm += std::chrono::duration<double, std::milli>(q1 - q0).count();
+            n_mm += n;
+        }
+    }
+
     void embed(uint32_t token) {
         if (t_tok_embd != 14) throw std::runtime_error("kata: token_embd must be q6_K");
         const size_t nb = n_embd / QK_K;
@@ -284,28 +306,69 @@ struct Model::Impl {
         }
 
         std::fill(out.begin(), out.end(), 0.0f);
-        // One expert's matrix is a slice of the stacked tensor.
+        // One expert's matrix is a slice of the stacked tensor. The four experts
+        // share one activation row, so gate and up go out as one batched call of
+        // 8 matvecs instead of 8 separate pool wake-ups (EXP-0021).
         const size_t sb_g = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ge);
         const size_t sb_u = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ue);
         const size_t sb_d = n_embd * n_ff_exp / QK_K * ggml_type_size(L.t_de);
-        for (size_t i = 0; i < n_expert_used; ++i) {
+        const size_t nu = n_expert_used;
+        const uint8_t * bg = static_cast<const uint8_t *>(L.gate_exps);
+        const uint8_t * bu = static_cast<const uint8_t *>(L.up_exps);
+        const uint8_t * bd = static_cast<const uint8_t *>(L.down_exps);
+
+        // The batched path bypasses mm(), so the shared activation row has to be
+        // quantised here.
+        const auto q0 = std::chrono::steady_clock::now();
+        quantize_row_q8_K(in.data(), aq.data(), n_embd);
+        if (prof) t_q += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count();
+        const void * wgu[8];
+        const block_q8_K * xgu[8];
+        for (size_t i = 0; i < nu; ++i) {
             const uint32_t e = sel[i].second;
-            const void * wg = static_cast<const uint8_t *>(L.gate_exps) + e * sb_g;
-            const void * wu = static_cast<const uint8_t *>(L.up_exps) + e * sb_u;
-            const void * wd = static_cast<const uint8_t *>(L.down_exps) + e * sb_d;
-            mm(L.t_ge, n_ff_exp, n_embd, ffn_gate.data(), wg, in.data());
-            mm(L.t_ue, n_ff_exp, n_embd, ffn_up.data(), wu, in.data());
-            dump(("rg" + std::to_string(i)).c_str(), ffn_gate.data(), n_ff_exp);
-            dump(("ru" + std::to_string(i)).c_str(), ffn_up.data(), n_ff_exp);
-            silu_inplace(ffn_gate.data(), n_ff_exp);
-            for (size_t j = 0; j < n_ff_exp; ++j) ffn_gate[j] *= ffn_up[j];
-            mm(L.t_de, n_embd, n_ff_exp, moe_acc.data(), wd, ffn_gate.data());
+            wgu[2 * i]     = bg + e * sb_g;
+            wgu[2 * i + 1] = bu + e * sb_u;
+            xgu[2 * i] = xgu[2 * i + 1] = aq.data();
+        }
+        // ffn_gate holds the gate results of all experts packed [i*n_ff_exp + j].
+        std::vector<float> gu(2 * nu * n_ff_exp);
+        if (L.t_ge == L.t_ue) {
+            mm_batch(L.t_ge, 2 * nu, n_ff_exp, n_embd, gu.data(), wgu, xgu);
+        } else {
+            for (size_t i = 0; i < nu; ++i) {
+                mm_batch(L.t_ge, 1, n_ff_exp, n_embd, gu.data() + (2 * i) * n_ff_exp, wgu + 2 * i, xgu + 2 * i);
+                mm_batch(L.t_ue, 1, n_ff_exp, n_embd, gu.data() + (2 * i + 1) * n_ff_exp, wgu + 2 * i + 1, xgu + 2 * i + 1);
+            }
+        }
+
+        // Down projection: each expert now has a different activation, so those
+        // four still share one call, with per-slot quantised copies.
+        std::vector<block_q8_K> aq_down(nu * (n_ff_exp / QK_K));
+        std::vector<const block_q8_K *> xd(nu);
+        std::vector<const void *> wd(nu);
+        for (size_t i = 0; i < nu; ++i) {
+            float * g = gu.data() + (2 * i) * n_ff_exp;
+            float * u = gu.data() + (2 * i + 1) * n_ff_exp;
+            silu_inplace(g, n_ff_exp);
+            for (size_t j = 0; j < n_ff_exp; ++j) g[j] *= u[j];
+            block_q8_K * dst = aq_down.data() + i * (n_ff_exp / QK_K);
+            quantize_row_q8_K(g, dst, n_ff_exp);
+            xd[i] = dst;
+            wd[i] = bd + sel[i].second * sb_d;
             if (!dump_dir.empty() && il == 2) {
-                dump(("xgate" + std::to_string(i)).c_str(), ffn_gate.data(), n_ff_exp);
-                dump(("xdown" + std::to_string(i)).c_str(), moe_acc.data(), n_embd);
+                dump(("xgate" + std::to_string(i)).c_str(), g, n_ff_exp);
+            }
+        }
+        std::vector<float> down(nu * n_embd);
+        mm_batch(L.t_de, nu, n_embd, n_ff_exp, down.data(), wd.data(), xd.data());
+
+        for (size_t i = 0; i < nu; ++i) {
+            if (!dump_dir.empty() && il == 2) {
+                dump(("xdown" + std::to_string(i)).c_str(), down.data() + i * n_embd, n_embd);
             }
             const float wj = w[i] / wsum;
-            for (size_t j = 0; j < n_embd; ++j) out[j] += wj * moe_acc[j];
+            const float * d = down.data() + i * n_embd;
+            for (size_t j = 0; j < n_embd; ++j) out[j] += wj * d[j];
         }
     }
 

@@ -193,6 +193,24 @@ TEST(GemvK, Avx2MatchesRef) {
     for (size_t r = 0; r < rows; ++r) EXPECT_NEAR(got[r], want[r], 1e-4 * std::max(1.0, double(std::fabs(want[r])))) << "row " << r;
 }
 
+TEST(GemvK, BatchDriverMatchesPerMatrixLoop) {
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    std::mt19937 g(29);
+    const size_t cols = 4 * kata::QK_K, rows = 13, n = 4;
+    auto w = random_q4_K(n * rows * 4, g);
+    auto x = random_q8_K(4, cols, g);
+    kata::ThreadPool pool(3);
+    std::vector<float> want(n * rows), got(n * rows);
+    for (size_t b = 0; b < n; ++b)
+        kata::gemv_q4_K_q8_K_mt(rows, cols, want.data() + b * rows, w.data() + b * rows * 4, x.data(), pool);
+    std::vector<const kata::block_q4_K *> wp(n);
+    std::vector<const kata::block_q8_K *> xp(n, x.data());
+    for (size_t b = 0; b < n; ++b) wp[b] = w.data() + b * rows * 4;
+    kata::gemv_q4_K_q8_K_mt_batch(n, rows, cols, got.data(), wp.data(), xp.data(), pool);
+    for (size_t i = 0; i < n * rows; ++i)
+        EXPECT_NEAR(got[i], want[i], 1e-5 * std::max(1.0, double(std::fabs(want[i])))) << "i " << i;
+}
+
 TEST(GemvK, SubnormalSuperblockScales) {
     // Regression for the f16 exponent bug: rows whose super-block scales are
     // f16 subnormals used to come out at half magnitude.

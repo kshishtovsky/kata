@@ -41,6 +41,18 @@ void gemv_q6_K_q8_K_avx2  (size_t rows, size_t cols, float * out, const block_q6
 GemvK6fn gemv_q6_K_q8_K_best();
 void gemv_q6_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x, ThreadPool & pool);
 
+// Batched driver: `n_batch` independent matrices of `rows` each, each with its
+// own weight base and its own activation row. The whole batch is split across
+// workers by global row index, so one pool wake-up covers `n_batch` matvecs.
+// Workers are the scarce resource here: a 1536-row call moves ~1.5 MB and a
+// worker is still starting up when the slice ends.
+void gemv_q4_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * out,
+                             const block_q4_K * const * w, const block_q8_K * const * x,
+                             ThreadPool & pool);
+void gemv_q6_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * out,
+                             const block_q6_K * const * w, const block_q8_K * const * x,
+                             ThreadPool & pool);
+
 // Multi-threaded driver. Rows are split into one contiguous block per worker so
 // each worker streams a single region of the weight matrix (TLB friendly).
 void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x, ThreadPool & pool);

@@ -1349,3 +1349,66 @@ activation row and one 1536-wide output row, so they can be issued as one call
 over a concatenated 4x1536 view when the four expert matrices are contiguous —
 they are not in the GGUF, so this needs a gather into a per-layer staging buffer,
 or a row-count-multiplied kernel that takes 4 base pointers.
+
+---
+
+## EXP-0021: batched expert GEMV — one pool wake-up per expert group
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** EXP-0020 showed the engine issues 503 GEMV calls per token and
+each 1536-row call moves only ~1.5 MB, so workers finish before they are all
+scheduled. Issuing the four experts of a layer (gate+up = 8 matvecs, down = 4
+matvecs) as a single call over a row-indexed batch should recover the ~47 ->
+80 GB/s gap measured in `/tmp/moebench.cpp`.
+
+### Implementation
+- `gemv_q4_K_q8_K_mt_batch()` / `gemv_q6_K_q8_K_mt_batch()` in `src/gemv.cpp`:
+  split `total = n_batch * rows` by global row index, derive `b = r / rows`,
+  `lo = r - b*rows`, `hi = min(rows, lo + (rend - r))`, call
+  `fn(hi-lo, cols, out + b*rows + lo, w[b] + lo*nb, x[b])`.
+- `Impl::mm_batch()` in `src/model.cpp`, local `wp[8]` per type.
+- `moe_ffn` issues gate+up of all 4 experts as one `2*nu` batch when
+  `t_ge == t_ue`, then SiLU + product, then the four down-projections as one
+  `nu` batch.
+
+### Bug found
+The batched path bypasses `mm()`, so the shared activation row was never
+quantised and `ffn2` error jumped to 6.5e-03 (whole tensor), argmax 14783/4361.
+Fix: `quantize_row_q8_K(in.data(), aq.data(), n_embd);` at the top of `moe_ffn`.
+After the fix `ffn_moe_out-2` = 3.78e-04 and single-token argmax is 785, matching
+the llama.cpp reference.
+
+### Benchmark
+Kernel level (`/tmp/b2.cpp`, 4 matrices of 1536x2048, one shared activation):
+| threads | batch | loop | speedup |
+|---|---|---|---|
+| 4 | 97.0 us (73.0 GB/s) | 107.8 us (65.6 GB/s) | 1.11x |
+| 8 | 61.1 us (115.9 GB/s) | 85.7 us (82.6 GB/s) | 1.40x |
+| 16 | 62.8 us (112.8 GB/s) | 107.7 us (65.7 GB/s) | 1.72x |
+
+End to end, 8-token prompt, `KATA_PROF=1`:
+| threads | mm before | mm after | total before | total after |
+|---|---|---|---|---|
+| 4 | 48.3 us/call, 24.3 ms | — | 32.47 ms | 32.2-33.4 ms |
+| 8 | 46-52 us/call, 23.2-26.4 ms | 40.7-44.5 us/call, 20.5-22.4 ms | 32.7-36.6 ms | 28.5-31.2 ms |
+| 16 | — | 36.5-40.0 us/call, 18.3-20.1 ms | — | **26.4-28.8 ms** |
+
+The kernel-level win is real but only ~15% reaches wall clock, because GEMV is
+already 74% of the token and the batch only covers the MoE part of it.
+
+### Bottleneck analysis
+`perf record -g` at 16 threads: 52.66% `gemv_q4_K_q8_K_avx2_impl`, 23.64%
+`gemv_q6_K_q8_K_avx2_impl`, 2.39% `native_queued_spin_lock_slowpath`. So after
+batching the pool lock is a visible 2.4% — the fan-out cost has not disappeared,
+it has moved into contention. 76% of the token is now the two quantised GEMV
+kernels themselves, which are already at 1.006x and 1.03x of llama.cpp.
+
+### Conclusion
+Keep. 8 threads 32.7-36.6 -> 28.5-31.2 ms/token, 16 threads best at 26.4-28.8
+ms/token (was 34-36). Remaining time is the kernels, not the runtime.
+
+### Next
+The engine is now kernel-bound at ~1.0x of llama.cpp per kernel, which means
+wall-clock gains have to come from not doing the work at all (batching across
+tokens, prefill) rather than from making the kernel faster.
