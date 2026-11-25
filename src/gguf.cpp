@@ -223,6 +223,7 @@ void GgufFile::open(const std::string & path) {
         else if (key == "general.alignment" && v.kind == MetaValue::Kind::UInt) alignment_ = (uint32_t)v.u;
         else if (v.kind == MetaValue::Kind::UInt) int_meta_.emplace_back(key, (uint32_t)v.u);
         else if (v.kind == MetaValue::Kind::Int) int_meta_.emplace_back(key, v.i < 0 ? 0u : (uint32_t)v.i);
+        else if (v.kind == MetaValue::Kind::Float) float_meta_.emplace_back(key, v.f);
     }
 
     if (alignment_ == 0 || (alignment_ & (alignment_ - 1))) alignment_ = 32;
@@ -270,7 +271,13 @@ const void * GgufFile::data(const GgufTensor & t) const {
 
 bool GgufFile::has_key(const std::string & key) const {
     for (const auto & kv : int_meta_) if (kv.first == key) return true;
+    for (const auto & kv : float_meta_) if (kv.first == key) return true;
     return false;
+}
+
+float GgufFile::f32(const std::string & key) const {
+    for (const auto & kv : float_meta_) if (kv.first == key) return kv.second;
+    throw std::runtime_error("gguf: missing key " + key);
 }
 
 uint32_t GgufFile::u32(const std::string & key) const {

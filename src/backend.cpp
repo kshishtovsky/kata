@@ -3,6 +3,7 @@
 #include "kata/cpu.h"
 #include "kata/gemv.h"
 #include "kata/norm.h"
+#include "kata/rope.h"
 
 namespace kata {
 namespace {
@@ -16,6 +17,10 @@ public:
 
     void rms_norm(const RmsNormArgs & a) const override {
         kata::rms_norm(a.rows, a.cols, a.out, a.x, a.w, a.eps);
+    }
+
+    void rope(const RopeArgs & a) const override {
+        kata::rope(a.n_heads, a.head_dim, a.x, a.pos, a.theta_base, a.interleaved);
     }
 
     void gemv_q4_K_q8_K(const GemvArgs & a) const override {

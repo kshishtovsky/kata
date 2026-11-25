@@ -36,6 +36,7 @@ public:
     const void * data(const GgufTensor & t) const;
 
     uint32_t u32(const std::string & key) const;
+    float f32(const std::string & key) const;
     bool has_key(const std::string & key) const;
 
 private:
@@ -46,6 +47,7 @@ private:
     std::string architecture_;
     std::vector<GgufTensor> tensors_;
     std::vector<std::pair<std::string, uint32_t>> int_meta_;
+    std::vector<std::pair<std::string, float>> float_meta_;
 };
 
 // ggml type table, limited to the types kata can reason about.

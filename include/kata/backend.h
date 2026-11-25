@@ -22,6 +22,18 @@ struct RmsNormArgs {
     float eps;
 };
 
+// Rotary position embedding applied in place to one token's head vectors.
+struct RopeArgs {
+    float * x;          // [n_heads * head_dim]
+    size_t n_heads;
+    size_t head_dim;
+    size_t pos;
+    float theta_base;
+    // Interleaved (pairs 2i,2i+1) vs half-split (pairs i,i+head_dim/2).
+    // Not interchangeable: the wrong choice keeps norms valid and quality broken.
+    bool interleaved;
+};
+
 // Quantised matrix-vector products. `out[r] = dot(W[r], x)`.
 struct GemvArgs {
     size_t rows;
@@ -41,6 +53,7 @@ public:
     virtual bool available() const = 0;
 
     virtual void rms_norm(const RmsNormArgs &) const = 0;
+    virtual void rope(const RopeArgs &) const = 0;
 
     virtual void gemv_q4_K_q8_K(const GemvArgs &) const = 0;
     virtual void gemv_q6_K_q8_K(const GemvArgs &) const = 0;

@@ -11,6 +11,7 @@
 | EXP-0007 | q4_K multi-row tiling + multi-thread driver | PASSED (threads) / REJECTED (tiling) | tiling 13.5 vs 26.7 GB/s; 1-2 threads 1.05-1.08x, 4 threads 0.99x (DRAM saturated) |
 | EXP-0008 | q6_K GEMV (22.3% of the shipped models) | PASSED | 1.03x ggml at 35.92 GB/s; caught a two-sub-block-per-maddubs scale bug |
 | EXP-0009 | RMSNorm + backend boundary | PASSED | 5.5-6.3x over scalar, 97-112 GB/s; coverage tool was under-reporting by 19pp |
+| EXP-0010 | RoPE | PASSED | 1.05-1.15x over scalar after caching the frequency table; both layouts supported |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -635,3 +636,71 @@ real forward pass says otherwise.
 
 RoPE with a real implementation, then a single transformer block wired through the
 backend so a full forward pass can be profiled end to end.
+
+## EXP-0010 — RoPE
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** RoPE at decode is ~4k floats in and out, so it is small next to a
+GEMV row. The goal is correctness on both pairing layouts, not speed; if the
+vector path were not measurably better it should not exist.
+
+### The two layouts are not interchangeable
+
+| layout | pairs | used by |
+|---|---|---|
+| `interleaved=true` | `(2i, 2i+1)` | `LLAMA_ROPE_TYPE_NORM`, older models |
+| `interleaved=false` | `(i, i + head_dim/2)` | `LLAMA_ROPE_TYPE_NEOX` |
+
+`LLM_ARCH_LFM2` / `LLM_ARCH_LFM2MOE` / `LLM_ARCH_LFM3` are listed under
+`return LLAMA_ROPE_TYPE_NEOX;` in `/home/medovarov/lcpp-base/src/llama-model.cpp:4564-4590`,
+so the shipped LFM2.5 models need the half-split form. Picking the wrong one keeps
+every output norm valid, so nothing looks corrupt — generation quality just rots.
+
+Frequencies come from the model, not a constant: `lfm2moe.rope.freq_base = 10000000`
+(1e7, not the 10000 of older models). Read via a new `GgufFile::f32(key)`.
+
+### Implementation
+
+- `include/kata/rope.h`, `src/rope.cpp`: `rope_ref`, `rope_avx2`, `rope`,
+  `rope_tables`. Added to `Backend` as `virtual void rope(const RopeArgs&)` — this
+  time with a real body. Angles are computed in `double`, since at pos = 128k the
+  float exponent is visibly wrong.
+- Non-interleaved pairs are two contiguous halves, so the vector path is plain
+  loads at `v+i` and `v+i+head_dim/2`. Interleaved needs a deinterleave: 8
+  `_mm256_setr_ps` gathers, two rotations, then `_mm256_unpacklo_ps` /
+  `_mm256_unpackhi_ps` / `_mm256_permute2f128_ps`. That costs ~10% vs neox.
+
+### Bug caught by the tests
+
+`angles()` divided the exponent by `half * 2` instead of `head_dim`. Identical for
+even head_dim, wrong for odd — `Rope.MatchesDefinitionBothLayouts` failed at
+`head_dim=7` against an independently written definition. Fixed by passing
+`head_dim` and using `-2.0 * i / (double)head_dim`. Odd head dims are not real,
+which is exactly why this would have survived unnoticed.
+
+### Benchmark
+
+1 thread pinned, 32 heads x 64 dim (LFM2.5 shape), median of 2000 calls:
+
+| layout | scalar | vector | speedup |
+|---|---|---|---|
+| neox (LFM2) | 0.60 us / 27.3 GB/s | **0.53 us / 30.9 GB/s** | 1.13x |
+| interleaved | 0.58 us / 28.2 GB/s | **0.55 us / 29.8 GB/s** | 1.05x |
+
+Before caching the frequency table both paths sat at 0.87-0.91 us: `pow()` was
+90% of the time and the rotation was noise. Caching `base^(-2i/head_dim)` per
+(head_dim, base) in a `thread_local` cut it by 35-40%.
+
+### Conclusion
+
+Keep. The vector path is only 1.05-1.15x, which is honest for a 0.5 us operation,
+but it is also 0.5 us per token out of a ~12 ms per-token budget — i.e. 0.004%.
+**RoPE must not be optimised further.** What matters here is that both layouts
+exist and are tested, because a wrong layout is a silent quality killer that no
+benchmark would catch.
+
+### Next
+
+A single transformer block wired through the backend, so a forward pass can be
+profiled end to end and the real bottleneck identified instead of guessed.
