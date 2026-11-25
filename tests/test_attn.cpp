@@ -2,6 +2,7 @@
 
 #include "kata/attn.h"
 #include "kata/cpu.h"
+#include "kata/simd.h"
 
 #include <cmath>
 #include <random>
@@ -225,3 +226,49 @@ TEST(Attn, KtDecodeMatchesPositionMajorDecode) {
         }
     }
 }
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2,fma")))
+static void check_exp256(float x, float * out) {
+    __m256 vx = _mm256_set1_ps(x);
+    __m256 ve = kata::exp256_ps(vx);
+    _mm256_storeu_ps(out, ve);
+}
+
+__attribute__((target("avx512f,avx512vl,avx512dq,fma")))
+static void check_exp512(float x, float * out) {
+    __m512 vx = _mm512_set1_ps(x);
+    __m512 ve = kata::exp512_ps(vx);
+    _mm512_storeu_ps(out, ve);
+}
+
+TEST(SimdExp, Exp256MatchesStdExp) {
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    alignas(32) float out[8];
+    for (float x = -20.0f; x <= 20.0f; x += 0.125f) {
+        check_exp256(x, out);
+        float expected = std::exp(x);
+        for (int i = 0; i < 8; ++i) {
+            float err = std::abs(out[i] - expected);
+            float rel = err / std::max(expected, 1e-12f);
+            EXPECT_LT(rel, 2e-5f) << "x=" << x;
+        }
+    }
+}
+
+TEST(SimdExp, Exp512MatchesStdExp) {
+    auto isa = kata::cpu_isa();
+    if (isa != kata::Isa::Avx512 && isa != kata::Isa::Avx512Vnni) GTEST_SKIP() << "no AVX-512 on this host";
+    alignas(64) float out[16];
+    for (float x = -20.0f; x <= 20.0f; x += 0.125f) {
+        check_exp512(x, out);
+        float expected = std::exp(x);
+        for (int i = 0; i < 16; ++i) {
+            float err = std::abs(out[i] - expected);
+            float rel = err / std::max(expected, 1e-12f);
+            EXPECT_LT(rel, 2e-5f) << "x=" << x;
+        }
+    }
+}
+#endif
+

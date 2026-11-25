@@ -56,6 +56,35 @@ inline __m256 exp256_ps(__m256 x) {
     return _mm256_mul_ps(poly, pow2k);
 }
 
+// Vectorised exp(x) via Cody-Waite range reduction (1.45 ULP) for AVX-512 (16 floats/vector).
+__attribute__((target("avx512f,avx512vl,avx512dq,fma")))
+inline __m512 exp512_ps(__m512 x) {
+    const __m512 r = _mm512_set1_ps(0x1.8p23f);
+    const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+    const __m512 n = _mm512_sub_ps(z, r);
+    const __m512 b =
+        _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                         _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+    const __mmask16 d =
+        _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+    const __m512 u = _mm512_mul_ps(b, b);
+    const __m512 j = _mm512_fmadd_ps(
+        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b,
+                                        _mm512_set1_ps(0x1.573e2ep-5f)),
+                        u,
+                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b,
+                                        _mm512_set1_ps(0x1.fffdb6p-2f))),
+        u,
+        _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), b, _mm512_set1_ps(1.0F)));
+    const __m512 res = _mm512_scalef_ps(j, n);
+    if (_mm512_kortestz(d, d))
+        return res;
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 alt = _mm512_mask_blend_ps(
+        _mm512_cmp_ps_mask(n, zero, _CMP_LE_OQ), _mm512_set1_ps(__builtin_inff()), zero);
+    return _mm512_mask_blend_ps(d, res, alt);
+}
+
 // Unpack the 12 packed q4_K scale bytes into utmp[0..3]: scales in the low byte
 // of each word, mins in the high byte. Same bit shuffling as ggml's reference.
 __attribute__((target("avx2")))

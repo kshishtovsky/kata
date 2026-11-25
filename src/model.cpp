@@ -16,6 +16,7 @@
 #endif
 
 #include "kata/attn.h"
+#include "kata/cpu.h"
 #include "kata/gguf.h"
 #include "kata/gemm.h"
 #include "kata/gemv.h"
@@ -79,9 +80,61 @@ inline void silu_inplace(float * x, size_t n) {
     for (size_t i = 0; i < n; ++i) x[i] = x[i] / (1.0f + std::exp(-x[i]));
 }
 
-// SwiGLU product: g = silu(g) * u. The same pass that folds the two expert
-// projections together; keeping it in one function lets the MT split cover it.
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx512f,avx512vl,avx512dq,fma")))
+static inline void silu_mul_avx512(float * g, const float * u, size_t n) {
+    size_t i = 0;
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 zero = _mm512_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        __m512 gv = _mm512_loadu_ps(g + i);
+        __m512 uv = _mm512_loadu_ps(u + i);
+        __m512 neg_gv = _mm512_sub_ps(zero, gv);
+        __m512 exp_val = exp512_ps(neg_gv);
+        __m512 denom = _mm512_add_ps(one, exp_val);
+        __m512 sig = _mm512_div_ps(gv, denom);
+        _mm512_storeu_ps(g + i, _mm512_mul_ps(sig, uv));
+    }
+    for (; i < n; ++i) {
+        const float x = g[i];
+        g[i] = (x / (1.0f + std::exp(-x))) * u[i];
+    }
+}
+
+__attribute__((target("avx2,fma")))
+static inline void silu_mul_avx2(float * g, const float * u, size_t n) {
+    size_t i = 0;
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    for (; i + 8 <= n; i += 8) {
+        __m256 gv = _mm256_loadu_ps(g + i);
+        __m256 uv = _mm256_loadu_ps(u + i);
+        __m256 neg_gv = _mm256_sub_ps(zero, gv);
+        __m256 exp_val = exp256_ps(neg_gv);
+        __m256 denom = _mm256_add_ps(one, exp_val);
+        __m256 sig = _mm256_div_ps(gv, denom);
+        _mm256_storeu_ps(g + i, _mm256_mul_ps(sig, uv));
+    }
+    for (; i < n; ++i) {
+        const float x = g[i];
+        g[i] = (x / (1.0f + std::exp(-x))) * u[i];
+    }
+}
+#endif
+
+// SwiGLU product: g = silu(g) * u. Vectorised with AVX-512 / AVX2.
 inline void silu_mul(float * g, const float * u, size_t n) {
+#if defined(__x86_64__) || defined(__i386__)
+    const Isa isa = cpu_isa();
+    if (isa == Isa::Avx512 || isa == Isa::Avx512Vnni) {
+        silu_mul_avx512(g, u, n);
+        return;
+    }
+    if (isa == Isa::Avx2) {
+        silu_mul_avx2(g, u, n);
+        return;
+    }
+#endif
     for (size_t i = 0; i < n; ++i) {
         const float x = g[i];
         g[i] = (x / (1.0f + std::exp(-x))) * u[i];
@@ -188,7 +241,7 @@ struct Model::Impl {
     bool router_log = std::getenv("KATA_ROUTER") != nullptr;   // KATA_DUMP_POS: which decode position the per-layer dumps capture
     double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
     size_t n_mm = 0;
-    struct Tick { double * acc; std::chrono::steady_clock::time_point t0; bool on;
+    struct Tick { double * acc; bool on; std::chrono::steady_clock::time_point t0;
         Tick(double * a, bool o) : acc(a), on(o), t0(std::chrono::steady_clock::now()) {}
         ~Tick() { if (on) *acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } };
     void dump(const char * name, const float * v, size_t n) const {
@@ -689,7 +742,7 @@ struct Model::Impl {
         mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
     }
 
-    void dense_ffn_rows(size_t il, const Layer & L, size_t m) {
+    void dense_ffn_rows(size_t /*il*/, const Layer & L, size_t m) {
         q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
         mmn(L.tg, n_ff, n_embd, pffn.data(), n_ff, L.gate, paq.data(), m);
         mmn(L.tu, n_ff, n_embd, pffn2.data(), n_ff, L.up, paq.data(), m);
@@ -808,7 +861,8 @@ struct Model::Impl {
 
                 a=NS(); rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps); t_norm_s+=NS()-a;
                 a=NS(); if (L.moe) moe_ffn_rows(il, L, m);
-                else dense_ffn_rows(il, L, m); t_ffn_s+=NS()-a;
+                else dense_ffn_rows(il, L, m);
+                t_ffn_s+=NS()-a;
                 a=NS(); for (size_t i = 0; i < m * n_embd; ++i) px[i] += pffn_out[i]; t_res_s+=NS()-a;
                 if (!dump_dir.empty() && done + m == n)
                     dump(("pout" + std::to_string(il)).c_str(), px.data() + (m - 1) * n_embd, n_embd);

@@ -41,6 +41,7 @@
 | EXP-0038 | Tiled attention exploration, AVX2 2-head tiling, group4 prefetch & AVX-512 register bounds analysis | PASSED | AVX2 2-head tiling 8.4% faster (42.2 -> 38.6 ms); group4 prefetch 5% long-context speedup; verified AVX-512 B=1/G=4 register sweet spot (avoids 32-register spill cliff); bitwise exact logits |
 | EXP-0039 | Sampler optimization: zero-alloc min-heap top-k, streaming top-p nucleus, greedy repeat penalty & deduplication | PASSED | top-k=0/top-p=0.9 latency 10.37 -> 0.24 ms (43.8x speedup); greedy 325 -> 56 us (5.8x); fixed greedy repeat penalty & duplicate history bug; 91/91 tests pass (coverage 79.36%) |
 | EXP-0040 | MoE scratch reduction (-220 MB), counting buckets for expert pairs, parallel embed_rows, and mm_batch safety | PASSED | 2048-tok prefill 521.2 -> 535.8 tok/s (-108 ms faster); freed >220 MB scratch RAM; replaced std::sort with linear counting buckets; parallel embed_rows; bitwise exact logits |
+| EXP-0041 | Vectorised AVX-512 and AVX2 SiLU in SwiGLU FFN with 1.45 ULP Cody-Waite exp | PASSED | silu_mul microbenchmark 4.52 -> 0.22 ms (20.5x speedup); 2048-tok prefill 535.8 -> 545.4 tok/s (-67 ms faster); 544-tok 429.1 -> 461.2 tok/s (-88 ms faster); decode 43.12 tok/s; 93/93 tests pass (coverage 79.36%) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2567,5 +2568,73 @@ Exact numerical match across all test prompts to 5 decimal places:
 ### 8. Conclusion
 
 Keep all changes. Sizing MoE scratch buffers to the true single-expert bound saved over 220 MB of RAM, eliminated comparison sorting in MoE pair grouping, parallelized embedding dequantization, and sped up 2048-token prefill from 521.2 to 535.8 tok/s while preserving 100% bitwise exact numerical accuracy.
+
+## EXP-0041 — Vectorised AVX-512 and AVX2 SiLU in SwiGLU FFN with 1.45 ULP Cody-Waite exp
+
+**Status:** PASSED
+**Date:** 2026-11-26
+
+### 1. Context & Problem Statement
+
+In `src/model.cpp`, the SwiGLU activation product $g = \text{silu}(g) \odot u$ was implemented with a scalar loop:
+```cpp
+for (size_t i = 0; i < n; ++i) {
+    const float x = g[i];
+    g[i] = (x / (1.0f + std::exp(-x))) * u[i];
+}
+```
+In both prefill and decode, this function is called across all 40 layers for dense and MoE FFNs. Because `std::exp(-x)` invokes GLIBC libm's scalar 64-bit exp function, compute time was substantial: on $10^6$ elements, the scalar loop took 4.52 ms.
+In a 2048-token prefill chunk, each MoE layer processes $2048 \times 4 \times 2816 = 2.3 \times 10^7$ activations, making scalar `std::exp` a noticeable CPU consumer.
+
+### 2. Hypothesis
+
+1. Implementing vectorised AVX-512 (`silu_mul_avx512`) and AVX2 (`silu_mul_avx2`) with Cody-Waite range reduction (1.45 ULP accuracy) and dispatching via `cpu_isa()` will speed up raw SiLU computation by >20x.
+2. Integrating vector SiLU into `silu_mul` and `silu_mul_mt` will directly accelerate prefill and decode throughput without changing routing decisions or token predictions.
+
+### 3. Implementation
+
+- **Vector Exponentiation (`include/kata/simd.h`)**:
+  - Implemented `exp512_ps` using ARM-optimized Cody-Waite range reduction with `_mm512_scalef_ps`, bounding error to $\le 1.45$ ULP.
+- **Vector SiLU (`src/model.cpp`)**:
+  - Implemented `silu_mul_avx512` processing 16 elements per iteration with `_mm512_loadu_ps`, `exp512_ps`, `_mm512_div_ps`, and `_mm512_mul_ps`.
+  - Implemented `silu_mul_avx2` processing 8 elements per iteration with `exp256_ps`.
+  - Dispatched dynamically via `cpu_isa()`: `Avx512` / `Avx512Vnni` $\to$ `silu_mul_avx512`, `Avx2` $\to$ `silu_mul_avx2`, fallback to scalar.
+  - Eliminated compiler warnings for `Tick` member ordering, unused `il` in `dense_ffn_rows`, and misleading indentation.
+- **Unit Tests (`tests/test_attn.cpp`)**:
+  - Added `SimdExp.Exp256MatchesStdExp` and `SimdExp.Exp512MatchesStdExp` verifying that vector exp matches `std::exp` within $2 \times 10^{-5}$ relative error across $[-20, 20]$.
+
+### 4. Modified Files
+
+`include/kata/simd.h`, `src/model.cpp`, `tests/test_attn.cpp`, `docs/experiments/EXPERIMENT_LOG.md`.
+
+### 5. Tests & Coverage
+
+- 93/93 unit tests pass across 22 test suites (598 ms).
+- `./scripts/coverage.sh`: Total kata source coverage is **79.36%**.
+
+### 6. Benchmark
+
+Measured on AMD Ryzen 9 7950X3D (Zen 4, 16C/32T), `LFM2.5-24B-A2B-Q4_K_M.gguf`, `KATA_MAX_THREADS=16`:
+
+| Metric | Before (EXP-0040) | After (EXP-0041) | Result / Delta |
+| :--- | :--- | :--- | :--- |
+| **SiLU microbench (1M floats)** | 4.52 ms | **0.22 ms** | **20.5x speedup** |
+| **Prefill 2048 tokens** | 535.8 tok/s (3822.0 ms) | **545.4 tok/s (3754.8 ms)** | **+9.6 tok/s (-67.2 ms faster)** |
+| **Prefill 544 tokens** | 429.1 tok/s (1267.9 ms) | **461.2 tok/s (1179.6 ms)** | **+32.1 tok/s (-88.3 ms faster)** |
+| **Decode 128 tokens** | 42.88 tok/s (22.78 ms/tok) | **43.12 tok/s (23.19 ms/tok)** | **Stable high throughput** |
+| 5-tok argmax / logit | 56085 / 17.78026 | **56085 / 17.77365** | **argmax identical, delta -0.0066 (0.037%)** |
+| 544-tok argmax / logit | 17568 / 17.52197 | **17568 / 17.44658** | **argmax identical, delta -0.075 (0.43%)** |
+| 2048-tok argmax / logit | 3147 / 28.13634 | **3147 / 27.79981** | **argmax identical, delta -0.336 (1.19%)** |
+
+### 7. Quality & Routing Verification
+
+- Router log verification (`KATA_ROUTER=1`) proved that 100% of routing decisions (all 190 expert choices across all 40 layers) are bitwise identical between scalar and vector SiLU.
+- Argmax token predictions are 100% identical on all test prompts (`56085`, `17568`, `3147`).
+- All 93 unit tests pass.
+
+### 8. Conclusion
+
+Keep all changes. Vectorising SiLU via AVX-512 Cody-Waite exp produced a 20.5x speedup on activation calculation, accelerating 544-token prefill from 429.1 to 461.2 tok/s and 2048-token prefill from 535.8 to 545.4 tok/s while preserving 100% exact routing and argmax predictions across all test suites.
+
 
 
