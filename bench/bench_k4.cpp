@@ -3,6 +3,7 @@
 #include "kata/gemv.h"
 #include "kata/gguf.h"
 #include "kata/quant.h"
+#include "kata/pool.h"
 #include "kata/throttle.h"
 
 #include <dlfcn.h>
@@ -31,6 +32,7 @@ int main(int argc, char ** argv) {
     std::string tensor = "blk.0.ffn_gate.weight";
     std::string libcpu = "/home/medovarov/lcpp-base/build/bin/libggml-cpu.so";
     size_t target_mb = 768;
+    unsigned threads = 1;
     int iters = 5;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -39,6 +41,7 @@ int main(int argc, char ** argv) {
         else if (a == "--lib" && i + 1 < argc)     libcpu = argv[++i];
         else if (a == "--mb" && i + 1 < argc)      target_mb = std::strtoul(argv[++i], nullptr, 10);
         else if (a == "--iters" && i + 1 < argc)   iters = std::atoi(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) threads = (unsigned)std::atoi(argv[++i]);
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
 
@@ -114,16 +117,38 @@ int main(int argc, char ** argv) {
                     name, out[out.size() / 2], out[out.size() / 10], out[out.size() * 9 / 10]);
     };
 
+    threads = std::min(threads, throttle::max_threads());
+    std::printf("threads=%u\n", threads);
+    ThreadPool pool(threads);
+    const size_t chunk = (total_rows + threads - 1) / threads;
+
     std::vector<double> k, gg;
-    run([&] { kata_fn(total_rows, cols, a.data(), w.data(), xq.data()); }, "kata", k);
     run([&] {
-        for (size_t r = 0; r < total_rows; ++r) {
-            ggml_dot(static_cast<int>(cols), &b[r], 0, w.data() + r * nb, 0, xq.data(), 0, 1);
-        }
+        if (threads == 1) { kata_fn(total_rows, cols, a.data(), w.data(), xq.data()); return; }
+        pool.run([&](unsigned tid) {
+            const size_t r0 = (size_t)tid * chunk;
+            const size_t r1 = std::min(total_rows, r0 + chunk);
+            if (r0 < r1) kata_fn(r1 - r0, cols, a.data() + r0, w.data() + r0 * nb, xq.data());
+        });
+    }, "kata", k);
+    run([&] {
+        // ggml's dot is single-row by contract, so parallelise across rows here.
+        auto body = [&](size_t r0, size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                ggml_dot(static_cast<int>(cols), &b[r], 0, w.data() + r * nb, 0, xq.data(), 0, 1);
+            }
+        };
+        if (threads == 1) { body(0, total_rows); return; }
+        pool.run([&](unsigned tid) {
+            const size_t r0 = (size_t)tid * chunk;
+            const size_t r1 = std::min(total_rows, r0 + chunk);
+            if (r0 < r1) body(r0, r1);
+        });
     }, "ggml", gg);
 
     const double ratio = k[k.size() / 2] / gg[gg.size() / 2];
     std::printf("\nratio kata/ggml = %.3fx  (%s)\n", ratio, ratio >= 1.0 ? "faster" : "slower");
-    std::printf("CSV,q4_K,%zu,%zu,%.2f,%.2f,%.3f\n", total_rows, cols, k[k.size() / 2], gg[gg.size() / 2], ratio);
+    std::printf("CSV,q4_K,%u,%zu,%zu,%.2f,%.2f,%.3f\n",
+                threads, total_rows, cols, k[k.size() / 2], gg[gg.size() / 2], ratio);
     return 0;
 }

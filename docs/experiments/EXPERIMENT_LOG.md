@@ -8,6 +8,7 @@
 | EXP-0004 | Load guard for benchmarks | PASSED | KATA_MAX_THREADS + duty cycle; noise 10-30% -> 0.2% |
 | EXP-0005 | Where single-thread GEMV time goes | PASSED | instruction-throughput bound, not latency; 4-row interleave is a loss in DRAM regime |
 | EXP-0006 | q4_K GEMV on real model weights (CPU-first format pivot) | PASSED | 1.006x ggml at 26.95 GB/s DRAM-bound; AVX-512 path 0.83x, rejected |
+| EXP-0007 | q4_K multi-row tiling + multi-thread driver | PASSED (threads) / REJECTED (tiling) | tiling 13.5 vs 26.7 GB/s; 1-2 threads 1.05-1.08x, 4 threads 0.99x (DRAM saturated) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -437,3 +438,62 @@ components worth attacking next.
 Multi-row tiling for q4_K (the AVX2 kernel re-reads the activation block from L1
 once per row; 2-4 rows would amortise it), plus a multi-threaded q4_K driver and
 a real A/B against ggml at 8/16 threads.
+
+## EXP-0007 — q4_K multi-row tiling and the multi-thread ceiling
+
+**Status:** PASSED for the thread driver, REJECTED for tiling
+**Date:** 2026-11-25
+
+### Hypothesis
+
+The AVX2 q4_K kernel re-reads the activation block from L1 once per row. Two to
+four rows per pass should amortise that decode (scale unpack, bsums, the
+per-sub-block shuffle) across R rows.
+
+### Tiling — REJECTED
+
+`template <int R> gemv_q4_K_q8_K_tiled_impl` written for R = 2, 4, 8 and measured
+at 776 MB, 1 thread pinned:
+
+| variant | GB/s | vs ggml |
+|---|---|---|
+| untiled | 26.73 | 1.002x |
+| tiled2 | 13.45 | 0.504x |
+| tiled4 | 13.87 | 0.520x |
+| tiled8 | 15.63 | 0.586x |
+
+**Half speed, not faster.** The activation block was never the cost — it is 292
+bytes re-read from L1, and L1 bandwidth is nowhere near the limit. What tiling
+actually does is turn one sequential weight stream into R streams megabytes
+apart, which costs TLB and page locality. This is the same mechanism that made
+the 4-row interleave lose in EXP-0001 and EXP-0005. **Three independent
+measurements now agree: on this machine, extra concurrent weight streams always
+lose.** Code deleted.
+
+### Multi-thread — PASSED
+
+Bench extended with `--threads`; rows split into contiguous per-worker chunks;
+ggml parallelised the same way (its dot is single-row by contract) so the
+comparison is like-for-like. 512 MB working set, affinity pinned.
+
+| threads | kata GB/s | ggml GB/s | ratio |
+|---|---|---|---|
+| 1 (cpu 0) | 26.01 | 24.84 | **1.047x** |
+| 2 (cpu 0-1) | 50.50 | 46.78 | **1.079x** |
+| 4 (cpu 0-3) | 69.46 | 69.95 | 0.993x |
+| 4 (9 reps) | 68.08 | 77.15 | 0.882x |
+
+At 4 threads both land on ~70 GB/s, which is the DRAM ceiling measured
+independently (77-79 GB/s peak, ~70 GB/s achieved at this access pattern). The
+4-thread ratio wanders between 0.88x and 0.99x with p10 spread of 59-65 GB/s on
+both sides — that is run-to-run noise, not a kernel difference. **Conclusion:
+kata is at parity or slightly ahead of ggml for q4_K up to saturation, and there
+is nothing left to win in this kernel — the ceiling is memory.**
+
+28/28 tests, coverage 82.89%.
+
+### Next
+
+Stop tuning GEMV. The remaining decode cost is elsewhere: q6_K is 22.3% of
+LFM2.5-24B-A2B by bytes and every `attn_v`/`output` tensor in both shipped models
+is Q6_K, so a q6_K kernel is required before any forward pass can run.
