@@ -1204,3 +1204,88 @@ resource, and it must be designed together with this layout because a
 transposed q8 cache wants positions packed differently than a q8 position-major
 one.
 
+
+## EXP-0019: LFM2.5-24B-A2B forward pass — correctness vs llama.cpp
+
+**Status:** PASSED (structurally correct, numerically within activation-quantisation noise)
+**Date:** 2026-11-25
+**Branch:** dev
+
+### Problem
+The engine had kernels but no graph. Nothing had ever produced a token from a real
+model, so kernel-level parity with ggml said nothing about whether the whole thing
+computes the right function.
+
+### Hypothesis
+A hand-written graph (embedding -> 40 layers of {RMSNorm, shortconv|GQA-attention,
+residual, RMSNorm, dense-FFN|MoE, residual} -> RMSNorm -> tied lm_head) will match
+llama.cpp component-by-component, with residual error explained entirely by the
+q8_K activation quantisation that both engines already use.
+
+### Implementation
+- `include/kata/model.h`, `src/model.cpp` — `Model::load`, `forward`, `ModelState`.
+- `run/kata_run.cpp` — CLI driver; `--greedy N` for greedy-decoding comparison.
+- Layer plan read from the GGUF: 10 attention layers (2,6,...,38), 30 shortconv,
+  38 MoE + 2 dense FFN, 32 query heads / 8 kv heads / head_dim 64, 64 experts top-4.
+- `KATA_DUMP=<dir>` writes per-stage float32 dumps for diffing against a llama.cpp
+  reference dump produced by `llama_context_params::cb_eval`.
+
+### Bugs found and fixed (all in the graph, none in the kernels)
+1. **shortconv kernel layout.** Used `kern[tap*n_embd + e]`; ggml's
+   `ggml_compute_forward_ssm_conv_f32` indexes `c[i0 + i1*ncs]` with `ne[0]=3`, so
+   channel `e` owns `kern[e*3 .. e*3+2]`. Diff on `conv_out_proj-0` went 2.74e-02 -> 3.73e-09.
+2. **`dump("emb")` inside the layer loop**, so it logged layer-39 output instead of
+   the embedding (fabricated diff of 1.6e+01). Guard `pos==0 && il==0`; now bit-exact.
+3. **`dense_ffn` hardcoded dump names** (`"dgate0"`), so layer 1 overwrote layer 0.
+   Took `il` as a parameter; gate/up then matched to 2.98e-08.
+4. **Expert byte strides** were hardcoded (144 / sizeof(block_q6_K)); replaced with
+   `n_ff_exp * n_embd / QK_K * ggml_type_size(type)`.
+
+### Correctness results
+| stage | max abs diff vs llama.cpp |
+|---|---|
+| embedding | 0.000e+00 (bit-exact) |
+| attn_norm layer 0 | 0.000e+00 |
+| shortconv out_proj layer 0 | 3.7e-09 |
+| `l_out-0` / `l_out-1` (dense path) | 7.5e-09 / 1.2e-07 |
+| dense `ffn_gate`/`ffn_up` layer 0 | 2.98e-08 |
+| MoE router expert ids | identical at every layer checked (2, 20-25) |
+| MoE router weights | 2.5e-05 |
+| `ffn_moe_out-2`, float64 exact recompute | 1.49e-04 |
+| `ffn_moe_out-2`, kata q8 path | 3.78e-04 |
+| `l_out-2` .. `l_out-8` | <= 1.4e-03 |
+| `l_out-9` .. `l_out-20` | ~2e-02 relative |
+| `l_out-21` .. `l_out-39` | ~5e-03 relative |
+
+The 0.9 absolute difference on layers 34-38 is **not** a defect. Three channels
+(1043, 271, 1549) carry an outlier of magnitude ~146 through layer 33; layer 34
+cancels it to ~2.7. Relative error before cancellation is 4.0e-03 on all three
+channels with the same sign and magnitude — a systematic activation-quantisation
+shift. After the cancellation the same absolute error reads as 35% relative. The
+error does not grow past layer 34.
+
+### Greedy-generation check
+Reference: `/tmp/ref/greedy.cpp` driving llama.cpp at `n_gpu_layers=0`.
+Prompt `124894 597 4104 10299 35886` ("The quick brown fox"):
+```
+llama.cpp  56085 890 278 45698 4448 63908 597 4104 10299 35886 56085 890 278 45698 4448 63908 | 93017 93017 ...
+kata       56085 890 278 45698 4448 63908 597 4104 10299 35886 56085 890 278 45698 4448 63908 | 597 4104 ...
+```
+16 tokens identical, divergence at 17. At that point llama.cpp falls into a
+degenerate `93017` loop while kata keeps echoing the prompt — both trajectories are
+degenerate, so the test cannot rank the two engines. It does establish that the
+graph agrees on everything well-conditioned.
+
+### Result
+The forward pass is correct. 315 ms/token on 3 tokens at 4 threads (cold, no
+optimisation). Not yet measured on a warm 40-token run.
+
+### Bottleneck
+Attribution not yet measured — `KATA_PROF` exists but the mixer timer `t_mix` is not
+wired. Expected dominated by the 38 MoE layers x 4 experts at ~1.4 GB/token.
+
+### Conclusion
+Keep. This is the base the rest of the project optimises.
+
+### Next
+EXP-0020: attribute per-stage time with KATA_PROF and rank the real hot spots.

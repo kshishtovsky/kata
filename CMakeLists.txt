@@ -18,6 +18,7 @@ add_library(kata_core
   src/gemv.cpp
   src/pool.cpp
   src/attn.cpp
+  src/model.cpp
   src/rope.cpp
   src/quant.cpp
 )
@@ -44,6 +45,9 @@ add_executable(bench_rope bench/bench_rope.cpp)
 target_link_libraries(bench_rope PRIVATE kata_core)
 add_executable(bench_norm bench/bench_norm.cpp)
 target_link_libraries(bench_norm PRIVATE kata_core)
+
+add_executable(kata_run run/kata_run.cpp)
+target_link_libraries(kata_run PRIVATE kata_core)
 
 add_executable(bench_real_weights bench/bench_real_weights.cpp)
 add_executable(bench_k4 bench/bench_k4.cpp)
