@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <dlfcn.h>
 #include <string>
 #include <vector>
@@ -50,7 +51,7 @@ int main(int argc, char ** argv) {
     std::string lib_cpu = "/home/medovarov/lcpp-base/build/bin/libggml-cpu.so";
     std::string want = "blk.0.ffn_gate.weight";
     int iters = 20;
-    int copies = 1;   // replicate the matrix so the working set leaves L3
+
     std::vector<unsigned> thread_list{1, 8, 16, 32};
 
     for (int i = 1; i < argc; ++i) {
@@ -59,7 +60,7 @@ int main(int argc, char ** argv) {
         if (a == "--model") path = next();
         else if (a == "--tensor") want = next();
         else if (a == "--iters") iters = std::max(1, atoi(next().c_str()));
-        else if (a == "--copies") copies = std::max(1, atoi(next().c_str()));
+
         else if (a == "--list") want.clear();
         else if (a == "--threads") { thread_list.clear(); for (auto s : {next()}) thread_list.push_back((unsigned)atoi(s.c_str())); }
         else if (a == "--threads-list") { thread_list.clear(); std::string s = next(); size_t p = 0; while (p < s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); thread_list.push_back((unsigned)atoi(s.substr(p, q - p).c_str())); p = q + 1; } }
@@ -117,14 +118,29 @@ int main(int argc, char ** argv) {
     printf("weights: rms=%.5f min=%.5f max=%.5f zero_frac=%.3f\n",
            std::sqrt(wsum / (double)wf.size()), wmin, wmax, (double)zeros / (double)wf.size());
 
-    std::vector<block_q4_0> wq(rows * cols / QK);
-    quantize_row_q4_0(wf.data(), wq.data(), rows * cols);
+    // A single real tensor is at most ~205 MiB while L3 is 128 MiB, so one pass
+    // is partly served from cache and every repeat run hits harder. Replicating
+    // the rows until the stream is several times L3 keeps the measurement honest.
+    size_t n_tensors = 1;
+    {
+        const size_t nb_rows = rows * cols * sizeof(block_q4_0) / QK;
+        while (nb_rows * n_tensors < size_t(768) * 1024 * 1024 && n_tensors < 64) ++n_tensors;
+    }
+    if (const char * e = getenv("KATA_REPLICAS")) n_tensors = std::max<size_t>(1, atoi(e));
+    const size_t w_rows = rows * n_tensors;
+
+    std::vector<block_q4_0> wq(w_rows * cols / QK);
+    for (size_t i = 0; i < n_tensors; ++i)
+        quantize_row_q4_0(wf.data(), wq.data() + i * rows * cols / QK, rows * cols);
+    printf("stream: %zu replica(s), weights %.1f MiB (L3 is 128 MiB)\n",
+           n_tensors, (double)wq.size() * sizeof(block_q4_0) / 1048576.0);
 
     // Our quantiser must produce the same bytes as ggml's, otherwise the speed
     // comparison is between two different value sets.
     auto ggml_q4_ref = sym<void (*)(const float *, void *, int64_t)>(hb, "quantize_row_q4_0_ref");
     std::vector<block_q4_0> wq_ggml(wq.size());
-    ggml_q4_ref(wf.data(), wq_ggml.data(), (int64_t)(rows * cols));
+    for (size_t i = 0; i < n_tensors; ++i)
+        ggml_q4_ref(wf.data(), wq_ggml.data() + i * rows * cols / QK, (int64_t)(rows * cols));
     size_t q_diff = 0, d_diff = 0;
     for (size_t i = 0; i < wq.size(); ++i) {
         if (wq[i].d != wq_ggml[i].d) ++d_diff;
@@ -139,20 +155,9 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < wf.size(); ++i) { qerr += (double)(dq[i] - wf[i]) * (dq[i] - wf[i]); qref += (double)wf[i] * wf[i]; }
     printf("quant: relative RMS error %.4f%%\n", 100.0 * std::sqrt(qerr / qref));
 
-    // Deterministic activations with the same statistics as a real post-RMSNorm row.
-    std::vector<float> ours(rows), theirs(rows), ref(rows);
-    if (copies > 1) {
-        std::vector<block_q4_0> big;
-        big.reserve(wq.size() * copies);
-        for (int c = 0; c < copies; ++c) big.insert(big.end(), wq.begin(), wq.end());
-        wq.swap(big);
-        ours.resize(rows * copies);
-        theirs.resize(rows * copies);
-        ref.resize(rows * copies);
-        printf("replicated %dx: working set %.1f MiB\n", copies,
-               (double)wq.size() * sizeof(block_q4_0) / 1048576.0);
-    }
-    const size_t total_rows = rows * copies;
+    // Vectors are sized from the replicated stream, not from one tensor copy.
+    const size_t total_rows = w_rows;
+    std::vector<float> ours(total_rows), theirs(total_rows), ref(rows);
 
     std::vector<float> act(cols);
     uint64_t s = 0x9E3779B97F4A7C15ull;
@@ -190,6 +195,30 @@ int main(int argc, char ** argv) {
             if (lo < hi) gemv_q4_0_q8_0_avx512_r1(hi - lo, cols, ours.data() + lo, wq.data() + lo * nb, aq.data());
         });
     };
+    // Ceiling probe: sequential read, same threads and chunking, no math.
+    // The buffer must be far larger than L3 or repeat passes get cached and the
+    // number turns into an L3 bandwidth figure instead of a DRAM one.
+    const size_t probe_bytes = size_t(1024) * 1024 * 1024;
+    std::vector<uint8_t> probe(probe_bytes, 0xA5);
+    std::atomic<uint64_t> sink{0};
+    auto pure_read_mt = [&](ThreadPool & pool, unsigned nt) {
+        const char * base = (const char *)probe.data();
+        const size_t bytes_local = probe_bytes;
+        const size_t chunk = (bytes_local + nt - 1) / nt;
+        pool.run([&](unsigned t) {
+            const size_t lo = (size_t)t * chunk, hi = std::min(lo + chunk, bytes_local);
+            uint64_t acc = 0;
+            // Every byte of the span must be touched: reading half of each 64-byte
+            // stride only faults in half the lines and doubles the apparent rate.
+            for (size_t i = lo; i + 64 <= hi; i += 64) {
+                uint64_t v[8];
+                std::memcpy(v, base + i, 64);
+                acc += v[0] ^ v[1] ^ v[2] ^ v[3] ^ v[4] ^ v[5] ^ v[6] ^ v[7];
+            }
+            sink.fetch_add(acc, std::memory_order_relaxed);
+        });
+    };
+
     auto ggml_gemv_mt = [&](ThreadPool & pool, unsigned nt) {
         if (nt <= 1) {
             for (size_t r = 0; r < total_rows; ++r) ggml_dot((int)cols, &theirs[r], 0, &wq[r * nb], 0, aq.data(), 0, 1);
@@ -204,10 +233,10 @@ int main(int argc, char ** argv) {
 
     // Second kata variant: identical math, one weight stream instead of four.
     printf("\n%-6s %10s %10s %10s %10s %8s %10s\n", "thr", "kata_GB/s", "ggml_GB/s", "kata_ms", "ggml_ms",
-           "speedup", "r1_GB/s");
+           "speedup", "r1_GB/s", "read_GB/s");
     for (unsigned nt : thread_list) {
         ThreadPool gpool(nt);
-        std::vector<double> tk, tg, tr;
+        std::vector<double> tk, tg, tr, tp;
         // Order alternates: whoever runs second inherits a warmer cache, which is
         // worth several percent on a buffer that half-fits in L3.
         for (int it = 0; it < iters; ++it) {
@@ -226,6 +255,10 @@ int main(int argc, char ** argv) {
                 const double t1 = now_s();
                 ggml_gemv_mt(gpool, nt);
                 tg.push_back(now_s() - t1);
+
+                const double tp0 = now_s();
+                pure_read_mt(gpool, nt);
+                tp.push_back(now_s() - tp0);
             } else {
                 const double t1 = now_s();
                 ggml_gemv_mt(gpool, nt);
@@ -247,9 +280,10 @@ int main(int argc, char ** argv) {
         auto spread = [](const std::vector<double> & v) {
             return v.empty() ? 0.0 : (v[v.size() * 3 / 4] - v[v.size() / 4]) / v[v.size() / 2] * 100.0;
         };
-        printf("%-6u %8.2f(%4.0f%%) %8.2f(%4.0f%%) %8.2f %8.2f %7.2fx %8.2f(%4.0f%%)\n", nt,
+        const double mp = tp[tp.size() / 2];
+        printf("%-6u %8.2f(%4.0f%%) %8.2f(%4.0f%%) %8.2f %8.2f %7.2fx %8.2f(%4.0f%%) %8.2f(%4.0f%%)\n", nt,
                bytes / mk / 1e9, spread(tk), bytes / mg / 1e9, spread(tg), mk * 1e3, mg * 1e3, mg / mk,
-               bytes / mr / 1e9, spread(tr));
+               bytes / mr / 1e9, spread(tr), probe_bytes / mp / 1e9, spread(tp));
     }
     return 0;
 }
