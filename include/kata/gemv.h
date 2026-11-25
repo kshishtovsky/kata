@@ -31,6 +31,16 @@ GemvKNfn gemv_q4_K_q8_K_best();
 const char * gemv_K_best_name();
 void gemv_q4_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x, ThreadPool & pool);
 
+// ---- q6_K x q8_K -------------------------------------------------------
+// 22.3% of LFM2.5-24B-A2B by bytes and every attn_v / output tensor in both
+// shipped models, so no forward pass is possible without it.
+using GemvK6fn = void (*)(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x);
+
+void gemv_q6_K_q8_K_ref   (size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x);
+void gemv_q6_K_q8_K_avx2  (size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x);
+GemvK6fn gemv_q6_K_q8_K_best();
+void gemv_q6_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x, ThreadPool & pool);
+
 // Multi-threaded driver. Rows are split into one contiguous block per worker so
 // each worker streams a single region of the weight matrix (TLB friendly).
 void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x, ThreadPool & pool);

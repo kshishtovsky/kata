@@ -6,6 +6,63 @@
 
 namespace kata {
 
+void dequantize_row_q6_K(const block_q6_K * x, float * y, size_t n) {
+    const size_t nb = n / QK_K;
+    for (size_t i = 0; i < nb; ++i) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t * ql = x[i].ql;
+        const uint8_t * qh = x[i].qh;
+        const int8_t * sc = x[i].scales;
+        float * out = y + i * QK_K;
+        for (int half = 0; half < 2; ++half) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[l + 0] = d * (float)sc[is + 0] * (float)q1;
+                out[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            out += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+float vec_dot_q6_K_q8_K_ref(size_t n, const block_q6_K * x, const block_q8_K * y) {
+    const size_t nb = n / QK_K;
+    float sum = 0.0f;
+    for (size_t i = 0; i < nb; ++i) {
+        const uint8_t * ql = x[i].ql;
+        const uint8_t * qh = x[i].qh;
+        const int8_t * sc = x[i].scales;
+        const int8_t * q8 = y[i].qs;
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        float block = 0.0f;
+        for (int half = 0; half < 2; ++half) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                block += (float)sc[is + 0] * (float)q1 * (float)q8[l + 0];
+                block += (float)sc[is + 2] * (float)q2 * (float)q8[l + 32];
+                block += (float)sc[is + 4] * (float)q3 * (float)q8[l + 64];
+                block += (float)sc[is + 6] * (float)q4 * (float)q8[l + 96];
+            }
+            ql += 64; qh += 32; sc += 8; q8 += 128;
+        }
+        sum += d * block;
+    }
+    return sum;
+}
+
 float f16_to_f32(uint16_t h) {
     // Ported from the classic half->float bit trick: faster and branch-lighter
     // than a table, and exact for subnormals/inf/nan.

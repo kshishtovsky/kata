@@ -37,6 +37,16 @@ struct block_q4_K {
 
 // Activation side of the K-quant dot: 256 signed bytes plus per-16 sums, which
 // is what lets the per-sub-block min be applied with integer math only.
+// 6-bit, 16 sub-blocks of 16 values, one signed 8-bit scale each.
+struct block_q6_K {
+    uint8_t ql[QK_K / 2];      // low 4 bits of each quant
+    uint8_t qh[QK_K / 4];      // high 2 bits of each quant
+    int8_t scales[QK_K / 16];  // signed per-16 scale
+    uint16_t d;                // f16 super-block scale
+};
+static_assert(sizeof(block_q6_K) == 2 + QK_K / 16 + 3 * QK_K / 4, "block_q6_K must match gguf layout");
+static_assert(offsetof(block_q6_K, ql) == 0 && offsetof(block_q6_K, d) == QK_K / 16 + 3 * QK_K / 4, "block_q6_K field order");
+
 struct block_q8_K {
     float   d;
     int8_t  qs[QK_K];

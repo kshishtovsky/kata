@@ -9,6 +9,7 @@
 | EXP-0005 | Where single-thread GEMV time goes | PASSED | instruction-throughput bound, not latency; 4-row interleave is a loss in DRAM regime |
 | EXP-0006 | q4_K GEMV on real model weights (CPU-first format pivot) | PASSED | 1.006x ggml at 26.95 GB/s DRAM-bound; AVX-512 path 0.83x, rejected |
 | EXP-0007 | q4_K multi-row tiling + multi-thread driver | PASSED (threads) / REJECTED (tiling) | tiling 13.5 vs 26.7 GB/s; 1-2 threads 1.05-1.08x, 4 threads 0.99x (DRAM saturated) |
+| EXP-0008 | q6_K GEMV (22.3% of the shipped models) | PASSED | 1.03x ggml at 35.92 GB/s; caught a two-sub-block-per-maddubs scale bug |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -497,3 +498,68 @@ is nothing left to win in this kernel — the ceiling is memory.**
 Stop tuning GEMV. The remaining decode cost is elsewhere: q6_K is 22.3% of
 LFM2.5-24B-A2B by bytes and every `attn_v`/`output` tensor in both shipped models
 is Q6_K, so a q6_K kernel is required before any forward pass can run.
+
+## EXP-0008 — q6_K GEMV
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** q6_K needs a different kernel shape than q4_K (6-bit values are
+split across two bit-planes, `ql` and `qh`), but the same one-row-per-pass
+streaming structure should reach ggml's AVX2 throughput. q6_K is not optional:
+22.3% of LFM2.5-24B-A2B-Q4_K_M by bytes, and every `attn_v`, `ffn_down` and
+`token_embd` tensor in both shipped models uses it.
+
+### Format
+
+`block_q6_K` is 210 B: `ql[128]` (low 4 bits), `qh[64]` (high 2 bits), `scales[16]`
+(**signed** int8, one per 16 values), `d` (f16) — note `d` is **last**, unlike
+q4_K and q4_0 where it comes first. Value = `d * scales[is] * q - 32`, and the
+-32 is folded out through the accumulated `bsums` rather than applied per value.
+
+### Bug found and fixed
+
+ggml's own AVX2 loop gave me the shape but I mis-sized the scale shuffle: one
+`maddubs` consumes 32 values, which spans **two** 16-value sub-blocks, so the low
+and high 128-bit halves of its result need **different** scales. I duplicated a
+single scale across both halves. Symptom on a real model tensor:
+`max|kata-ggml| / max|ggml| = 3.065`, while the scalar reference matched ggml to
+`2.0e-07` — i.e. the reference was right and only the vector path was wrong, which
+is exactly what an independent `_ref` implementation is for. Fixed with a
+`scale_pair(s)` mask writing scale `s` into the low 64 bits and `s+1` into the
+high 64 bits. Regression test `GemvK6.PerSubBlockScalesAreNotDuplicated` forces
+alternating scales of 100 and 1 so any half-block misweighting is unmissable.
+
+### Correctness
+
+All 26 Q6_K tensors in the real model: dequantiser **bit-exact** against ggml
+(`deqmaxdiff = 0.000e+00` on every tensor), dot agreement `1.14e-07` relative.
+31/31 tests, coverage 83.50%.
+
+### Benchmark
+
+1 thread pinned to CPU 0, 769 MB working set (`blk.2.attn_v.weight`, 937 row
+replications), median of 5 reps:
+
+| Metric | kata | ggml | ratio |
+|---|---|---|---|
+| Throughput (GB/s) | 35.92 | 34.88 | **1.030x** |
+| p10 | 34.49 | 33.49 | |
+| p90 | 36.04 | 35.41 | |
+
+q6_K is notably faster than q4_K for both engines (35.9 vs 26.0 GB/s) because a
+210-byte block carries 256 values — 0.82 B/value against q4_K's 0.5625 — so fewer
+blocks and fewer scale unpackings per byte streamed.
+
+### Conclusion
+
+Both formats that the shipped models actually use now have kernels at or above
+ggml's AVX2 path on this machine. Keeping an independent scalar reference per
+format paid for itself twice (q4_K subnormals, q6_K scale pairing): in both cases
+the reference was correct and the vector code was not.
+
+### Next
+
+A forward pass needs more than GEMV: RMSNorm, RoPE, attention with a KV cache,
+and the MoE router/dispatch. Next iteration: RMSNorm + the block/backends
+boundary, so subsequent kernels plug into a backend interface rather than growing
+free functions (CPU now, ROCm later — per the m00800 direction).

@@ -208,3 +208,63 @@ TEST(GemvK, SubnormalSuperblockScales) {
     EXPECT_NEAR(got[0], want[0], 1e-5 * std::max(1.0, double(std::fabs(want[0]))));
     EXPECT_NEAR(got[1], want[1], 1e-5 * std::max(1.0, double(std::fabs(want[1]))));
 }
+
+namespace {
+std::vector<kata::block_q6_K> random_q6_K(size_t nblocks, std::mt19937 & g) {
+    std::uniform_int_distribution<int> byte(0, 255), sc(-128, 127);
+    std::vector<kata::block_q6_K> out(nblocks);
+    for (auto & b : out) {
+        b.d = kata::f32_to_f16(0.001f + 0.01f * (byte(g) / 255.0f));
+        for (auto & v : b.ql) v = (uint8_t)byte(g);
+        for (auto & v : b.qh) v = (uint8_t)byte(g);
+        for (auto & v : b.scales) v = (int8_t)sc(g);
+    }
+    return out;
+}
+} // namespace
+
+TEST(GemvK6, RefMatchesDequantisedDot) {
+    std::mt19937 g(17);
+    const size_t cols = 2 * kata::QK_K;
+    auto w = random_q6_K(3 * 2, g);
+    auto x = random_q8_K(2, cols, g);
+    std::vector<float> deq(cols), got(3);
+    kata::gemv_q6_K_q8_K_ref(3, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < 3; ++r) {
+        kata::dequantize_row_q6_K(&w[r * 2], deq.data(), cols);
+        double want = 0.0;
+        for (size_t c = 0; c < cols; ++c) {
+            want += (double)deq[c] * (double)x[c / kata::QK_K].qs[c % kata::QK_K] * (double)x[c / kata::QK_K].d;
+        }
+        EXPECT_NEAR(got[r], want, 1e-3 * std::max(1.0, double(std::fabs(want)))) << "row " << r;
+    }
+}
+
+TEST(GemvK6, Avx2MatchesRef) {
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    std::mt19937 g(19);
+    const size_t cols = 5 * kata::QK_K, rows = 7;
+    auto w = random_q6_K(rows * 5, g);
+    auto x = random_q8_K(5, cols, g);
+    std::vector<float> want(rows), got(rows);
+    kata::gemv_q6_K_q8_K_ref(rows, cols, want.data(), w.data(), x.data());
+    kata::gemv_q6_K_q8_K_avx2(rows, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < rows; ++r) {
+        EXPECT_NEAR(got[r], want[r], 1e-4 * std::max(1.0, double(std::fabs(want[r])))) << "row " << r;
+    }
+}
+
+TEST(GemvK6, PerSubBlockScalesAreNotDuplicated) {
+    // Regression: one maddubs covers 32 values = two 16-value sub-blocks, so its
+    // low and high halves need different scales. Using one duplicated scale made
+    // half of every block wrong (error ~3.0 relative on a real model).
+    std::mt19937 g(23);
+    auto w = random_q6_K(1, g);
+    for (int i = 0; i < 16; ++i) w[0].scales[i] = (int8_t)((i % 2) ? 1 : 100);  // alternate wildly
+    auto x = random_q8_K(1, kata::QK_K, g);
+    float want = 0.0f, got = 0.0f;
+    kata::gemv_q6_K_q8_K_ref(1, kata::QK_K, &want, w.data(), x.data());
+    kata::gemv_q6_K_q8_K_avx2(1, kata::QK_K, &got, w.data(), x.data());
+    EXPECT_GT(std::fabs(want), 1e-6f);
+    EXPECT_NEAR(got, want, 1e-4 * std::max(1.0, double(std::fabs(want))));
+}

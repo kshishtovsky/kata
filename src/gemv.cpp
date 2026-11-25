@@ -56,6 +56,14 @@ inline float f16_fast(uint16_t h) {
     return _cvtsh_ss(h);
 }
 
+// Byte mask selecting scale s into the low 64 bits and scale s+1 into the high
+// 64 bits: the two halves of a maddubs result, which span two sub-blocks.
+__attribute__((target("avx2")))
+inline __m128i scale_pair(int s) {
+    return _mm_set_epi64x((long long)(0x0101010101010101ull * (unsigned)(s + 1)),
+                          (long long)(0x0101010101010101ull * (unsigned)s));
+}
+
 __attribute__((target("avx2,f16c,fma")))
 inline float hsum_avx2(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
@@ -373,10 +381,91 @@ void gemv_q4_K_q8_K_avx2_impl(size_t rows, size_t cols, float * out, const block
     }
 }
 
+// q6_K: values are (low4 | high2<<4) - 32, i.e. 0..63 biased by 32. The bias is
+// folded out through bsums once per block (32 = 1<<5), so the hot loop stays all
+// integer. Scales are signed bytes, one per 16 values.
+__attribute__((target("avx2,f16c,fma")))
+void gemv_q6_K_q8_K_avx2_impl(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
+    const size_t nb = cols / QK_K;
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i m15 = _mm256_set1_epi8(15);
+    const __m256i m12 = _mm256_set1_epi8(12);
+    const __m256i m48 = _mm256_set1_epi8(48);
+    const __m256i mc0 = _mm256_set1_epi8((char)0xc0);
+
+    for (size_t r = 0; r < rows; ++r) {
+        const block_q6_K * wr = w + r * nb;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (size_t b = 0; b < nb; ++b) {
+            const block_q6_K * wb = wr + b;
+            const float d = x[b].d * f16_fast(wb->d);
+
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i *)x[b].bsums);
+            const __m128i scales128 = _mm_loadu_si128((const __m128i *)wb->scales);
+            const __m256i scales16 = _mm256_cvtepi8_epi16(scales128);
+            // 32 * sum(scales[i] * sum(q8 in sub-block i))
+            const __m256i bias = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales16), 5);
+
+            const uint8_t * ql = wb->ql;
+            const uint8_t * qh = wb->qh;
+            const __m256i * q8 = (const __m256i *)x[b].qs;
+            __m256i sumi = _mm256_setzero_si256();
+            int is = 0;
+
+            for (int j = 0; j < QK_K / 128; ++j) {
+                const __m256i q4bits1 = _mm256_loadu_si256((const __m256i *)ql);
+                const __m256i q4bits2 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+                const __m256i qhbits = _mm256_loadu_si256((const __m256i *)qh);
+
+                const __m256i h0 = _mm256_slli_epi16(_mm256_and_si256(qhbits, m3), 4);
+                const __m256i h1 = _mm256_slli_epi16(_mm256_and_si256(qhbits, m12), 2);
+                const __m256i h2 = _mm256_and_si256(qhbits, m48);
+                const __m256i h3 = _mm256_srli_epi16(_mm256_and_si256(qhbits, mc0), 2);
+
+                const __m256i q0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m15), h0);
+                const __m256i q1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m15), h1);
+                const __m256i q2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m15), h2);
+                const __m256i q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m15), h3);
+
+                __m256i p0 = _mm256_maddubs_epi16(q0, _mm256_loadu_si256(q8 + 4 * j + 0));
+                __m256i p1 = _mm256_maddubs_epi16(q1, _mm256_loadu_si256(q8 + 4 * j + 1));
+                __m256i p2 = _mm256_maddubs_epi16(q2, _mm256_loadu_si256(q8 + 4 * j + 2));
+                __m256i p3 = _mm256_maddubs_epi16(q3, _mm256_loadu_si256(q8 + 4 * j + 3));
+
+                // One maddubs spans 32 values, i.e. TWO 16-value sub-blocks: its
+                // low 128-bit half needs scale s and its high half scale s+1.
+                // A single duplicated scale here silently misweights half of
+                // every block.
+                p0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales128, scale_pair(is + 0))), p0);
+                p1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales128, scale_pair(is + 2))), p1);
+                p2 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales128, scale_pair(is + 4))), p2);
+                p3 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales128, scale_pair(is + 6))), p3);
+                is += 8;
+
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p1));
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p2, p3));
+
+                ql += 64;
+                qh += 32;
+            }
+
+            sumi = _mm256_sub_epi32(sumi, bias);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        }
+
+        out[r] = hsum_avx2(acc);
+    }
+}
+
 } // namespace
 
 void gemv_q4_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
     gemv_q4_K_q8_K_avx2_impl(rows, cols, out, w, x);
+}
+
+void gemv_q6_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
+    gemv_q6_K_q8_K_avx2_impl(rows, cols, out, w, x);
 }
 
 #else
@@ -385,7 +474,39 @@ void gemv_q4_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q4_K
     gemv_q4_K_q8_K_ref(rows, cols, out, w, x);
 }
 
+void gemv_q6_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
+    const size_t nb = cols / QK_K;
+    for (size_t r = 0; r < rows; ++r) out[r] = vec_dot_q6_K_q8_K_ref(cols, w + r * nb, x);
+}
+
 #endif
+
+GemvK6fn gemv_q6_K_q8_K_best() {
+    switch (cpu_isa()) {
+        case Isa::Avx512Vnni:
+        case Isa::Avx2:       return gemv_q6_K_q8_K_avx2;
+        default:              return [](size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
+            const size_t nb = cols / QK_K;
+            for (size_t r = 0; r < rows; ++r) out[r] = vec_dot_q6_K_q8_K_ref(cols, w + r * nb, x);
+        };
+    }
+}
+
+void gemv_q6_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x, ThreadPool & pool) {
+    const GemvK6fn fn = gemv_q6_K_q8_K_best();
+    const unsigned nt = pool.size();
+    const size_t chunk = (rows + nt - 1) / nt;
+    pool.run([&](unsigned tid) {
+        const size_t r0 = (size_t)tid * chunk;
+        const size_t r1 = std::min(rows, r0 + chunk);
+        if (r0 < r1) fn(r1 - r0, cols, out + r0, w + r0 * (cols / QK_K), x);
+    });
+}
+
+void gemv_q6_K_q8_K_ref(size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
+    const size_t nb = cols / QK_K;
+    for (size_t r = 0; r < rows; ++r) out[r] = vec_dot_q6_K_q8_K_ref(cols, w + r * nb, x);
+}
 
 GemvKNfn gemv_q4_K_q8_K_best() {
     switch (cpu_isa()) {
