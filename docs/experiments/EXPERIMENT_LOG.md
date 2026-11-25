@@ -1412,3 +1412,71 @@ ms/token (was 34-36). Remaining time is the kernels, not the runtime.
 The engine is now kernel-bound at ~1.0x of llama.cpp per kernel, which means
 wall-clock gains have to come from not doing the work at all (batching across
 tokens, prefill) rather than from making the kernel faster.
+
+---
+
+## EXP-0022: sampler — the engine could not stop or vary its output
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Problem:** the engine had no sampler at all: the CLI took the argmax and fed it
+back. On LFM2.5 that produced a literal 10-token cycle (`56085 890 278 45698 ...`
+repeating the prompt forever) and without an eos check generation never ended.
+
+### Implementation
+`include/kata/sampler.h` + `src/sampler.cpp`:
+```
+struct SamplerConfig { float temp = 0.8f; int top_k = 40; float top_p = 0.9f;
+                       float repeat_penalty = 1.0f; int repeat_last_n = 64; uint64_t seed = 0; };
+class Sampler { uint32_t sample(const float * logits, size_t n_vocab, const std::vector<uint32_t> & history);
+                void apply_penalty(float * logits, size_t n_vocab, const std::vector<uint32_t> & history) const; };
+```
+Order of operations matches llama.cpp: repeat penalty on a copy indexed by vocab
+id -> top_k -> softmax at `temp` -> top_p nucleus -> draw. The penalty is
+asymmetric (`x>0 ? x/pen : x*pen`) so the ordering around zero stays sane.
+`temp <= 0` short-circuits to argmax and skips the penalty entirely.
+Tie-break on token id inside the sort, otherwise two equal logits can reorder
+between runs and the same seed produces different text.
+
+`run/kata_run.cpp` reads the model's own recommendation from the GGUF
+(`general.sampling.top_k=50`, `temp=0.1`, `penalty_repeat=1.05`) and honours
+`tokenizer.ggml.eos_token_id=124900`; the vocab also flags 124895 as EOG, so
+both stop generation. Flags: `--gen N`, `--temp`, `--top-k`, `--top-p`,
+`--repeat-penalty`, `--repeat-last-n`, `--seed`.
+
+### Test
+13 tests in `tests/test_sampler.cpp`: greedy ignores the penalty, negative temp
+is greedy, top_k=1 equals greedy, top_k=0 is disabled, same seed is
+deterministic, top_p keeps only the nucleus (and a 0.5 nucleus over four equal
+logits admits exactly two symbols), the penalty lowers a positive logit and
+raises a negative one, the `repeat_last_n` window is respected, out-of-range
+history ids are ignored, an empty vocabulary throws, and a 2-way distribution
+with logit gap ln 3 samples at 3.0 +- 0.25 over 20000 draws.
+
+### Benchmark
+`/tmp/scost.cpp`, 128000 logits, temp 0.1 / top_k 50 / top_p 0.9 / penalty
+1.05: **126.4 us per sample** — 0.44% of a 28.5 ms token. `partial_sort` over
+the full vocab is the cost; not worth optimising yet.
+
+End to end, 128 generated tokens, 16 threads:
+| config | ms/token | tok/s |
+|---|---|---|
+| greedy (sampler bypassed) | 27.98 | 35.74 |
+| temp 0.7 / top_p 0.9 / pen 1.3 | 28.5-29.7 | 33.7-35.1 |
+
+One outlier run at 48.84 ms/token — the first run of the batch, cold page
+faults on the 512-token KV region, same effect measured in EXP-0020.
+
+### Quality
+Output is now coherent instead of degenerate. With temp 0.7 / top_p 0.9 /
+repeat 1.3 the model answers the prompt ("...The quick brown fox jumps over the
+lazy dog" then a short list of fruits and a numbered analysis) and stops at
+EOG in 3 of 3 seeds. Greedy still loops by construction — that is correct
+behaviour for argmax, not a bug.
+
+### Conclusion
+Keep. Without a sampler the engine cannot be used at all, and the cost is 0.4%.
+
+### Next
+Prefill in batches: at 28.5 ms/token the first 32 prompt tokens cost 0.9 s of
+pure decode that llama.cpp does at 199 tok/s.
