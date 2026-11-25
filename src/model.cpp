@@ -127,6 +127,12 @@ struct Model::Impl {
     std::vector<float> x, prev, norm_out, q, k, v, attn_out, bcx;
     std::vector<float> ffn_gate, ffn_up, ffn_down, moe_acc;
     std::vector<float> logits;
+    std::vector<float> attn_scratch;   // decode attention scratch, sized once
+    std::vector<float> d_logits, d_probs, d_w, d_gu, d_down;
+    std::vector<std::pair<float, uint32_t>> d_sel;
+    std::vector<block_q8_K> d_aq_down;
+    std::vector<const block_q8_K *> d_xd, d_xgu;
+    std::vector<const void *> d_wd, d_wgu;
     std::vector<block_q8_K> aq;
     // Decode-path scratch that used to be allocated per call. Steady-state
     // decode was paying a malloc/free for every one of the 30 shortconv layers.
@@ -194,6 +200,23 @@ struct Model::Impl {
         logits.assign(n_vocab, 0.0f);
         logits_ptr = logits.data();
         aq.assign(std::max({n_embd, n_ff, n_ff_exp}) / QK_K + 1, {});
+        // Decode-path scratch. moe_ffn used to allocate eight vectors per layer,
+        // 38 layers per token; the same reuse that EXP-0031 brought to prefill.
+        const size_t nu = n_expert_used;
+        d_logits.assign(n_expert, 0.0f);
+        d_probs.assign(n_expert, 0.0f);
+        d_sel.resize(n_expert);
+        d_w.assign(nu, 0.0f);
+        d_gu.assign(2 * nu * n_ff_exp, 0.0f);
+        d_aq_down.assign(nu * (n_ff_exp / QK_K), {});
+        d_down.assign(nu * n_embd, 0.0f);
+        d_xd.resize(nu);
+        d_wd.resize(nu);
+        d_wgu.resize(2 * nu);
+        d_xgu.resize(2 * nu);
+        // grouped decode attention wants n_heads/n_kv_heads floats per cached
+        // position plus 8 for the tail.
+        attn_scratch.assign(n_ctx * (n_head / n_head_kv) + 8, 0.0f);
         spr_3.assign(3 * n_embd / QK_K, {});
         spr_ao.assign(n_embd / QK_K, {});
         spr_out.assign(n_embd, 0.0f);
@@ -339,8 +362,7 @@ struct Model::Impl {
         a.head_dim = head_dim;
         a.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         a.out = attn_out.data();
-        std::vector<float> scratch(attention_scratch_floats_grouped(a));
-        attention_decode_grouped(a, scratch.data());
+        attention_decode_grouped(a, attn_scratch.data());
 
         mm(L.to, n_embd, n_head * head_dim, attn_out.data(), L.wo, attn_out.data());
     }
@@ -356,27 +378,28 @@ struct Model::Impl {
     }
 
     void moe_ffn(size_t il, const Layer & L, const std::vector<float> & in, std::vector<float> & out) {
-        std::vector<float> logits_e(n_expert);
-        gemv_f32(n_expert, n_embd, logits_e.data(), static_cast<const float *>(L.gate_inp), in.data());
+        float * logits_e = d_logits.data();
+        gemv_f32(n_expert, n_embd, logits_e, static_cast<const float *>(L.gate_inp), in.data());
 
-        std::vector<float> probs(n_expert);
+        float * probs = d_probs.data();
         for (size_t e = 0; e < n_expert; ++e)
             probs[e] = sigmoid_gate ? 1.0f / (1.0f + std::exp(-logits_e[e])) : logits_e[e];
 
         // Selection uses probs + bias; the weight comes from the unbiased prob.
         const float * bias = static_cast<const float *>(L.exp_probs_b);
-        std::vector<std::pair<float, uint32_t>> sel(n_expert);
+        auto * sel = d_sel.data();
         for (size_t e = 0; e < n_expert; ++e) sel[e] = { probs[e] + bias[e], static_cast<uint32_t>(e) };
-        std::partial_sort(sel.begin(), sel.begin() + n_expert_used, sel.end(),
+        std::partial_sort(sel, sel + n_expert_used, sel + n_expert,
                           [](const auto & a, const auto & b) { return a.first > b.first; });
 
-        std::vector<float> w(n_expert_used);
+        const size_t nu = n_expert_used;
+        float * w = d_w.data();
         float wsum = 0.0f;
-        for (size_t i = 0; i < n_expert_used; ++i) { w[i] = probs[sel[i].second]; wsum += w[i]; }
+        for (size_t i = 0; i < nu; ++i) { w[i] = probs[sel[i].second]; wsum += w[i]; }
         if (wsum < 6.103515625e-5f) wsum = 6.103515625e-5f;
         if (!dump_dir.empty()) {
-            dump(("moelogits" + std::to_string(il)).c_str(), logits_e.data(), n_expert);
-            dump(("moeprobs" + std::to_string(il)).c_str(), probs.data(), n_expert);
+            dump(("moelogits" + std::to_string(il)).c_str(), logits_e, n_expert);
+            dump(("moeprobs" + std::to_string(il)).c_str(), probs, n_expert);
             std::vector<float> biased(n_expert), wsel(n_expert_used), wn(n_expert_used);
             for (size_t e = 0; e < n_expert; ++e) biased[e] = probs[e] + bias[e];
             for (size_t i = 0; i < n_expert_used; ++i) { wsel[i] = w[i]; wn[i] = w[i] / wsum; }
@@ -392,7 +415,6 @@ struct Model::Impl {
         const size_t sb_g = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ge);
         const size_t sb_u = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ue);
         const size_t sb_d = n_embd * n_ff_exp / QK_K * ggml_type_size(L.t_de);
-        const size_t nu = n_expert_used;
         const uint8_t * bg = static_cast<const uint8_t *>(L.gate_exps);
         const uint8_t * bu = static_cast<const uint8_t *>(L.up_exps);
         const uint8_t * bd = static_cast<const uint8_t *>(L.down_exps);
@@ -402,8 +424,8 @@ struct Model::Impl {
         const auto q0 = std::chrono::steady_clock::now();
         quantize_row_q8_K(in.data(), aq.data(), n_embd);
         if (prof) t_q += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count();
-        const void * wgu[8];
-        const block_q8_K * xgu[8];
+        const void ** wgu = d_wgu.data();
+        const block_q8_K ** xgu = d_xgu.data();
         for (size_t i = 0; i < nu; ++i) {
             const uint32_t e = sel[i].second;
             wgu[2 * i]     = bg + e * sb_g;
@@ -411,27 +433,27 @@ struct Model::Impl {
             xgu[2 * i] = xgu[2 * i + 1] = aq.data();
         }
         // ffn_gate holds the gate results of all experts packed [i*n_ff_exp + j].
-        std::vector<float> gu(2 * nu * n_ff_exp);
+        float * gu = d_gu.data();
         if (L.t_ge == L.t_ue) {
-            mm_batch(L.t_ge, 2 * nu, n_ff_exp, n_embd, gu.data(), wgu, xgu);
+            mm_batch(L.t_ge, 2 * nu, n_ff_exp, n_embd, gu, wgu, xgu);
         } else {
             for (size_t i = 0; i < nu; ++i) {
-                mm_batch(L.t_ge, 1, n_ff_exp, n_embd, gu.data() + (2 * i) * n_ff_exp, wgu + 2 * i, xgu + 2 * i);
-                mm_batch(L.t_ue, 1, n_ff_exp, n_embd, gu.data() + (2 * i + 1) * n_ff_exp, wgu + 2 * i + 1, xgu + 2 * i + 1);
+                mm_batch(L.t_ge, 1, n_ff_exp, n_embd, gu + (2 * i) * n_ff_exp, wgu + 2 * i, xgu + 2 * i);
+                mm_batch(L.t_ue, 1, n_ff_exp, n_embd, gu + (2 * i + 1) * n_ff_exp, wgu + 2 * i + 1, xgu + 2 * i + 1);
             }
         }
 
         // Down projection: each expert now has a different activation, so those
         // four still share one call, with per-slot quantised copies.
-        std::vector<block_q8_K> aq_down(nu * (n_ff_exp / QK_K));
-        std::vector<const block_q8_K *> xd(nu);
-        std::vector<const void *> wd(nu);
+        block_q8_K * aq_down = d_aq_down.data();
+        const block_q8_K ** xd = d_xd.data();
+        const void ** wd = d_wd.data();
         for (size_t i = 0; i < nu; ++i) {
-            float * g = gu.data() + (2 * i) * n_ff_exp;
-            float * u = gu.data() + (2 * i + 1) * n_ff_exp;
+            float * g = gu + (2 * i) * n_ff_exp;
+            float * u = gu + (2 * i + 1) * n_ff_exp;
             silu_inplace(g, n_ff_exp);
             for (size_t j = 0; j < n_ff_exp; ++j) g[j] *= u[j];
-            block_q8_K * dst = aq_down.data() + i * (n_ff_exp / QK_K);
+            block_q8_K * dst = aq_down + i * (n_ff_exp / QK_K);
             quantize_row_q8_K(g, dst, n_ff_exp);
             xd[i] = dst;
             wd[i] = bd + sel[i].second * sb_d;
@@ -439,15 +461,15 @@ struct Model::Impl {
                 dump(("xgate" + std::to_string(i)).c_str(), g, n_ff_exp);
             }
         }
-        std::vector<float> down(nu * n_embd);
-        mm_batch(L.t_de, nu, n_embd, n_ff_exp, down.data(), wd.data(), xd.data());
+        float * down = d_down.data();
+        mm_batch(L.t_de, nu, n_embd, n_ff_exp, down, wd, xd);
 
         for (size_t i = 0; i < nu; ++i) {
             if (!dump_dir.empty() && il == 2) {
-                dump(("xdown" + std::to_string(i)).c_str(), down.data() + i * n_embd, n_embd);
+                dump(("xdown" + std::to_string(i)).c_str(), down + i * n_embd, n_embd);
             }
             const float wj = w[i] / wsum;
-            const float * d = down.data() + i * n_embd;
+            const float * d = down + i * n_embd;
             for (size_t j = 0; j < n_embd; ++j) out[j] += wj * d[j];
         }
     }
@@ -569,7 +591,7 @@ struct Model::Impl {
         const size_t nc = n_embd;
         const size_t d_conv = l_cache - 1;
 
-        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
         mmn(L.t_in, nc3, n_embd, pbcx.data(), nc3, L.in_proj, paq.data(), m);
 
         float * seq = pbx.data();
@@ -582,14 +604,14 @@ struct Model::Impl {
         // Tail of this chunk becomes the history for the next one.
         std::memcpy(hist, seq + m * nc, d_conv * nc * sizeof(float));
 
-        q8_rows(pconv_out.data(), m, n_embd, paq.data());
+        q8_rows_mt(pconv_out.data(), m, n_embd, paq.data());
         mmn(L.t_out, n_embd, n_embd, pattn.data(), n_embd, L.out_proj, paq.data(), m);
     }
 
     void attention_rows(size_t il, const Layer & L, size_t m, size_t pos0) {
         const size_t qw = n_head * head_dim;
         const size_t kvw = n_head_kv * head_dim;
-        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
         mmn(L.tq, qw, n_embd, pq.data(), qw, L.wq, paq.data(), m);
         mmn(L.tk, kvw, n_embd, pk.data(), kvw, L.wk, paq.data(), m);
         mmn(L.tv, kvw, n_embd, pv.data(), kvw, L.wv, paq.data(), m);
@@ -609,16 +631,16 @@ struct Model::Impl {
                           v_cache.data() + il * n_ctx * kvw, pos0, n_head, n_head_kv,
                           head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)),
                           pattn.data(), pool);
-        q8_rows(pattn.data(), m, qw, paq.data());
+        q8_rows_mt(pattn.data(), m, qw, paq.data());
         mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
     }
 
     void dense_ffn_rows(size_t il, const Layer & L, size_t m) {
-        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
         mmn(L.tg, n_ff, n_embd, pffn.data(), n_ff, L.gate, paq.data(), m);
         mmn(L.tu, n_ff, n_embd, pffn2.data(), n_ff, L.up, paq.data(), m);
         silu_mul(pffn.data(), pffn2.data(), m * n_ff);
-        q8_rows(pffn.data(), m, n_ff, paq.data());
+        q8_rows_mt(pffn.data(), m, n_ff, paq.data());
         mmn(L.td, n_embd, n_ff, pffn_out.data(), n_embd, L.down, paq.data(), m);
     }
 

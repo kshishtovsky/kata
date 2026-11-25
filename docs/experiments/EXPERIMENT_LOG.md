@@ -33,6 +33,7 @@
 | EXP-0029 | VNNI microkernel for q6_K, bias folded into the scale multiply | PASSED | 651 -> 1415 GMAC/s (2.2x); prefill 260 -> 268 tok/s, 25070 tok 137.0 -> 138.6 |
 | EXP-0030 | Spin-then-park thread pool (the CPU load "wave") | PASSED | prefill 268 -> 330 tok/s, 25070 tok 138.6 -> 154.7, decode 36.1 -> 41.6 tok/s |
 | EXP-0031 | Reuse MoE scratch across layers; ring-buffer shortconv | PASSED | prefill 330 -> 354-370 tok/s, logits unchanged; shortconv 331 -> 364 tok/s on its own (serial history shift removed, OOB at m<l_cache fixed) |
+| EXP-0033 | Multithreaded prefill quantisation (`q8_rows_mt`); decode scratch reuse | PASSED (prefill) / NEUTRAL (decode) | prefill 544 tok 354-370 -> 445.3-467.6 tok/s (parity with llama.cpp 465.23); decode 41.55-42.31 vs 45.78 tok/s (pool overhead ~25% in perf) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1979,3 +1980,81 @@ Keep both. They remove serial work without touching numerics.
 ### 11. Next Iteration
 
 Batch the per-expert GEMMs of a layer into one `pool.run`, then re-measure.
+
+---
+
+## EXP-0033 — Multithreaded prefill quantisation (`q8_rows_mt`); decode scratch reuse
+
+**ID:** EXP-0033
+**Date:** 2026-11-26
+**Status:** PASSED (prefill) / NEUTRAL (decode)
+
+### 1. Problem
+
+After EXP-0031 prefill reached 354-370 tok/s against `llama.cpp`'s ~441-465 tok/s CPU baseline, with single-threaded row quantisation (`q8_rows`) sitting serially in front of the chunk matmuls. On the decode path (`~40.7-41.6 tok/s` vs `~45 tok/s` in `llama.cpp`), `moe_ffn` and `attention` still allocated per-layer `std::vector` scratch buffers on every token (10 attention + 38 MoE layers).
+
+### 2. Hypothesis
+
+1. Replacing `q8_rows` with `q8_rows_mt` at the six prefill quantisation sites (`shortconv_rows`, `attention_rows`, `dense_ffn_rows`) removes the remaining serial activation-quantisation bottleneck and brings prefill to parity with `llama.cpp`.
+2. Hoisting the per-layer decode scratch vectors (`attn_scratch` and `moe_ffn`'s `d_*` buffers) into persistent `Model::Impl` members allocated once in `alloc()` eliminates per-layer heap churn during single-token decode (same class of fix as EXP-0031 in prefill), though decode may still be bounded by GEMV + thread-pool fan-out.
+
+### 3. Implementation
+
+`src/model.cpp`:
+
+- **Prefill quantisation:** replaced `q8_rows` with `q8_rows_mt` in `shortconv_rows` (2 sites), `attention_rows` (2 sites), and `dense_ffn_rows` (2 sites).
+- **Decode scratch reuse:** added persistent members on `Model::Impl` sized once in `alloc()`: `attn_scratch` (`n_ctx * (n_head / n_head_kv) + 8`), `d_logits`, `d_probs`, `d_sel`, `d_w`, `d_gu`, `d_aq_down`, `d_down`, `d_xd`, `d_wd`, `d_wgu`, `d_xgu`. Updated `attention` and `moe_ffn` to write into those buffers instead of allocating local `std::vector`s per layer.
+
+### 4. Modified Files
+
+`src/model.cpp`, `docs/experiments/EXPERIMENT_LOG.md`.
+
+### 5. Tests
+
+Rebuilt and ran `kata_tests` on the Ryzen 9 7950X3D host: **80/80 pass** (19 suites, 601 ms).
+
+### 6. Coverage
+
+`./scripts/coverage.sh`: **79.13%** total across kata sources (threshold 75%; previously 79.08%).
+
+### 7. Benchmark
+
+Ryzen 9 7950X3D, `LFM2.5-24B-A2B-Q4_K_M.gguf`, `KATA_MAX_THREADS=16`, same session (`HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES=""` for `llama-bench`):
+
+| Metric | Before (EXP-0031) | After (EXP-0033) | llama.cpp CPU (`-ngl 0 -t 16`) | Ratio vs llama.cpp |
+| --- | --- | --- | --- | --- |
+| Prefill 544 tok (warm, no `taskset`) | 354-370 tok/s | **445.3 - 467.6 tok/s** (cold 121.4) | 465.23 +/- 2.95 tok/s | ~0.96 - 1.01x (parity) |
+| Decode 128 tok (warm, no `taskset`) | 40.7 tok/s | **41.55 - 42.31 tok/s** (cold 34.97) | 45.78 +/- 0.04 tok/s | 1.08 - 1.10x slower |
+| Decode 128 tok (`taskset -c 0-15`, warm) | — | 40.49 tok/s (cold 22.68) | 15.67 +/- 0.49 tok/s | — |
+| 5-tok argmax / logit | 56085 / 17.78026 | 56085 / 17.78026 | matches | unchanged |
+| 544-tok argmax / logit | 17568 / 17.52197 | 17568 / 17.52197 | matches | unchanged |
+
+Note: pinning `taskset -c 0-15` (16 physical cores across both CCDs) throttled prefill on both `kata_run` (281.4-380.5 tok/s) and `llama-bench` (235.99 +/- 3.48 tok/s) under `powersave` scaling; unpinned `KATA_MAX_THREADS=16` runs match the earlier baseline methodology. Cold Run 1 pays OS mmap page faults on newly routed MoE experts.
+
+### 8. Quality
+
+Unchanged: identical 5-token (`argmax=56085`, `logit=17.78026`), 544-token (`argmax=17568`, `logit=17.52197`), and 128-token generated sequences (`argmax=3197`, `logit=24.76086`) across all runs.
+
+### 9. Bottleneck Analysis
+
+Decode attribution (`KATA_PROF=1` on `--gen 32`, steady-state `23.43-24.07 ms/token`):
+- `mm`: `16.11-16.71 ms` across `503` calls (`32.0-33.2 us/call`, ~68-70% of token time)
+- `quantize`: `0.53-0.56 ms` (~2.3%)
+- Phase split: `ffn` `14.96-15.58 ms` (63.8-64.8%), `mix` `5.57-5.76 ms` (23.5-24.2%), `lm` `2.76-2.85 ms` (11.6-12.0%), `norm` `0.02 ms` (0.1%).
+
+`perf record -e cycles -g` on `--gen 128` (`210K` samples, 0 lost):
+- `49.22%` `gemv_q4_K_q8_K_avx2_impl`
+- `23.76%` `ThreadPool::_M_run()` (worker spin/wait/dispatch overhead)
+- `19.33%` `gemv_q6_K_q8_K_avx2_impl`
+- `1.07%` `ThreadPool::run`
+- `0.95%` `native_queued_spin_lock_slowpath`
+
+~25% of total decode cycles sit in thread-pool spin/dispatch/synchronisation overhead across the 503 `mm` calls per token. Scratch reuse alone did not meaningfully change decode speed because heap allocation was minor compared to ~503 fan-outs/token and GEMV dispatch overhead.
+
+### 10. Conclusion
+
+Keep both changes: `q8_rows_mt` brings prefill to full parity with `llama.cpp` (~445-468 vs 465 tok/s), and decode scratch reuse removes unnecessary per-layer allocations cleanly without affecting numerics.
+
+### 11. Next Iteration
+
+Attribute and reduce decode thread-pool dispatch overhead (~25% of decode cycles across 503 fan-outs/token) and `mm_batch`/GEMV latency (e.g., evaluate whether fewer worker threads or CCD0-local execution reduces `ThreadPool::_M_run` spin/sync overhead on small GEMV buckets, and check `mm_batch` activation reuse / dispatch overhead in `ffn` and `mix`).
