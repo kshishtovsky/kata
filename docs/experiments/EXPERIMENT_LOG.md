@@ -256,3 +256,88 @@ A third failure mode appeared: a reset during `cmake --build` left
 
 **Guard added to this log's procedure:** no benchmark may exceed
 `KATA_MAX_THREADS`, and every harness must idle `1-KATA_DUTY` of wall clock.
+
+## EXP-0005 — Where the single-thread GEMV time actually goes
+
+**Date:** 2026-11-25
+**Status:** PASSED (diagnosis only, no kernel change kept)
+**Hypothesis:** the 1-thread gap (15.7 GB/s) against achievable bandwidth (43-79
+GB/s) is a dependency-chain latency problem, so more independent accumulators
+would close it.
+
+**Setup.** Synthetic q4_0 weights generated from N(0,1) and quantised with kata's
+own `quantize_row_q4_0`, so this isolates the kernel from weight distribution.
+576 MB working set (L3 is 96 MB), single thread pinned with `taskset -c 0`, best
+of 4 iterations, 50% duty cycle via `throttle`.
+
+### Access-pattern ablation (no arithmetic, same bytes)
+
+| shape | GB/s |
+|---|---|
+| sequential, 32-byte aligned | 79.07 |
+| sequential, 18-byte blocks | 65.48 |
+| 4-row interleaved tile walk | 35.58 |
+| full GEMV kernel | 17.03 |
+
+The cost splits roughly in half: the 4-row tile pattern gives up ~1.8x against a
+sequential walk, and the arithmetic gives up another ~2.1x.
+
+### Arithmetic ablation (4-row kernel, 576 MB)
+
+| variant | GB/s | what it isolates |
+|---|---|---|
+| touch bytes only (`xor`) | 67.29 | the machine's 1-thread ceiling |
+| integer accumulate, no fp | 35.61 | unpack + `vpdpbusd` cost 1.9x |
+| `raw_qs`, no nibble unpack | 23.84 | |
+| no `-8` bias correction | 22.04 | correction costs 1.33x |
+| full kernel | 16.58 | |
+
+### Chain-count experiment — hypothesis REJECTED
+
+The dependent chain is `vpdpbusd`(5) -> `sub`(1) -> `cvtepi32_ps`(3) -> `fmadd`(4),
+13 cycles. With 4 rows that is 3.25 cycles/block against 4.9 measured, so latency
+looked like the limiter. Measured instead:
+
+| shape (rows x K-chains) | GB/s |
+|---|---|
+| lib_best 4x1 | 15.31 |
+| **1x1** | **16.94** |
+| 4x1 | 15.54 |
+| 4x2 | 15.01 |
+| 4x4 | 11.04 |
+| 8x2 | 13.42 |
+
+More chains make it *worse*, and a single row single chain is the fastest of all.
+So the kernel is **instruction-throughput bound, not latency bound**. Also note
+the 4-row interleave, which EXP-0001 introduced and EXP-0003 kept, is a net loss
+in the DRAM regime — the 1x1 shape wins.
+
+### Two other candidate fixes, both rejected by measurement
+
+- **Algebraic removal of the bias correction.** `sum((u-8)y) = sum(uy) - 8*sum(y)`,
+  with the `-8*sum(y)` term moved to a second pass over the 2-byte scales. Verified
+  numerically exact on a small matrix (`-6.388366` vs `-6.388367`), then measured:
+  11.03 GB/s against 15.27. **Rejected** — reading 2 bytes out of every 18-byte
+  block touches every cache line again, so the second pass costs a full extra
+  memory traversal.
+- **Software prefetch at distances 4/8/16/24/32/48/64 blocks.** Best case 16.88
+  GB/s vs 15.26 unsignalled at 288 MB, but the ordering was not controlled and the
+  repeat run inverted it (17.61 baseline vs 14.06 prefetch). **Not adopted** —
+  effect is inside the noise floor and the hardware prefetcher already covers a
+  sequential stream.
+
+### Byte-level conclusion
+
+| format | bytes/value | values per scale | scale ALU per byte |
+|---|---|---|---|
+| q4_0 | 18/32 = 0.5625 | 32 | 1 per 0.5625 B |
+| q4_k | 144/256 = 0.5625 | 32 (8 sub-blocks of 32, 6-bit scales) | 1 per 4.5 B |
+
+q4_0 and q4_k occupy **identical bytes per value**, but q4_k amortises scale
+metadata over 8x more values. That is exactly the 1.33x the correction costs in
+the ablation. And q4_k is what the user's models actually contain (77.6% of
+LFM2.5-24B-A2B-Q4_K_M). Further q4_0 tuning is therefore capped: we and ggml sit
+at 17-20 GB/s with the same instruction budget, against a 67 GB/s memory ceiling.
+
+**Next:** implement `vec_dot_q8_0_q4_K` / q4_K GEMV. That is both the real workload
+and the format whose metadata cost is 8x smaller.
