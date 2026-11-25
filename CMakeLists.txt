@@ -1,0 +1,57 @@
+cmake_minimum_required(VERSION 3.20)
+project(kata LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+option(KATA_COVERAGE "Build with gcov instrumentation" OFF)
+
+add_library(kata_core
+  src/cpu.cpp
+  src/gemv.cpp
+  src/quant.cpp
+)
+target_include_directories(kata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(kata_core PRIVATE -Wall -Wextra -Wpedantic -O3)
+
+# Kernels carry their own target attributes so one binary runs on any x86 CPU
+# and picks the fastest path at runtime.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  target_compile_definitions(kata_core PRIVATE KATA_X86=1)
+endif()
+
+if(KATA_COVERAGE)
+  target_compile_options(kata_core PRIVATE --coverage -O0 -g)
+  target_link_options(kata_core PUBLIC --coverage)
+endif()
+
+add_executable(bench_gemv bench/bench_gemv.cpp)
+target_link_libraries(bench_gemv PRIVATE kata_core)
+
+# Optional : compares our kernels against a local llama.cpp build.
+add_executable(bench_vs_ggml bench/bench_vs_ggml.cpp)
+target_link_libraries(bench_vs_ggml PRIVATE kata_core ${CMAKE_DL_LIBS})
+
+find_package(GTest QUIET)
+if(NOT GTest_FOUND)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GTEST REQUIRED gtest_main)
+  add_executable(kata_tests EXCLUDE_FROM_ALL)
+  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp)
+  target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
+  target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
+else()
+  enable_testing()
+  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp)
+  target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
+endif()
+
+if(KATA_COVERAGE)
+  target_compile_options(kata_tests PRIVATE --coverage -O0 -g)
+endif()
+
+add_test(NAME unit COMMAND kata_tests)
