@@ -1,5 +1,7 @@
 build/
+build-*/
 *.o
 *.a
 *.gcda
 *.gcno
+*.gcov
