@@ -1,4 +1,8 @@
 #include "kata/gemv.h"
+
+#include <map>
+#include <memory>
+#include <mutex>
 #include "kata/cpu.h"
 #include "kata/quant.h"
 
@@ -166,7 +170,50 @@ void gemv_q4_0_q8_0_avx512(size_t rows, size_t cols, float * out, const block_q4
     }
 }
 
+__attribute__((target("avx512f,avx512vl,avx512bw,f16c,fma")))
+void gemv_q4_0_q8_0_avx512_r1(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+    const size_t nb = cols / QK;
+    const __m256i off = _mm256_set1_epi8(8);
+    for (size_t r = 0; r < rows; ++r) {
+        const block_q4_0 * wr = w + r * nb;
+        // One accumulator per 4 blocks: the chain is the dependency bottleneck
+        // when a single thread has to keep multiple DRAM requests in flight.
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        size_t b = 0;
+        for (; b + 3 < nb; b += 4) {
+            const __m256i qy0 = _mm256_loadu_si256((const __m256i *)x[b + 0].qs);
+            const __m256i qy1 = _mm256_loadu_si256((const __m256i *)x[b + 1].qs);
+            const __m256i qy2 = _mm256_loadu_si256((const __m256i *)x[b + 2].qs);
+            const __m256i qy3 = _mm256_loadu_si256((const __m256i *)x[b + 3].qs);
+            const __m256i sx0 = _mm256_sub_epi8(nibbles_q4_avx2(wr[b + 0].qs), off);
+            const __m256i sx1 = _mm256_sub_epi8(nibbles_q4_avx2(wr[b + 1].qs), off);
+            const __m256i sx2 = _mm256_sub_epi8(nibbles_q4_avx2(wr[b + 2].qs), off);
+            const __m256i sx3 = _mm256_sub_epi8(nibbles_q4_avx2(wr[b + 3].qs), off);
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(wr[b + 0].d) * _cvtsh_ss(x[b + 0].d)),
+                                   dot_i8_i8_avx2(sx0, qy0), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(wr[b + 1].d) * _cvtsh_ss(x[b + 1].d)),
+                                   dot_i8_i8_avx2(sx1, qy1), acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(wr[b + 2].d) * _cvtsh_ss(x[b + 2].d)),
+                                   dot_i8_i8_avx2(sx2, qy2), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(wr[b + 3].d) * _cvtsh_ss(x[b + 3].d)),
+                                   dot_i8_i8_avx2(sx3, qy3), acc3);
+        }
+        for (; b < nb; ++b) {
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(wr[b].d) * _cvtsh_ss(x[b].d)),
+                                   dot_i8_i8_avx2(_mm256_sub_epi8(nibbles_q4_avx2(wr[b].qs), off),
+                                                  _mm256_loadu_si256((const __m256i *)x[b].qs)), acc0);
+        }
+        out[r] = hsum_avx2(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
+    }
+}
+
 #else
+void gemv_q4_0_q8_0_avx512_r1(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+    gemv_q4_0_q8_0_ref(rows, cols, out, w, x);
+}
 void gemv_q4_0_q8_0_avx2(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
     gemv_q4_0_q8_0_ref(rows, cols, out, w, x);
 }
@@ -205,6 +252,21 @@ void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 *
         if (lo >= hi) return;
         gemv_q4_0_q8_0_best()(hi - lo, cols, out + lo, w + lo * nb, x);
     });
+}
+
+// Pools are cached per thread count so repeated calls do not respawn workers.
+static ThreadPool & pool_for(unsigned n_threads) {
+    static std::mutex mu;
+    static std::map<unsigned, std::unique_ptr<ThreadPool>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cache.find(n_threads);
+    if (it == cache.end())
+        it = cache.emplace(n_threads, std::make_unique<ThreadPool>(n_threads)).first;
+    return *it->second;
+}
+
+void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x, unsigned n_threads) {
+    gemv_q4_0_q8_0_mt(rows, cols, out, w, x, pool_for(n_threads));
 }
 
 void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {

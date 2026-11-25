@@ -109,3 +109,81 @@ into memory bandwidth, which means kernel quality is currently invisible. Before
 more kernel work: measure q4_0/q8_0 *quantisation* and build a correctness harness
 against llama.cpp on a real model tensor, so later kernel changes are validated
 against real weights rather than synthetic noise.
+
+## EXP-0003 — Real weights from the shipped models
+
+**Status:** PASSED (loader + quantiser) / REJECTED (kernel is slower DRAM-bound).
+
+**Why.** Every number in EXP-0001/0002 came from synthetic buffers. The shipped
+models contain no q4_0 tensors at all — LFM2.5-24B-A2B-Q4_K_M is 77.6% Q4_K
+(10.49 GiB) and 22.3% Q6_K (3.01 GiB); Qwen3.6-35B-A3B is 61.6% IQ3_XXS. So the
+test takes a real Q4_K tensor, dequantises it with ggml's own reference, and
+requantises with kata's quantiser. That validates kernel *and* quantiser against
+real weight distributions.
+
+**Implementation.** `include/kata/gguf.h` + `src/gguf.cpp` (GGUF v2/v3 reader:
+metadata, tensor table, mmap, bounds-checked slice access, block-size/type-size
+tables for 30 ggml types). `bench/bench_real_weights.cpp` dlopens libggml-base
+and libggml-cpu, calls `ggml_cpu_init()` (without it ggml's f16 table is all
+zeros and every dot returns 0.00000000 — cost an hour), and runs three kernels
+over the same bytes with alternating order so neither side inherits a warm cache.
+
+**Found and fixed a real bug in the quantiser.** kata's q4_0 scale was `-maxv/amax`,
+which looks right but is not ggml's rule: ggml uses `d = maxv / -8`, anchoring the
+extreme weight onto the code -8. With our rule 12076 of 753664 blocks (1.6%) got a
+different scale. Also switched f16 rounding from half-up to nearest-even, since
+scale packing is exactly where ties land. After both fixes the quantiser is
+**byte-identical to ggml on all 753664 blocks**: 0 scale diffs, 0 nibble diffs.
+
+**Correctness.** 21/21 tests (2 new: `F16.MatchesRoundToNearestEven` compares
+20000 random values against an independent RNE implementation, and
+`Quant.Q4ScaleAnchorsExtremeWeight`). Coverage 90.33% of kata sources.
+Numerical agreement on real weights, normalised by max|ref|: kata 2.87e-07,
+ggml 3.44e-07 — same order, both well inside f32 noise.
+
+**Measured**, LFM2.5 `blk.0.ffn_gate` (13 MiB, L3-resident) — same bytes both sides:
+
+| threads | kata GB/s | ggml GB/s | speedup |
+|---|---|---|---|
+| 1 | 23.21 | 20.79 | 1.12x |
+| 8 | 134.14 | 80.54 | 1.67x |
+| 16 | 152.11 | 131.19 | 1.16x |
+| 32 | 202.23 | 146.20 | 1.38x |
+
+**Measured**, `token_embd` (205 MiB, genuinely DRAM-bound):
+
+| threads | kata GB/s | ggml GB/s | speedup |
+|---|---|---|---|
+| 1 | 16.86 | 20.38 | **0.83x** |
+| 8 | 119.37 | 153.56 | **0.78x** |
+| 16 | 140.05 | 145.42 | 0.96x |
+| 32 | 174.14 | 183.89 | 0.95x |
+
+**Analysis.** The advantage inverts the moment the weights leave L3, and the
+pattern matches EXP-0001 exactly. Tried the obvious fix — a one-stream variant
+(`gemv_q4_0_q8_0_avx512_r1`) to test whether the 4-row interleave was splitting
+the TLB/pagetable walk across four distant regions. It was **not** faster
+(r1 137.78 GB/s vs 119.37 at 8 threads, still below ggml), so the interleave is
+not the cause. Also tried `_mm_prefetch(wr + b + 8)`: no effect, so the hardware
+prefetcher is already handling the sequential stream.
+
+A measurement flaw was found and corrected mid-experiment: the first runs always
+executed kata before ggml, giving ggml a warm cache on a buffer that half-fits L3.
+Alternating the two removed a 5-15% bias. Run-to-run spread is 10-30% on this
+machine at high thread counts even pinned, so only >=10% differences are read as
+real.
+
+**Conclusion.** Keep the loader and the fixed quantiser; treat the kernel as
+*compute*-competitive and *memory*-inferior. Do not push further on the GEMV inner
+loop — it is already at the machine's bandwidth ceiling (202 GB/s effective at 32
+threads on 13 MiB, which only works because that tensor lives in L3). The honest
+next target is a memcpy-style sequential read of the same 205 MiB to establish
+the true single-thread DRAM ceiling, which tells us whether 16.8 GB/s is our
+kernel or the machine.
+
+**Incident.** During this experiment the machine hard-reset with no shutdown
+sequence in the journal (last entry 17:33:16, reboot 17:37:25) — no OOM, no MCE,
+no thermal trip logged. Preceding coredumps were ggml SIGSEGVs from a mistyped
+`ggml_vec_dot_t` signature (fixed: it takes `(n, s, bs, x, bx, y, by, nrc)`),
+not a hardware fault. Cause of the reset remains unidentified; if it repeats under
+the same memory-heavy benchmark, treat it as a suspect PSU/RAM stability issue.

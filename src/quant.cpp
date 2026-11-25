@@ -1,5 +1,6 @@
 #include "kata/quant.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -36,33 +37,34 @@ float f16_to_f32(uint16_t h) {
 }
 
 uint16_t f32_to_f16(float f) {
+    // Round-to-nearest-even: half-up rounding here produced different scales than
+    // ggml on 1.6% of blocks. Kept scalar because this runs on the load path only.
     uint32_t x;
     std::memcpy(&x, &f, sizeof(x));
-    const uint32_t s = (x >> 16) & 0x8000u;
-    int32_t e = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
-    uint32_t m = x & 0x007fffffu;
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t exp = (x >> 23) & 0xffu;
+    uint32_t mant = x & 0x007fffffu;
 
-    if (((x >> 23) & 0xffu) == 0xffu) {                 // inf / nan
-        return (uint16_t)(s | 0x7c00u | (m ? 0x200u : 0u));
-    }
-    if (e >= 0x1f) return (uint16_t)(s | 0x7c00u);      // overflow -> inf
-    if (e <= 0) {                                       // subnormal / underflow
-        if (e < -10) return (uint16_t)s;
-        m |= 0x00800000u;
+    if (exp == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0u));  // inf / nan
+
+    int32_t e = (int32_t)exp - 127 + 15;
+    if (e >= 0x1f) return (uint16_t)(sign | 0x7c00u);                            // overflow
+    if (e <= 0) {                                                                // subnormal
+        if (e < -10) return (uint16_t)sign;
+        mant |= 0x00800000u;
         const uint32_t sh = (uint32_t)(14 - e);
-        uint32_t r = m >> sh;
-        if (m & (1u << (sh - 1))) {                     // round half up
-            r += 1;
-            if (r & 0x00000400u) { r = 0x000003ffu; }
-        }
-        return (uint16_t)(s | r);
+        uint32_t r = mant >> sh;
+        const uint32_t rem = mant & ((1u << sh) - 1);
+        const uint32_t halfway = 1u << (sh - 1);
+        if (rem > halfway || (rem == halfway && (r & 1))) ++r;
+        return (uint16_t)(sign | r);
     }
-    uint32_t r = m >> 13;
-    if (m & 0x00001000u) {                              // round half up
-        r += 1;
-        if (r & 0x00000400u) { r = 0; e += 1; if (e >= 0x1f) return (uint16_t)(s | 0x7c00u); }
+    uint32_t r = mant >> 13;
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) {
+        if (++r == 0x400u) { r = 0; if (++e >= 0x1f) return (uint16_t)(sign | 0x7c00u); }
     }
-    return (uint16_t)(s | ((uint32_t)e << 10) | r);
+    return (uint16_t)(sign | ((uint32_t)e << 10) | r);
 }
 
 void quantize_row_q8_0(const float * x, block_q8_0 * y, size_t n) {
@@ -83,6 +85,29 @@ void quantize_row_q8_0(const float * x, block_q8_0 * y, size_t n) {
             if (q > 127) q = 127;
             if (q < -127) q = -127;
             y[i].qs[j] = (int8_t)q;
+        }
+    }
+}
+
+void quantize_row_q4_0(const float * x, block_q4_0 * y, size_t n) {
+    const size_t nb = n / QK;
+    for (size_t i = 0; i < nb; ++i) {
+        const float * xi = x + i * QK;
+        // Same rule as ggml: keep the signed extreme with the largest magnitude.
+        float amax = 0.0f, maxv = 0.0f;
+        for (int j = 0; j < QK; ++j) {
+            const float v = xi[j];
+            if (std::fabs(v) > amax) { amax = std::fabs(v); maxv = v; }
+        }
+        (void)amax;
+        // ggml maps the extreme value to -8 exactly, so the scale is -maxv/8.
+        const float d = maxv / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        y[i].d = f32_to_f16(d);
+        for (int j = 0; j < QK / 2; ++j) {
+            const int lo = std::min(15, (int)(xi[j] * id + 8.5f));
+            const int hi = std::min(15, (int)(xi[j + QK / 2] * id + 8.5f));
+            y[i].qs[j] = (uint8_t)(lo | (hi << 4));
         }
     }
 }

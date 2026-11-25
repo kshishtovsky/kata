@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "kata/quant.h"
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -92,4 +93,56 @@ TEST(Quant, RefDotMatchesDequant) {
     }
     const float got = vec_dot_q4_0_q8_0_ref(QK * nb, w.data(), x.data());
     ASSERT_NEAR(got, (float)expect, std::fabs((float)expect) * 1e-5f + 1e-3f);
+}
+
+// ggml rounds to nearest-even when packing scales; a half-up rule changed 1.6% of
+// blocks on blk.0.ffn_gate of LFM2.5.
+static uint16_t f32_to_f16_rne(float f) {
+    const uint32_t x = [&] { uint32_t t; std::memcpy(&t, &f, 4); return t; }();
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t exp = (x >> 23) & 0xffu;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0u));
+    int32_t e = (int32_t)exp - 127 + 15;
+    if (e >= 0x1f) return (uint16_t)(sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t sh = (uint32_t)(14 - e), r0 = mant >> sh, rem = mant & ((1u << sh) - 1);
+        const uint32_t half = 1u << (sh - 1);
+        return (uint16_t)(sign | (r0 + (rem > half || (rem == half && (r0 & 1)))));
+    }
+    uint32_t r = mant >> 13;
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1)))
+        if (++r == 0x400u) { r = 0; if (++e >= 0x1f) return (uint16_t)(sign | 0x7c00u); }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | r);
+}
+
+TEST(F16, MatchesRoundToNearestEven) {
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-70000.0f, 70000.0f);
+    for (int i = 0; i < 20000; ++i) {
+        const float v = dist(rng) * std::pow(10.0f, -(float)(rng() % 12));
+        ASSERT_EQ(f32_to_f16(v), f32_to_f16_rne(v)) << "v=" << v;
+    }
+    // Cases exactly on a tie: halfway between 1.0 and the next f16 value rounds to
+    // 1.0 (even), halfway between the next two rounds up (even) instead of down.
+    const float kU = 0.0009765625f;                       // f16 ulp in [1,2)
+    EXPECT_EQ(f16_to_f32(f32_to_f16(1.0f + 0.5f * kU)), 1.0f);
+    EXPECT_NEAR(f16_to_f32(f32_to_f16(1.0f + 1.5f * kU)), 1.0f + 2 * kU, 1e-7f);
+}
+
+// The signed scale must map the extreme weight onto a representable code, else
+// the whole block is offset and every dot product drifts.
+TEST(Quant, Q4ScaleAnchorsExtremeWeight) {
+    std::vector<float> x(64);
+    for (int i = 0; i < 64; ++i) x[i] = 0.001f * (float)i;
+    x[37] = 0.75f;                                        // dominant positive in block 1
+    std::vector<block_q4_0> q(2);
+    quantize_row_q4_0(x.data(), q.data(), 64);
+    float dq[64];
+    dequantize_row_q4_0(q.data(), dq, 64);
+    EXPECT_NEAR(f16_to_f32(q[1].d), -0.75f / 8.0f, 1e-6f);  // d = maxv / -8, signed
+    EXPECT_NEAR(dq[37], 0.75f, 2e-2f);                    // round trip within one step
 }

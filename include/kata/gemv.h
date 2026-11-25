@@ -14,6 +14,9 @@ void gemv_q4_0_q8_0_avx512(size_t rows, size_t cols, float * out, const block_q4
 
 // Best kernel the current CPU supports.
 GemvFn gemv_q4_0_q8_0_best();
+// Same math, one row per pass: used to test whether interleaving four weight
+// streams hurts once the weights no longer fit in cache.
+void gemv_q4_0_q8_0_avx512_r1(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x);
 const char * gemv_best_name();
 
 // Multi-threaded driver. Rows are split into one contiguous block per worker so
@@ -22,5 +25,6 @@ void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 *
 
 // Convenience: lazily creates one pool of default_threads().
 void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x);
+void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x, unsigned n_threads);
 
 } // namespace kata

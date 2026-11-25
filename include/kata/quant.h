@@ -10,6 +10,7 @@ uint16_t f32_to_f16(float f);
 
 // x: n floats, n must be a multiple of QK. y holds n/QK blocks.
 void quantize_row_q8_0(const float * x, block_q8_0 * y, size_t n);
+void quantize_row_q4_0(const float * x, block_q4_0 * y, size_t n);
 void dequantize_row_q4_0(const block_q4_0 * x, float * y, size_t n);
 
 // Independent scalar reference, used to validate every SIMD path.
