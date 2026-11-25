@@ -36,6 +36,7 @@
 | EXP-0033 | Multithreaded prefill quantisation (`q8_rows_mt`); decode scratch reuse | PASSED (prefill) / NEUTRAL (decode) | prefill 544 tok 354-370 -> 445.3-467.6 tok/s (parity with llama.cpp 465.23); decode 41.55-42.31 vs 45.78 tok/s (pool overhead ~25% in perf) |
 | EXP-0034 | Vectorised router GEMV (`gemv_f32_avx2`) and shortconv decode step | PASSED | decode 24.1 -> 22.8 ms/token (41.5 -> 42.9 tok/s); exact numerical match (56085 / 17568 unchanged); router GEMV 1.36 -> 0.16 ms (8.3x) |
 | EXP-0035 | Fused attention QKV (`gemv_qkv_mt`), vectorized MoE down accumulation & residual add, lock-free ThreadPool dispatch | PASSED | decode 22.8 -> 23.13 ms/tok (42.9 -> 43.24 tok/s); exact numerical match (56085 / 17568); eliminated 20 pool dispatches & redundant quantizations; lock-free pool when spinning |
+| EXP-0036 | Weighted thread partitioning for causal prefill attention | PASSED | Attention kernel 5.39 -> 2.86 ms (1.88x speedup); work imbalance 30x -> <1.15x; 544-tok prefill 445 tok/s, bitwise exact logits |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2202,3 +2203,74 @@ Keep all changes. Fusing attention QKV, vectorizing MoE down accumulation & resi
 Remaining gap to llama.cpp is ~1.33 ms (43.24 vs 45.86 tok/s):
 1. Investigate multi-row unrolling in `gemv_q4_K_q8_K` (currently single row per pass in AVX2).
 2. Examine prefetching or batching expert down projections.
+
+## EXP-0036 — Weighted Thread Partitioning for Causal Attention Prefill
+
+**Status:** PASSED
+**Date:** 2026-11-26
+
+### 1. Context & Problem Statement
+
+In causal attention prefill (`attention_prefill_mt`), token $t$ attends to all cached positions $0 \dots n_{kv\_begin} + t$, requiring $n_{kv\_begin} + t + 1$ dot products per query row.
+Previously, tokens were split equally across threads:
+`rows_per = (n_tok + nw - 1) / nw`.
+
+For $n\_tok = 544$ and $nw = 16$ threads ($n_{kv\_begin} = 0$), each thread received 34 tokens:
+- Thread 0 processed tokens $0 \dots 33$: cumulative work = $\sum_{t=0}^{33} (t+1) = 595$ dot products.
+- Thread 15 processed tokens $510 \dots 543$: cumulative work = $\sum_{t=510}^{543} (t+1) = 17,935$ dot products.
+
+Thread 15 did **30.1x more work** than thread 0! The first 15 threads completed quickly and spent the remainder of the layer spinning idly in user space waiting for thread 15 to finish, severely degrading multicore scaling.
+
+### 2. Hypothesis
+
+1. Partitioning tokens dynamically such that the cumulative work $W(a, b) = \sum_{t=a}^{b-1} (n_{kv\_begin} + t + 1)$ is balanced across $nw$ threads will eliminate thread idling.
+2. The partition boundaries can be computed in closed form using the quadratic root:
+   $$W(0, T) = \frac{T^2 + (2 n_{kv\_begin} + 1) T}{2} = W_{target} \implies T = \frac{-b + \sqrt{b^2 + 8 W_{target}}}{2}$$
+   where $b = 2 n_{kv\_begin} + 1$.
+3. Thread balancing will yield up to a 1.8-2.0x speedup in the attention prefill kernel while leaving logits completely bitwise identical.
+
+### 3. Implementation
+
+- **`include/kata/prefill.h`**: declared `std::vector<size_t> prefill_weighted_partition_bounds(size_t n_tok, size_t n_kv_begin, unsigned nw)`.
+- **`src/prefill.cpp`**:
+  - Implemented analytical quadratic root solution with monotonic bounds clamping in $O(nw)$ time.
+  - Wired `prefill_weighted_partition_bounds` into `attention_prefill_mt`.
+- **`tests/test_prefill.cpp`**:
+  - Added `Prefill.WeightedPartitionBalancing`: verified that for $n\_tok = 544, nw = 16$, work per worker is within $10\%$ of target, with ratio $max/min < 1.15$ (down from $30x$).
+  - Added `Prefill.WeightedPartitionMonotonicityAndBounds`: verified boundary correctness, monotonic ordering, and edge cases across combinations of token counts ($0 \dots 2048$), prefix lengths ($0 \dots 25000$), and thread counts ($1 \dots 32$).
+
+### 4. Modified Files
+
+`include/kata/prefill.h`, `src/prefill.cpp`, `tests/test_prefill.cpp`, `docs/experiments/EXPERIMENT_LOG.md`.
+
+### 5. Tests & Coverage
+
+- 86/86 unit tests pass (21 test suites, 598 ms).
+- `./scripts/coverage.sh`: **80.02%** overall kata source coverage (`src/prefill.cpp` at 87.50%).
+
+### 6. Benchmark
+
+Measured on AMD Ryzen 9 7950X3D (Zen 4, 16C/32T), `LFM2.5-24B-A2B-Q4_K_M.gguf`, `KATA_MAX_THREADS=16`:
+
+| Metric | Before (EXP-0035) | After (EXP-0036) | Delta / Speedup |
+| --- | --- | --- | --- |
+| Attention prefill kernel ($n=544, nw=16$) | 5.389 ms | **2.861 ms** | **1.88x speedup (-46.9% latency)** |
+| Work imbalance across 16 threads | 30.1x (3000%) | **< 1.15x (< 15%)** | **26x load balance improvement** |
+| Prefill throughput (544 tokens) | 445 tok/s | **447.9 tok/s** | Maintained high throughput |
+| 5-tok argmax / logit | 56085 / 17.78026 | **56085 / 17.78026** | **bitwise exact match** |
+| 544-tok argmax / logit | 17568 / 17.52197 | **17568 / 17.52197** | **bitwise exact match** |
+
+### 7. Quality
+
+Bitwise exact match across all reference prompts (`argmax=56085 logit=17.78026` on 5-tok, `argmax=17568 logit=17.52197` on 544-tok).
+
+### 8. Conclusion
+
+Keep all changes. Analytical weighted partitioning resolves the fundamental load imbalance inherent to causal attention without any iterative approximation overhead, yielding a 1.88x kernel speedup with bitwise exact numeric equivalence.
+
+### 9. Next Iteration
+
+Continue user's prefill optimization roadmap:
+1. **Tiled Attention**: Reuse loaded K/V across query positions while respecting causal mask.
+2. **ISA Dispatch**: Decouple AVX-512 attention kernel gating from unnecessary `Avx512Vnni` check.
+3. **SIMD Exp**: Integrate `exp256_ps` in the softmax loop.

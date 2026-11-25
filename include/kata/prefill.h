@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 namespace kata {
 
@@ -28,5 +29,10 @@ void attention_prefill_mt(const float * q, size_t n_tok,
                           const float * k_cache, const float * v_cache,
                           size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
                           size_t head_dim, float scale, float * out, ThreadPool & pool);
+
+// Returns worker token boundaries [0 = b[0] <= b[1] <= ... <= b[nw] = n_tok]
+// such that the cumulative causal attention cost W = sum(n_kv_begin + t + 1)
+// is balanced across nw threads.
+std::vector<size_t> prefill_weighted_partition_bounds(size_t n_tok, size_t n_kv_begin, unsigned nw);
 
 } // namespace kata

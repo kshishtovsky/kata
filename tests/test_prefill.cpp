@@ -138,3 +138,53 @@ TEST(Prefill, MtSplitMatchesSingleThreaded) {
         }
     }
 }
+
+TEST(Prefill, WeightedPartitionBalancing) {
+    const size_t n_tok = 544, n_kv_begin = 0;
+    const unsigned nw = 16;
+    const auto bounds = kata::prefill_weighted_partition_bounds(n_tok, n_kv_begin, nw);
+
+    ASSERT_EQ(bounds.size(), nw + 1);
+    EXPECT_EQ(bounds[0], 0u);
+    EXPECT_EQ(bounds[nw], n_tok);
+
+    std::vector<double> work(nw);
+    double total_work = 0.0;
+    for (unsigned w = 0; w < nw; ++w) {
+        ASSERT_LE(bounds[w], bounds[w + 1]);
+        double w_w = 0.0;
+        for (size_t t = bounds[w]; t < bounds[w + 1]; ++t) {
+            w_w += static_cast<double>(n_kv_begin + t + 1);
+        }
+        work[w] = w_w;
+        total_work += w_w;
+    }
+
+    const double expected_work = total_work / nw;
+    double max_work = work[0], min_work = work[0];
+    for (unsigned w = 0; w < nw; ++w) {
+        max_work = std::max(max_work, work[w]);
+        min_work = std::min(min_work, work[w]);
+        // Every thread should be within 10% of the target work
+        EXPECT_NEAR(work[w], expected_work, expected_work * 0.10) << "thread " << w;
+    }
+    // Balance ratio max/min should be < 1.15 (vs 30x unweighted!)
+    EXPECT_LT(max_work / min_work, 1.15);
+}
+
+TEST(Prefill, WeightedPartitionMonotonicityAndBounds) {
+    for (size_t n_tok : {0u, 1u, 2u, 5u, 16u, 37u, 128u, 544u, 2048u}) {
+        for (size_t n_kv_begin : {0u, 1u, 10u, 512u, 2048u, 25000u}) {
+            for (unsigned nw : {1u, 2u, 4u, 8u, 16u, 32u}) {
+                const auto b = kata::prefill_weighted_partition_bounds(n_tok, n_kv_begin, nw);
+                ASSERT_EQ(b.size(), nw + 1);
+                EXPECT_EQ(b[0], 0u);
+                EXPECT_EQ(b[nw], n_tok);
+                for (unsigned w = 0; w < nw; ++w) {
+                    EXPECT_LE(b[w], b[w + 1]);
+                    EXPECT_LE(b[w + 1], n_tok);
+                }
+            }
+        }
+    }
+}

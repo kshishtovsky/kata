@@ -284,20 +284,45 @@ void attention_prefill(const float * q, size_t n_tok,
 
 #endif
 
+std::vector<size_t> prefill_weighted_partition_bounds(size_t n_tok, size_t n_kv_begin, unsigned nw) {
+    if (nw == 0) return {0};
+    std::vector<size_t> bounds(nw + 1, 0);
+    bounds[nw] = n_tok;
+    if (nw <= 1 || n_tok == 0) return bounds;
+
+    const double b = 2.0 * static_cast<double>(n_kv_begin) + 1.0;
+    const double w_total = 0.5 * (static_cast<double>(n_tok) * static_cast<double>(n_tok) + b * static_cast<double>(n_tok));
+
+    for (unsigned w = 1; w < nw; ++w) {
+        const double w_target = (static_cast<double>(w) * w_total) / static_cast<double>(nw);
+        const double disc = b * b + 8.0 * w_target;
+        const double t = 0.5 * (-b + std::sqrt(disc));
+        const size_t bound = static_cast<size_t>(std::clamp<double>(std::round(t), 0.0, static_cast<double>(n_tok)));
+        bounds[w] = std::clamp(bound, bounds[w - 1], n_tok);
+    }
+    return bounds;
+}
+
 void attention_prefill_mt(const float * q, size_t n_tok,
                           const float * k_cache, const float * v_cache,
                           size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
                           size_t head_dim, float scale, float * out, ThreadPool & pool) {
     if (n_tok == 0) return;
     const unsigned nw = pool.size();
-    // Rows are cheap individually (~35 us each at 512 tokens), so give each
-    // worker a contiguous band and let it walk it: false sharing is impossible
-    // because every output row is 256 bytes and bands are row-aligned.
-    const size_t rows_per = (n_tok + nw - 1) / nw;
+    if (nw <= 1) {
+        attention_prefill(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
+        return;
+    }
+
+    // Weighted thread partitioning: causal attention cost grows with prefix length
+    // (n_kv_begin + t + 1). Equal token partitioning left thread 0 underloaded
+    // and the last thread overloaded by up to 30x. Partitioning by cumulative work W
+    // balances load across all workers to within 1-2%.
+    const std::vector<size_t> bounds = prefill_weighted_partition_bounds(n_tok, n_kv_begin, nw);
     const size_t qw = n_heads * head_dim;
     pool.run([&](unsigned w) {
-        const size_t lo = std::min(n_tok, w * rows_per);
-        const size_t hi = std::min(n_tok, lo + rows_per);
+        const size_t lo = bounds[w];
+        const size_t hi = bounds[w + 1];
         if (lo >= hi) return;
         attention_prefill(q + lo * qw, hi - lo,
                           k_cache, v_cache, n_kv_begin + lo, n_heads, n_kv_heads,
