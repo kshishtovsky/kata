@@ -12,6 +12,7 @@
 | EXP-0008 | q6_K GEMV (22.3% of the shipped models) | PASSED | 1.03x ggml at 35.92 GB/s; caught a two-sub-block-per-maddubs scale bug |
 | EXP-0009 | RMSNorm + backend boundary | PASSED | 5.5-6.3x over scalar, 97-112 GB/s; coverage tool was under-reporting by 19pp |
 | EXP-0010 | RoPE | PASSED | 1.05-1.15x over scalar after caching the frequency table; both layouts supported |
+| EXP-0011 | Decode attention + KV layout | PASSED | 2.2-2.9x over scalar; 17.5 ms at 32k context, becomes the dominant cost |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -704,3 +705,78 @@ benchmark would catch.
 
 A single transformer block wired through the backend, so a forward pass can be
 profiled end to end and the real bottleneck identified instead of guessed.
+
+## EXP-0011 — Decode attention and the KV cache layout
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** decode attention is memory-bound on the KV cache, so a vectorised
+3-pass softmax (scores, exp/sum, weighted v) should approach the bandwidth
+ceiling and the gain over scalar should grow with context depth.
+
+### Implementation
+
+- `include/kata/attn.h`, `src/attn.cpp`: `AttnArgs`, `attention_decode_ref`,
+  `attention_decode_avx2`, `attention_decode`, and `kv_slot(cache, pos, n_kv_heads, head_dim)`
+  which returns the position-major slot. GQA is handled by
+  `head_of(h) = h / (n_heads / n_kv_heads)`.
+- Three passes rather than one: the running max has to be known before `exp`,
+  so scores land in `scratch[n_kv]`, then exponentiate and sum, then accumulate v.
+- Scoring uses `_mm256_fmadd_ps` on two accumulators plus a horizontal reduce.
+- v accumulation writes the output row once and re-reads it per position instead
+  of holding it in registers: `head_dim` can exceed the 16 ymm registers, and the
+  row stays in L1, so this is free and keeps the loop simple.
+
+### Benchmark
+
+1 thread pinned, `32 heads / 8 kv heads x 64 dim` (LFM2.5 shape), median of 200:
+
+| n_kv | scalar | vector | gain | KV size |
+|---|---|---|---|---|
+| 1 | 1.51 us | 0.77 us | 1.96x | 0 MiB |
+| 128 | 141.3 us | 64.6 us | 2.19x | 0.5 MiB |
+| 1024 | 1200 us | 438 us | 2.74x | 4 MiB |
+| 4096 | 4816 us | 1734 us | 2.78x | 16 MiB |
+| 16384 | 19247 us | 6925 us | 2.78x | 64 MiB |
+| 32768 | 50600 us | 17544 us | 2.88x | 128 MiB |
+
+The gain flattens at ~2.8x instead of approaching the memory ceiling, which says
+the kernel is not yet bandwidth-bound. At 32768 the vector path reads 128 MiB of
+KV in 17.5 ms = **7.3 GB/s**, against a 43 GB/s single-thread read ceiling. There
+is a 5.9x gap sitting in this kernel.
+
+### The number that matters
+
+17.5 ms per token at 32k context, single-threaded. For scale: a q4_K GEMV row of
+2048 takes ~0.08 us at 78 GB/s, so one layer's projections are ~0.5 ms of work
+across all rows — meaning **past roughly 2-4k context, single-threaded decode
+attention costs more than the entire matrix work of a layer**. Attention, not
+GEMV, is the thing to fix for long context.
+
+### Known limitation, deliberately not fixed here
+
+`attention_decode` does not loop over KV in blocks, so the v-accumulation pass
+re-reads the whole KV from a context that may exceed L3 (128 MiB) — at 32k it is
+exactly at the L3 size. Blocked (tiled) attention over positions is the standard
+answer and is the obvious next step; it was left out of this iteration to keep the
+change to one thing, and because it needs its own benchmark to prove anything.
+
+### Tests
+
+`Attn.VectorMatchesRefAcrossShapes` (GQA, MHA, MQA, head_dim divisible by 8 but
+not 16, and head_dim not divisible by 8 to exercise the scalar tail),
+`Attn.FirstTokenReturnsExactlyV` (at n_kv = 1 softmax is 1, so the output must
+equal v exactly — catches a wrong GQA mapping but not a missing normalisation),
+`Attn.EqualScoresGiveMeanOfV` (replaced a broken "invariance to score offset"
+test: scaling k does NOT leave softmax unchanged, it sharpens it),
+`Attn.KvSlotIsDisjointAndPositionMajor`.
+
+### Conclusion
+
+Keep. Correct across shapes, 2.2-2.9x over scalar, and it told us where the real
+long-context cost is. 88.39% coverage, 47/47 tests.
+
+### Next
+
+Blocked (tiled) decode attention — loop over KV in L2-sized chunks so the v pass
+never re-reads DRAM, and measure whether the 5.9x gap to the read ceiling closes.

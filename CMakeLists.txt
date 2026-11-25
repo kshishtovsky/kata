@@ -17,6 +17,7 @@ add_library(kata_core
   src/gguf.cpp
   src/gemv.cpp
   src/pool.cpp
+  src/attn.cpp
   src/rope.cpp
   src/quant.cpp
 )
@@ -37,6 +38,8 @@ endif()
 add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv PRIVATE kata_core)
 
+add_executable(bench_attn bench/bench_attn.cpp)
+target_link_libraries(bench_attn PRIVATE kata_core)
 add_executable(bench_rope bench/bench_rope.cpp)
 target_link_libraries(bench_rope PRIVATE kata_core)
 add_executable(bench_norm bench/bench_norm.cpp)
@@ -56,12 +59,12 @@ if(NOT GTest_FOUND)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(GTEST REQUIRED gtest_main)
   add_executable(kata_tests EXCLUDE_FROM_ALL)
-  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp)
+  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp tests/test_attn.cpp)
   target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
   target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
 else()
   enable_testing()
-  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp)
+  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp tests/test_attn.cpp)
   target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
 endif()
 
