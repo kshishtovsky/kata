@@ -16,6 +16,7 @@
 | EXP-0012 | Grouped-KV decode attention | FAILED | All 4 variants slower at 32k (24.2 vs 17.5 ms); reverted |
 | EXP-0013 | Register accumulators + vectorised exp | PASSED | 32k decode 17.5 -> 11.7 ms (1.50x); gain over scalar 2.84x -> 4.16x |
 | EXP-0014 | Batched score pass (4 positions/iter) | PASSED | 16k 4206 -> 3863 us (1.09x); 32k flat; N=8/16/32 all worse |
+| EXP-0015 | Grouped decode (one kv walk per GQA group) | PASSED | 32k 13.3 -> 8.0 ms (1.66x); 16k 3.81 -> 2.05 ms (1.86x) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -971,3 +972,69 @@ costs more than it saves.
 
 **Next.** Measure the score and v passes separately so the remaining 12.8 ms at
 32k can be attributed before choosing another target.
+
+## EXP-0015 — Grouped decode attention
+
+**Status:** PASSED. Supersedes the EXP-0012 failure.
+
+**Hypothesis.** A phase split of the 12.8 ms 32k decode gave 6915 us score /
+225 us softmax / 5778 us weighted-v. With 32 query heads over 8 kv heads, four
+heads share each kv head, so both passes read every k and v row four times: at
+32k that is 256 MiB touched out of 64 MiB of real data. Walking each kv head
+once for all four of its query heads should cut that 4x.
+
+**Why EXP-0012 failed at the same idea.** EXP-0012 tried the same grouping and
+lost at 32k in every variant. The difference here is that the score pass keeps
+`NT x G` accumulators in registers and the v pass needs AVX-512 for its register
+budget, so no per-position store-to-memory round trip survives. EXP-0012's
+grouped loop stored each score and read it back for the running max.
+
+**Implementation.** `src/attn.cpp`:
+- `scores_group<G, NT>()` — NT positions x G heads of `__m256` accumulators (8
+  ymms at G=4, NT=2), one k load per position shared by all G heads.
+- `v_group<G>()` — `__m512` accumulators, 4 heads x 64 floats = 16 zmm; AVX-512
+  is used for the register budget, not for wider math.
+- `attention_decode_avx2_grouped()` — dispatch plus a scalar tail for odd
+  position counts. Falls back to the plain kernel unless G==4, head_dim%16==0
+  and head_dim<=64.
+- New API: `attention_scratch_floats_grouped()` (G heads x n_kv) and
+  `attention_decode_grouped()`.
+- Diagnostic: `attention_decode_phases()` plus `AttnArgs::base`, so the bench can
+  time score / softmax / v separately. Public callers leave `base` at 0.
+
+**Correctness.** `Attn.GroupedMatchesPlainDecode` compares the grouped kernel
+against the plain one over 8 shapes, including the three fallback shapes (G=1,
+hd=96, hd=32 with an odd position count) and checks for NaN. 49/49 tests.
+
+**Measured** (Ryzen 9 7950X3D, 1 thread pinned, 32 heads / 8 kv heads x 64 dim,
+median of 30 iters):
+
+| n_kv | plain us | grouped us | gain |
+|---|---|---|---|
+| 1024 | 238 | 137 | 1.74x |
+| 4096 | 951 | 557 | 1.71x |
+| 16384 | 3814 | 2053 | 1.86x |
+| 32768 | 13282 | 8012 | 1.66x |
+
+Cumulative against the original scalar decode: 32k is now 8.0 ms vs 53.5 ms,
+**6.7x**, and vs the start of EXP-0013 (17.5 ms) 2.2x.
+
+**Analysis.** Grouping helps at every depth and peaks at 16k. At 32k the KV is
+exactly the 128 MiB L3, so the group walk's four-head reuse competes with itself
+in cache; that is the same plateau EXP-0014 hit. The 32k number is also the
+noisiest (8.0-8.4 ms across runs).
+
+**Bottleneck after this change.** Re-measured phases at 32k: score 7088 us,
+softmax 187 us, v 6114 us. Both passes still sit near 37 GB/s of effective
+traffic, well under the 43-59 GB/s single-thread ceiling, so the remaining gap is
+instruction throughput in the score kernel and the 16 zmm v accumulator, not
+memory.
+
+**Conclusion.** Keep. The grouped path is now the default for GQA shapes with
+G=4, which is what LFM2.5 and Qwen3.6 use.
+
+**Next.** The v pass is now as expensive as the score pass. It recomputes
+`set1` per head per position and re-reads v once per group; splitting it so v is
+read once into L1 and used by all four heads, and hoisting the four
+probabilities into one broadcast, is the next experiment.
+

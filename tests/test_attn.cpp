@@ -107,6 +107,44 @@ TEST(Attn, KvSlotIsDisjointAndPositionMajor) {
         for (size_t i = 0; i < n_kv_heads * hd; ++i)
             EXPECT_EQ(kata::kv_slot(cache.data(), p, n_kv_heads, hd)[i], (float)(p * 100 + i));
 }
+TEST(Attn, GroupedMatchesPlainDecode) {
+    // The grouped kernel is a separate code path with its own scratch layout, so
+    // it has to agree with the plain one on every shape it accepts, and fall back
+    // unchanged on every shape it does not.
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    struct C { size_t nh, nkv, hd, n_kv; };
+    const C cases[] = {
+        {32, 8, 64, 1}, {32, 8, 64, 37}, {32, 8, 64, 256}, {32, 8, 64, 4097},
+        {8, 8, 64, 129},   // G=1: must fall back
+        {8, 2, 96, 200},   // G=4 but hd=96: must fall back
+        {8, 2, 32, 63},    // G=4, hd=32, odd n_kv
+        {16, 4, 16, 511},
+    };
+    for (const auto & c : cases) {
+        auto q = rnd(c.nh * c.hd, 11);
+        auto k = rnd(c.n_kv * c.nkv * c.hd, 12);
+        auto v = rnd(c.n_kv * c.nkv * c.hd, 13);
+        kata::AttnArgs a{};
+        a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
+        a.n_kv = c.n_kv; a.n_heads = c.nh; a.n_kv_heads = c.nkv;
+        a.head_dim = c.hd; a.scale = 1.0f / std::sqrt((float)c.hd);
+        std::vector<float> want(c.nh * c.hd), got(c.nh * c.hd);
+        a.out = want.data();
+        std::vector<float> s1(kata::attention_scratch_floats(a));
+        kata::attention_decode(a, s1.data());
+        a.out = got.data();
+        std::vector<float> s2(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s2.data());
+        for (size_t i = 0; i < want.size(); ++i) {
+            ASSERT_FALSE(std::isnan(got[i])) << "heads=" << c.nh << "/" << c.nkv
+                                             << " hd=" << c.hd << " n_kv=" << c.n_kv << " i=" << i;
+            EXPECT_NEAR(got[i], want[i], 5e-4f * std::max(1.0f, std::fabs(want[i])))
+                << "heads=" << c.nh << "/" << c.nkv << " hd=" << c.hd
+                << " n_kv=" << c.n_kv << " i=" << i;
+        }
+    }
+}
+
 TEST(Attn, ExtremeScoresMatchRefAfterClamp) {
     // The vector path replaces exp with a polynomial and clamps the exponent
     // range. Wild score spans are normal with untrained or saturated attention,

@@ -3,6 +3,7 @@
 #include "kata/cpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #ifndef SCORE_N
@@ -239,49 +240,190 @@ void scores_n(const AttnArgs & a, const float * q, size_t base, size_t t0, size_
     }
 }
 
+// One query head: score every cached position, return the max for softmax.
+__attribute__((target("avx2,fma")))
+float attn_head_scores(const AttnArgs & a, float * scratch) {
+    const float * q = a.q;
+    const size_t hd = a.head_dim;
+    const size_t base = a.base;
+    float mx = -INFINITY;
+    size_t t = 0;
+    for (; t + SCORE_N <= a.n_kv; t += SCORE_N) {
+        scores_n<SCORE_N>(a, q, base, t, hd, a.scale, scratch + t);
+        for (int j = 0; j < SCORE_N; ++j) mx = std::max(mx, scratch[t + j]);
+    }
+    for (; t < a.n_kv; ++t) {
+        const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
+        const float s = dot_avx2(q, k, hd) * a.scale;
+        scratch[t] = s;
+        mx = std::max(mx, s);
+    }
+    return mx;
+}
+
+// One query head: weighted sum of v, normalised by 1/sum.
+__attribute__((target("avx2,fma")))
+void attn_head_v(const AttnArgs & a, const float * p, float inv) {
+    float * o = a.out;
+    const size_t hd = a.head_dim;
+    const size_t base = a.base;
+    const size_t nv = hd / 8;
+    switch (nv) {
+    case 1:  v_accum<1>(a, o, p, hd, base, inv); break;
+    case 2:  v_accum<2>(a, o, p, hd, base, inv); break;
+    case 4:  v_accum<4>(a, o, p, hd, base, inv); break;
+    case 8:  v_accum<8>(a, o, p, hd, base, inv); break;
+    case 16: v_accum<16>(a, o, p, hd, base, inv); break;
+    default: v_accum_generic(a, o, p, hd, base, inv); break;
+    }
+}
+
+// G query heads share one kv head. Walking the kv head once and scoring all G
+// against the same k block removes the G-fold re-read of K, which the phase
+// split showed was 256 MiB per token at 32k for 64 MiB of actual data.
+// Accumulators: NT positions x G heads; NT=2, G=4 -> 8 ymm, fits with room.
+template <int G, int NT>
+__attribute__((target("avx2,fma")))
+void scores_group(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd,
+                  const float * scale, float * out, float * mx) {
+    const size_t stride = a.n_kv_heads * hd;
+    const float * k0 = a.k_cache + t0 * stride + base;
+    __m256 acc[NT][G];
+    for (int j = 0; j < NT; ++j)
+        for (int h = 0; h < G; ++h) acc[j][h] = _mm256_setzero_ps();
+
+    size_t i = 0;
+    for (; i + 8 <= hd; i += 8) {
+        __m256 kv[NT];
+        for (int j = 0; j < NT; ++j) kv[j] = _mm256_loadu_ps(k0 + j * stride + i);
+        for (int h = 0; h < G; ++h) {
+            const __m256 qv = _mm256_loadu_ps(q + h * hd + i);
+            for (int j = 0; j < NT; ++j) acc[j][h] = _mm256_fmadd_ps(qv, kv[j], acc[j][h]);
+        }
+    }
+    for (int j = 0; j < NT; ++j) {
+        for (int h = 0; h < G; ++h) {
+            __m128 t = _mm_add_ps(_mm256_castps256_ps128(acc[j][h]), _mm256_extractf128_ps(acc[j][h], 1));
+            t = _mm_hadd_ps(t, t);
+            t = _mm_hadd_ps(t, t);
+            float sc = _mm_cvtss_f32(t);
+            for (size_t z = i; z < hd; ++z) sc += q[h * hd + z] * k0[j * stride + z];
+            sc *= scale[h];
+            out[h * a.n_kv + t0 + j] = sc;
+            mx[h] = std::max(mx[h], sc);
+        }
+    }
+}
+
+// G heads sharing one kv head: weighted sum of v. AVX-512 is used for the
+// register budget alone -- 4 heads x 64 floats is 16 zmm accumulators, which
+// AVX2's 16 ymm cannot hold without spilling.
+template <int G>
+__attribute__((target("avx512f,avx512vl,avx512bw,fma")))
+void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const float * inv,
+             float * out, size_t nv_zmm) {
+    const size_t stride = a.n_kv_heads * hd;
+    __m512 acc[G][4];
+    for (int h = 0; h < G; ++h)
+        for (size_t j = 0; j < nv_zmm; ++j) acc[h][j] = _mm512_setzero_ps();
+
+    for (size_t t = 0; t < a.n_kv; ++t) {
+        const float * v = a.v_cache + t * stride + base;
+        __m512 pv[G];
+        for (int h = 0; h < G; ++h) pv[h] = _mm512_set1_ps(p[h * a.n_kv + t]);
+        for (size_t j = 0; j < nv_zmm; ++j) {
+            const __m512 vv = _mm512_loadu_ps(v + j * 16);
+            for (int h = 0; h < G; ++h) acc[h][j] = _mm512_fmadd_ps(pv[h], vv, acc[h][j]);
+        }
+    }
+    for (int h = 0; h < G; ++h) {
+        const __m512 iv = _mm512_set1_ps(inv[h]);
+        for (size_t j = 0; j < nv_zmm; ++j)
+            _mm512_storeu_ps(out + h * hd + j * 16, _mm512_mul_ps(acc[h][j], iv));
+        for (size_t i = nv_zmm * 16; i < hd; ++i) {
+            float s = 0.0f;
+            for (size_t t = 0; t < a.n_kv; ++t) s += p[h * a.n_kv + t] * a.v_cache[t * stride + base + i];
+            out[h * hd + i] = s * inv[h];
+        }
+    }
+}
+
 } // namespace
 
 __attribute__((target("avx2,fma")))
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
     const size_t hd = a.head_dim;
     for (size_t h = 0; h < a.n_heads; ++h) {
-        const float * q = a.q + h * hd;
-        const size_t base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
+        AttnArgs one = a;
+        one.n_heads = 1;
+        one.q = a.q + h * hd;
+        one.out = a.out + h * hd;
+        one.base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
 
-        float mx = -INFINITY;
-        size_t t = 0;
-        for (; t + SCORE_N <= a.n_kv; t += SCORE_N) {
-            scores_n<SCORE_N>(a, q, base, t, hd, a.scale, scratch + t);
-            for (int j = 0; j < SCORE_N; ++j) mx = std::max(mx, scratch[t + j]);
-        }
-        for (; t < a.n_kv; ++t) {
-            const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
-            const float s = dot_avx2(q, k, hd) * a.scale;
-            scratch[t] = s;
-            mx = std::max(mx, s);
-        }
-
+        const float mx = attn_head_scores(one, scratch);
         const float sum = softmax_exp_inplace(scratch, a.n_kv, mx);
+        attn_head_v(one, scratch, 1.0f / sum);
+    }
+}
 
-        float * o = a.out + h * hd;
-        const float inv = 1.0f / sum;
-        const size_t nv = hd / 8;
+// Grouped variant: one kv head serves G query heads, so both passes walk the
+// kv cache once per group instead of once per head.
+size_t attention_scratch_floats_grouped(const AttnArgs & a) {
+    const size_t g = a.n_heads / a.n_kv_heads;
+    return a.n_kv * (g ? g : 1) + 8;
+}
 
-        // The accumulator has to live in a register. Storing it back to o every
-        // position forces a store-forwarding round trip per 8 floats, which
-        // profiling put at 38% of the kernel.
-        switch (nv) {
-        case 1:  v_accum<1>(a, o, scratch, hd, base, inv); break;
-        case 2:  v_accum<2>(a, o, scratch, hd, base, inv); break;
-        case 4:  v_accum<4>(a, o, scratch, hd, base, inv); break;
-        case 8:  v_accum<8>(a, o, scratch, hd, base, inv); break;
-        case 16: v_accum<16>(a, o, scratch, hd, base, inv); break;
-        default: v_accum_generic(a, o, scratch, hd, base, inv); break;
+__attribute__((target("avx2,fma")))
+void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
+    const size_t hd = a.head_dim;
+    const size_t g = a.n_heads / a.n_kv_heads;
+
+    // Only the G=4, head_dim%16==0 shape has a register-resident v pass.
+    if (g != 4 || hd % 16 != 0 || hd > 64) {
+        attention_decode_avx2(a, scratch);
+        return;
+    }
+
+    alignas(64) float scale[4], mxv[4], inv[4];
+    for (size_t h = 0; h < 4; ++h) {
+        scale[h] = a.scale;
+        mxv[h] = -INFINITY;
+    }
+
+    for (size_t gb = 0; gb < a.n_kv_heads; ++gb) {
+        const size_t base = gb * hd;
+        const float * q = a.q + gb * 4 * hd;
+
+        float * p = scratch;  // 4 heads x n_kv probabilities, head-major
+        size_t t = 0;
+        for (; t + 2 <= a.n_kv; t += 2)
+            scores_group<4, 2>(a, q, base, t, hd, scale, p, mxv);
+        // Odd tail position: reuse the NT=2 kernel on a copy would read past the
+        // cache, so score it per head.
+        if (t < a.n_kv) {
+            for (size_t h = 0; h < 4; ++h) {
+                const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
+                const size_t hi = gb * 4 + h;
+                const float sc = dot_avx2(a.q + hi * hd, k, hd) * a.scale;
+                p[h * a.n_kv + t] = sc;
+                mxv[h] = std::max(mxv[h], sc);
+            }
         }
+
+        for (size_t h = 0; h < 4; ++h) {
+            float * ph = p + h * a.n_kv;
+            const float sum = softmax_exp_inplace(ph, a.n_kv, mxv[h]);
+            inv[h] = 1.0f / sum;
+        }
+
+        v_group<4>(a, p, hd, base, inv, a.out + gb * 4 * hd, hd / 16);
     }
 }
 
 #else
+void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
+    attention_decode_avx2(a, scratch);
+}
 
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
     attention_decode_ref(a, scratch);
@@ -294,6 +436,46 @@ size_t attention_scratch_floats(const AttnArgs & a) {
     // query head and scratch only needs one head's scores.
     (void)a;
     return a.n_kv + 8;
+}
+
+void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[3]) {
+    // Mirrors attention_decode pass by pass; keep the two in step.
+    double us[3] = {0, 0, 0};
+    const size_t hd = a.head_dim;
+    if (cpu_isa() == Isa::Scalar) {
+        attention_decode(a, scratch);
+        out_us[0] = out_us[1] = out_us[2] = 0.0;
+        return;
+    }
+#if defined(__x86_64__) || defined(__i386__)
+    for (size_t h = 0; h < a.n_heads; ++h) {
+        AttnArgs one = a;
+        one.n_heads = 1;
+        one.q = a.q + h * hd;
+        one.out = a.out + h * hd;
+        one.base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const float mx = attn_head_scores(one, scratch);
+        const auto t1 = std::chrono::steady_clock::now();
+        const float sum = softmax_exp_inplace(scratch, a.n_kv, mx);
+        const auto t2 = std::chrono::steady_clock::now();
+        attn_head_v(one, scratch, 1.0f / sum);
+        const auto t3 = std::chrono::steady_clock::now();
+        us[0] += std::chrono::duration<double, std::micro>(t1 - t0).count();
+        us[1] += std::chrono::duration<double, std::micro>(t2 - t1).count();
+        us[2] += std::chrono::duration<double, std::micro>(t3 - t2).count();
+    }
+#endif
+    for (int i = 0; i < 3; ++i) out_us[i] = us[i];
+}
+
+void attention_decode_grouped(const AttnArgs & a, float * scratch) {
+    if (cpu_isa() == Isa::Scalar) {
+        attention_decode_ref(a, scratch);
+        return;
+    }
+    attention_decode_avx2_grouped(a, scratch);
 }
 
 void attention_decode(const AttnArgs & a, float * scratch) {

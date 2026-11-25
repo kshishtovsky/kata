@@ -17,6 +17,9 @@ struct AttnArgs {
     size_t head_dim;
     float scale;            // 1/sqrt(head_dim), passed in because some models differ
     float * out;            // [n_heads * head_dim]
+    // Offset of this head's kv slice inside one position's row. Set by the
+    // decode loop; callers of attention_decode leave it at 0.
+    size_t base = 0;
 };
 
 void attention_decode_ref(const AttnArgs & a, float * scratch);
@@ -24,6 +27,15 @@ void attention_decode_avx2(const AttnArgs & a, float * scratch);
 // scratch must hold at least attention_scratch_floats(a) floats: the scores of
 // one kv group, which is (n_heads / n_kv_heads) * n_kv.
 size_t attention_scratch_floats(const AttnArgs & a);
+
+// Diagnostic only: same decode as attention_decode, but reports the elapsed
+// microseconds of the score, softmax and weighted-v passes separately.
+void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[3]);
+
+// Variant that walks the kv cache once per group of query heads instead of once
+// per head. Needs its own, larger scratch: see attention_scratch_floats_grouped.
+size_t attention_scratch_floats_grouped(const AttnArgs & a);
+void attention_decode_grouped(const AttnArgs & a, float * scratch);
 void attention_decode(const AttnArgs & a, float * scratch);
 
 // Writes k and v for one token into the cache slot at a->n_kv - 1, applying
