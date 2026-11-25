@@ -19,11 +19,15 @@ float f16_to_f32(uint16_t h) {
             out = s << 31;
         } else {
             // subnormal: normalize
+            // f16 subnormal value is m * 2^-24; after `shift` steps bit 10 is
+            // set, so the exponent is 113 - shift in f32 biased form. Using
+            // 112 - shift here made every subnormal half its true size, which
+            // is what broke q4_K blocks 3/4/6 of a real model.
             uint32_t mm = m;
             int shift = 0;
             while ((mm & 0x00000400u) == 0) { mm <<= 1; ++shift; }
             mm &= 0x000003ffu;
-            out = (s << 31) | ((127 - 15 - shift) << 23) | (mm << 13);
+            out = (s << 31) | ((uint32_t)(113 - shift) << 23) | (mm << 13);
         }
     } else if (e == 0x1f) {
         out = (s << 31) | 0x7f800000u | (m << 13);
@@ -136,6 +140,97 @@ float vec_dot_q4_0_q8_0_ref(size_t n, const block_q4_0 * x, const block_q8_0 * y
             isum += lo * (int)y[b].qs[j] + hi * (int)y[b].qs[j + QK / 2];
         }
         sum += d * (float)isum;
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------- K-quants
+
+void q4_K_scale_min(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        // 6 bits do not fit in 8, so the top 2 bits of each scale live in the
+        // high bits of the earlier bytes.
+        *d = (uint8_t)((q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+void quantize_row_q8_K(const float * x, block_q8_K * y, size_t n) {
+    const size_t nb = n / QK_K;
+    for (size_t i = 0; i < nb; ++i) {
+        const float * xi = x + i * QK_K;
+        float maxv = 0.0f, amax = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const float ax = std::fabs(xi[j]);
+            if (ax > amax) { amax = ax; maxv = xi[j]; }
+        }
+        if (amax == 0.0f) {
+            y[i].d = 0.0f;
+            std::memset(y[i].qs, 0, QK_K);
+            std::memset(y[i].bsums, 0, sizeof y[i].bsums);
+            continue;
+        }
+        // ggml uses -127/max rather than -128 so the AVX path stays in int8.
+        const float iscale = -127.0f / maxv;
+        for (int j = 0; j < QK_K; ++j) {
+            y[i].qs[j] = (int8_t)std::min(127, (int)std::nearbyint(iscale * xi[j]));
+        }
+        for (int j = 0; j < QK_K / 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) sum += y[i].qs[j * 16 + ii];
+            y[i].bsums[j] = (int16_t)sum;
+        }
+        y[i].d = 1.0f / iscale;
+    }
+}
+
+void dequantize_row_q4_K(const block_q4_K * x, float * y, size_t n) {
+    const size_t nb = n / QK_K;
+    for (size_t i = 0; i < nb; ++i) {
+        const float d = f16_to_f32(x[i].d);
+        const float dmin = f16_to_f32(x[i].dmin);
+        const uint8_t * q = x[i].qs;
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            q4_K_scale_min(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmin * (float)m;
+            q4_K_scale_min(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmin * (float)m;
+            for (int l = 0; l < 32; ++l) y[i * QK_K + j + l] = d1 * (float)(q[l] & 0x0f) - m1;
+            for (int l = 0; l < 32; ++l) y[i * QK_K + j + 32 + l] = d2 * (float)(q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+float vec_dot_q4_K_q8_K_ref(size_t n, const block_q4_K * x, const block_q8_K * y) {
+    float sum = 0.0f;
+    for (size_t b = 0; b < n / QK_K; ++b) {
+        const float d = f16_to_f32(x[b].d) * y[b].d;
+        const float dmin = f16_to_f32(x[b].dmin) * y[b].d;
+        int is = 0;
+        const uint8_t * q = x[b].qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            q4_K_scale_min(is + 0, x[b].scales, &sc, &m);
+            int acc1 = 0, acc2 = 0, sy1 = 0, sy2 = 0;
+            for (int l = 0; l < 32; ++l) {
+                acc1 += (q[l] & 0x0f) * (int)y[b].qs[j + l];
+                acc2 += (q[l] >> 4) * (int)y[b].qs[j + 32 + l];
+                sy1 += (int)y[b].qs[j + l];
+                sy2 += (int)y[b].qs[j + 32 + l];
+            }
+            sum += d * (float)sc * (float)acc1 - dmin * (float)m * (float)sy1;
+            q4_K_scale_min(is + 1, x[b].scales, &sc, &m);
+            sum += d * (float)sc * (float)acc2 - dmin * (float)m * (float)sy2;
+            q += 32;
+            is += 2;
+        }
     }
     return sum;
 }

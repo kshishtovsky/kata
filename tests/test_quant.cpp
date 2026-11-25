@@ -15,6 +15,23 @@ TEST(F16, RoundTripRepresentative) {
     }
 }
 
+TEST(F16, SubnormalsAreNotHalved) {
+    // Every f16 subnormal: value must be mantissa * 2^-24 exactly. This is the
+    // regression that corrupted q4_K blocks with small super-block scales.
+    for (uint32_t m = 1; m < 0x400; ++m) {
+        const float expect = (float)m * 5.9604644775390625e-08f;  // 2^-24
+        const float got = kata::f16_to_f32((uint16_t)m);
+        ASSERT_EQ(got, expect) << "m=" << m;
+        ASSERT_EQ(kata::f16_to_f32((uint16_t)(m | 0x8000u)), -expect);
+    }
+    ASSERT_EQ(kata::f16_to_f32(0x0001u), std::ldexp(1.0f, -24));
+    ASSERT_EQ(kata::f16_to_f32(0x03ffu), 1023.0f * std::ldexp(1.0f, -24));
+    // Round trip through the encoder must also survive.
+    for (uint32_t m = 1; m < 0x400; ++m) {
+        ASSERT_EQ(kata::f32_to_f16((float)m * 5.9604644775390625e-08f), (uint16_t)m) << "m=" << m;
+    }
+}
+
 TEST(F16, SpecialValues) {
     EXPECT_TRUE(std::isinf(f16_to_f32(f32_to_f16(1e30f))));
     EXPECT_TRUE(std::isnan(f16_to_f32(f32_to_f16(NAN))));

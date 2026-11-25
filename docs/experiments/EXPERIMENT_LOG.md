@@ -4,6 +4,10 @@
 |----|------|--------|--------|
 | EXP-0001 | q4_0 x q8_0 AVX-512 VNNI GEMV vs ggml | PASSED (compute-bound) / NEEDS_RESEARCH (DRAM) | 1.26x faster L3-resident, 0.88x when DRAM-bound |
 | EXP-0002 | Multi-threaded GEMV + thread pool | PASSED | 19.20 -> 82.77 GB/s (4.31x) at 32 threads; 90.84% coverage |
+| EXP-0003 | Real weights from the shipped models | PASSED | quantiser byte-identical to ggml; 1.11x L3, 0.88x DRAM at 1 thread |
+| EXP-0004 | Load guard for benchmarks | PASSED | KATA_MAX_THREADS + duty cycle; noise 10-30% -> 0.2% |
+| EXP-0005 | Where single-thread GEMV time goes | PASSED | instruction-throughput bound, not latency; 4-row interleave is a loss in DRAM regime |
+| EXP-0006 | q4_K GEMV on real model weights (CPU-first format pivot) | PASSED | 1.006x ggml at 26.95 GB/s DRAM-bound; AVX-512 path 0.83x, rejected |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -341,3 +345,95 @@ at 17-20 GB/s with the same instruction budget, against a 67 GB/s memory ceiling
 
 **Next:** implement `vec_dot_q8_0_q4_K` / q4_K GEMV. That is both the real workload
 and the format whose metadata cost is 8x smaller.
+
+## EXP-0006 — q4_K GEMV on real model weights
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** q4_K carries the same 0.5625 bytes/value as q4_0 but amortises
+scale metadata over 8x more values (EXP-0005), so a q4_K kernel should reach the
+same bandwidth as ggml's best AVX2 path while consuming the format the shipped
+models actually contain — and unlike q4_0 it has no per-block bias correction to
+pay for.
+
+### Problem
+
+All previous kernels were q4_0, a format that appears in **none** of the user's
+models (LFM2.5-24B-A2B-Q4_K_M is 77.6% Q4_K / 22.3% Q6_K by bytes; Qwen3.6-35B
+is 61.6% IQ3_XXS). Optimising q4_0 was therefore optimising a format we would
+never load.
+
+### Implementation
+
+- `include/kata/types.h`: `QK_K = 256`, `K_SCALE_SIZE = 12`, `block_q4_K`
+  (144 B, static_asserted) and `block_q8_K` (292 B, static_asserted).
+- `src/quant.cpp`: `q4_K_scale_min`, `quantize_row_q8_K` (ggml's `-127/max`
+  rule, byte-identical output verified), `dequantize_row_q4_K`,
+  `vec_dot_q4_K_q8_K_ref`.
+- `src/gemv.cpp`: `gemv_q4_K_q8_K_avx2_impl` — one row per pass, sequential
+  weight stream, no bias correction in the hot loop (the min term rides on
+  `block_q8_K.bsums`), `__attribute__((target(...)))` so one binary runs anywhere.
+- `bench/bench_k4.cpp`: lifts the tensor **verbatim** out of the .gguf (no
+  dequantise/requantise round trip), replicates whole rows past L3, and times
+  kata against `ggml_vec_dot_q4_K_q8_K`.
+
+### Bug found and fixed on the way
+
+`f16_to_f32` was wrong for **every** f16 subnormal: it used `112 - shift` instead
+of `113 - shift`, so each one came out at half its true value. Real weights hit
+this — blocks 3, 4 and 6 of `blk.0.ffn_gate.weight` have super-block scales
+`0x0350`, `0x0398`, `0x03b5`, i.e. exponent field 0. Symptom: 739 of 2048
+dequantised elements differed from ggml and the dot came out `-0.755659` instead
+of `-0.256831`. Regression test `F16.SubnormalsAreNotHalved` now walks all 1023
+subnormals and round-trips them.
+
+### Correctness
+
+`max|kata-ggml| / max|ggml| = 5.007e-08` over 64 rows of a real Q4_K tensor.
+Against an exact dequantised dot the residual is 4.1e-03, which is the q8_K
+activation quantisation, not kernel error. 28/28 tests, coverage 82.89%.
+
+### Benchmark
+
+1 thread pinned to CPU 0, 776 MB working set (60 row-replications of the 12.9 MB
+tensor), median of 7 reps.
+
+| Metric | kata | ggml | ratio |
+|---|---|---|---|
+| Throughput (GB/s) | 26.95 | 26.78 | **1.006x** |
+| p10 | 23.09 | 26.70 | |
+| p90 | 27.35 | 27.18 | |
+
+Ablation of the same instruction stream at 776 MB (what the ALU actually costs):
+
+| variant | GB/s | share of peak |
+|---|---|---|
+| maddubs only (no scales, no min) | 36.43 | 1.00 |
+| no per-sub-block shuffle | 36.35 | 1.00 |
+| no scale unpack | 30.25 | 0.83 |
+| no min term | 32.98 | 0.91 |
+| **full kernel** | **24.79** | **0.68** |
+
+### Rejected: AVX-512 VNNI variant
+
+Written and measured. It replaces `maddubs`+`madd` with `dpbusd` and removes the
+per-sub-block byte shuffle entirely (a sub-block scale is constant across the 64
+values one zmm holds, so the shuffle degenerates to a broadcast `mullo`).
+Result: **22.13 GB/s vs 26.83 for the AVX2 loop, 0.83x.** Zen 4 splits every
+512-bit op into two 256-bit halves, so the two extra zmm inserts plus 32-bit
+`mullo` cost more than the byte shuffle they removed. Kept in the log, code
+deleted. Revisit only on a genuinely 512-bit-wide core.
+
+### Conclusion
+
+kata now matches ggml on the format that matters, at 1 thread. Against a 64-79
+GB/s memory ceiling there is headroom, but the ablation says it is ALU-side, not
+access-side: the full kernel runs at 0.68 of what the same bytes cost with the
+scale arithmetic stripped. The min term and the scale unpack are the two
+components worth attacking next.
+
+### Next
+
+Multi-row tiling for q4_K (the AVX2 kernel re-reads the activation block from L1
+once per row; 2-4 rows would amortise it), plus a multi-threaded q4_K driver and
+a real A/B against ggml at 8/16 threads.

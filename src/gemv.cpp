@@ -48,6 +48,14 @@ inline __m256 dot_i8_i8_avx2(__m256i qx, __m256i qy) {
     return _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), pairs));
 }
 
+// Hardware half->float. The generic f16_to_f32 branches (and loops on the
+// subnormal path), and real Q4_K weights hit that path often enough for it to
+// cost 20% of the row time.
+__attribute__((target("avx2,f16c,fma")))
+inline float f16_fast(uint16_t h) {
+    return _cvtsh_ss(h);
+}
+
 __attribute__((target("avx2,f16c,fma")))
 inline float hsum_avx2(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
@@ -272,6 +280,137 @@ void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0
 void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
     static ThreadPool pool(ThreadPool::default_threads());
     gemv_q4_0_q8_0_mt(rows, cols, out, w, x, pool);
+}
+
+// ------------------------------------------------------------- q4_K kernels
+
+void gemv_q4_K_q8_K_ref(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
+    const size_t nb = cols / QK_K;
+    for (size_t r = 0; r < rows; ++r) out[r] = vec_dot_q4_K_q8_K_ref(cols, w + r * nb, x);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+
+namespace {
+
+// Unpack the 12 packed scale bytes into utmp[0..3]: scales in the low byte of
+// each word, mins in the high byte. Same bit shuffling as ggml's reference.
+__attribute__((target("avx2")))
+inline void unpack_k_scales(const uint8_t * scales, uint32_t * utmp) {
+    const uint32_t kmask1 = 0x3f3f3f3fu, kmask2 = 0x0f0f0f0fu, kmask3 = 0x03030303u;
+    std::memcpy(utmp, scales, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+}
+
+// One row per pass, sequential weight stream. The q4_K loop has no bias
+// correction to fold, so there is nothing for extra rows to hide.
+__attribute__((target("avx2,f16c,fma")))
+void gemv_q4_K_q8_K_avx2_impl(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
+    const size_t nb = cols / QK_K;
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    const __m128i m2 = _mm_set1_epi16(2);
+
+    for (size_t r = 0; r < rows; ++r) {
+        const block_q4_K * wr = w + r * nb;
+        __m256 acc = _mm256_setzero_ps();
+        __m128 acc_m = _mm_setzero_ps();
+
+        for (size_t b = 0; b < nb; ++b) {
+            const float d = x[b].d * f16_fast(wr[b].d);
+            const float dmin = -x[b].d * f16_fast(wr[b].dmin);
+
+            uint32_t utmp[4];
+            unpack_k_scales(wr[b].scales, utmp);
+            const __m128i utmps = _mm_set_epi32((int)utmp[3], (int)utmp[2], (int)utmp[1], (int)utmp[0]);
+            const __m128i sc128 = _mm_cvtepu8_epi16(utmps);
+            const __m256i scales = _mm256_set_m128i(sc128, sc128);
+            const __m128i mins = _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
+
+            // min term: sum over sub-blocks of min[i] * sum(y in sub-block i),
+            // both already 16-bit, so one madd handles all eight.
+            const __m128i q8sums = _mm_loadu_si128((const __m128i *)x[b].bsums);
+            const __m128i q8s = _mm_hadd_epi16(_mm_loadu_si128((const __m128i *)&x[b].bsums[0]),
+                                              _mm_loadu_si128((const __m128i *)&x[b].bsums[8]));
+            const __m128i prod = _mm_madd_epi16(mins, q8s);
+            (void)q8sums;
+            acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+            const __m256i * q4 = (const __m256i *)wr[b].qs;
+            const __m256i * q8 = (const __m256i *)x[b].qs;
+            __m256i sumi = _mm256_setzero_si256();
+            __m128i shuffle = _mm_set1_epi16(0x0100);
+
+            for (int j = 0; j < QK_K / 64; ++j) {
+                // value j in the low nibble, value j+32 in the high nibble
+                const __m256i q4bits = _mm256_loadu_si256(q4 + j);
+                const __m256i q4l = _mm256_and_si256(q4bits, m4);
+                const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+                const __m256i scale_l = _mm256_shuffle_epi8(scales, _mm256_set_m128i(shuffle, shuffle));
+                shuffle = _mm_add_epi16(shuffle, m2);
+                const __m256i scale_h = _mm256_shuffle_epi8(scales, _mm256_set_m128i(shuffle, shuffle));
+                shuffle = _mm_add_epi16(shuffle, m2);
+
+                __m256i p = _mm256_maddubs_epi16(q4l, _mm256_loadu_si256(q8 + 2 * j));
+                p = _mm256_madd_epi16(scale_l, p);
+                sumi = _mm256_add_epi32(sumi, p);
+
+                p = _mm256_maddubs_epi16(q4h, _mm256_loadu_si256(q8 + 2 * j + 1));
+                p = _mm256_madd_epi16(scale_h, p);
+                sumi = _mm256_add_epi32(sumi, p);
+            }
+
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        }
+
+        acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+        acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+        out[r] = hsum_avx2(acc) + _mm_cvtss_f32(acc_m);
+    }
+}
+
+} // namespace
+
+void gemv_q4_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
+    gemv_q4_K_q8_K_avx2_impl(rows, cols, out, w, x);
+}
+
+#else
+
+void gemv_q4_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x) {
+    gemv_q4_K_q8_K_ref(rows, cols, out, w, x);
+}
+
+#endif
+
+GemvKNfn gemv_q4_K_q8_K_best() {
+    switch (cpu_isa()) {
+        // AVX-512 VNNI q4_K measured 0.83x of this AVX2 loop: Zen4 splits every
+        // 512-bit op in two, so dropping the byte shuffle did not pay for the
+        // extra zmm inserts and 32-bit mullo. Revisit only on a real 512-bit core.
+        case Isa::Avx512Vnni:
+        case Isa::Avx2:       return gemv_q4_K_q8_K_avx2;
+        default:              return gemv_q4_K_q8_K_ref;
+    }
+}
+
+const char * gemv_K_best_name() {
+    return cpu_isa() == Isa::Scalar ? "ref" : "avx2";
+}
+
+void gemv_q4_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q4_K * w, const block_q8_K * x, ThreadPool & pool) {
+    const GemvKNfn fn = gemv_q4_K_q8_K_best();
+    const unsigned nt = pool.size();
+    const size_t chunk = (rows + nt - 1) / nt;
+    pool.run([&](unsigned tid) {
+        const size_t r0 = (size_t)tid * chunk;
+        const size_t r1 = std::min(rows, r0 + chunk);
+        if (r0 < r1) fn(r1 - r0, cols, out + r0, w + r0 * (cols / QK_K), x);
+    });
 }
 
 } // namespace kata

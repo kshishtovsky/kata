@@ -35,7 +35,9 @@ add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv PRIVATE kata_core)
 
 add_executable(bench_real_weights bench/bench_real_weights.cpp)
+add_executable(bench_k4 bench/bench_k4.cpp)
 target_link_libraries(bench_real_weights PRIVATE kata_core ${CMAKE_DL_LIBS})
+target_link_libraries(bench_k4 PRIVATE kata_core ${CMAKE_DL_LIBS})
 
 # Optional : compares our kernels against a local llama.cpp build.
 add_executable(bench_vs_ggml bench/bench_vs_ggml.cpp)

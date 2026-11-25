@@ -3,6 +3,9 @@
 #include "kata/quant.h"
 #include "kata/cpu.h"
 #include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -137,4 +140,71 @@ TEST(Gemv, MultithreadedTinyMatrices) {
         gemv_q4_0_q8_0_mt(rows, 64, got.data(), d.w.data(), d.x.data(), pool);
         expect_same(d, got, 2e-4f);
     }
+}
+
+namespace {
+std::vector<kata::block_q4_K> random_q4_K(size_t nblocks, std::mt19937 & g) {
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::vector<kata::block_q4_K> out(nblocks);
+    for (auto & b : out) {
+        b.d = kata::f32_to_f16(0.001f + 0.01f * (byte(g) / 255.0f));
+        b.dmin = kata::f32_to_f16(0.001f + 0.01f * (byte(g) / 255.0f));
+        for (int i = 0; i < 12; ++i) b.scales[i] = (uint8_t)byte(g);
+        for (int i = 0; i < 128; ++i) b.qs[i] = (uint8_t)byte(g);
+    }
+    return out;
+}
+std::vector<kata::block_q8_K> random_q8_K(size_t nblocks, size_t cols, std::mt19937 & g) {
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> f(cols);
+    for (auto & v : f) v = nd(g);
+    std::vector<kata::block_q8_K> out(nblocks);
+    kata::quantize_row_q8_K(f.data(), out.data(), cols);
+    return out;
+}
+} // namespace
+
+TEST(GemvK, RefMatchesDequantisedDot) {
+    std::mt19937 g(7);
+    const size_t cols = 3 * kata::QK_K;
+    auto w = random_q4_K(4 * 3, g);
+    auto x = random_q8_K(3, cols, g);
+    std::vector<float> deq(cols), got(4);
+    kata::gemv_q4_K_q8_K_ref(4, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < 4; ++r) {
+        kata::dequantize_row_q4_K(&w[r * 3], deq.data(), cols);
+        double want = 0.0;
+        for (size_t c = 0; c < cols; ++c) {
+            want += (double)deq[c] * (double)x[c / kata::QK_K].qs[c % kata::QK_K] * (double)x[c / kata::QK_K].d;
+        }
+        EXPECT_NEAR(got[r], want, 1e-3 * std::max(1.0, double(std::fabs(want)))) << "row " << r;
+    }
+}
+
+TEST(GemvK, Avx2MatchesRef) {
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    std::mt19937 g(11);
+    const size_t cols = 5 * kata::QK_K, rows = 9;
+    auto w = random_q4_K(rows * 5, g);
+    auto x = random_q8_K(5, cols, g);
+    std::vector<float> want(rows), got(rows);
+    kata::gemv_q4_K_q8_K_ref(rows, cols, want.data(), w.data(), x.data());
+    kata::gemv_q4_K_q8_K_avx2(rows, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < rows; ++r) EXPECT_NEAR(got[r], want[r], 1e-4 * std::max(1.0, double(std::fabs(want[r])))) << "row " << r;
+}
+
+TEST(GemvK, SubnormalSuperblockScales) {
+    // Regression for the f16 exponent bug: rows whose super-block scales are
+    // f16 subnormals used to come out at half magnitude.
+    std::mt19937 g(3);
+    auto w = random_q4_K(2, g);
+    w[0].d = 0x0350;      // subnormal
+    w[1].d = 0x0398;      // subnormal
+    auto x = random_q8_K(1, kata::QK_K, g);
+    std::vector<float> want(2), got(2);
+    kata::gemv_q4_K_q8_K_ref(2, kata::QK_K, want.data(), w.data(), x.data());
+    kata::gemv_q4_K_q8_K_avx2(2, kata::QK_K, got.data(), w.data(), x.data());
+    EXPECT_GT(std::fabs(want[0]), 0.0f);
+    EXPECT_NEAR(got[0], want[0], 1e-5 * std::max(1.0, double(std::fabs(want[0]))));
+    EXPECT_NEAR(got[1], want[1], 1e-5 * std::max(1.0, double(std::fabs(want[1]))));
 }
