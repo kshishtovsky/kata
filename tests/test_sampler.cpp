@@ -108,7 +108,7 @@ TEST(Sampler, RepeatPenaltyLowersASeenToken) {
     // Token 0 leads by 1.0; a 4x penalty on it must hand the argmax to token 1.
     std::vector<float> l = { 5.0f, 4.0f, 0.0f, 0.0f };
     EXPECT_EQ(s.sample(l.data(), l.size(), {}), 0u);
-    EXPECT_EQ(s.sample(l.data(), l.size(), { 0 }), 0u) << "greedy path ignores the penalty";
+    EXPECT_EQ(s.sample(l.data(), l.size(), { 0 }), 1u) << "greedy path applies the repeat penalty";
     const std::vector<uint32_t> hist = { 0 };
     std::vector<float> scratch = l;
     s.apply_penalty(scratch.data(), scratch.size(), hist);
@@ -168,3 +168,66 @@ TEST(Sampler, DistributionFollowsTheWeights) {
     const double ratio = double(hits[1]) / double(hits[0]);
     EXPECT_NEAR(ratio, 3.0, 0.25);
 }
+
+TEST(Sampler, RepeatPenaltyDoesNotMultiplyForDuplicates) {
+    kata::SamplerConfig c;
+    c.repeat_penalty = 2.0f;
+    c.repeat_last_n = 8;
+    kata::Sampler s(c);
+    std::vector<float> l = { 4.0f, 1.0f };
+    s.apply_penalty(l.data(), l.size(), { 0, 0, 0, 0 });
+    // Must be penalized exactly once (4.0 / 2.0 = 2.0), not 4.0 / (2^4) = 0.25
+    EXPECT_FLOAT_EQ(l[0], 2.0f);
+}
+
+TEST(Sampler, ValidationRejectsNullLogits) {
+    kata::Sampler s;
+    EXPECT_THROW(s.sample(nullptr, 10, {}), std::invalid_argument);
+    EXPECT_THROW(s.apply_penalty(nullptr, 10, {}), std::invalid_argument);
+}
+
+TEST(Sampler, ValidationRejectsNaNLogits) {
+    kata::Sampler s;
+    std::vector<float> l = { 1.0f, NAN, 2.0f };
+    EXPECT_THROW(s.sample(l.data(), l.size(), {}), std::runtime_error);
+}
+
+TEST(Sampler, ValidationRejectsInvalidParameters) {
+    {
+        kata::SamplerConfig c;
+        c.top_p = 0.0f;
+        EXPECT_THROW(kata::Sampler s(c), std::invalid_argument);
+    }
+    {
+        kata::SamplerConfig c;
+        c.top_p = 1.5f;
+        EXPECT_THROW(kata::Sampler s(c), std::invalid_argument);
+    }
+    {
+        kata::SamplerConfig c;
+        c.repeat_penalty = -1.0f;
+        EXPECT_THROW(kata::Sampler s(c), std::invalid_argument);
+    }
+    {
+        kata::SamplerConfig c;
+        c.temp = NAN;
+        EXPECT_THROW(kata::Sampler s(c), std::invalid_argument);
+    }
+}
+
+TEST(Sampler, ZeroTopKWithTopPMatchesNucleus) {
+    kata::SamplerConfig c;
+    c.temp = 0.8f;
+    c.top_k = 0;
+    c.top_p = 0.9f;
+    c.seed = 42;
+    kata::Sampler s(c);
+    std::vector<float> l(1000, 0.0f);
+    l[123] = 10.0f;
+    l[456] = 9.5f;
+    for (int i = 0; i < 50; ++i) {
+        uint32_t t = s.sample(l.data(), l.size(), {});
+        EXPECT_TRUE(t == 123u || t == 456u);
+    }
+}
+

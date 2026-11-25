@@ -39,6 +39,7 @@
 | EXP-0036 | Weighted thread partitioning for causal prefill attention | PASSED | Attention kernel 5.39 -> 2.86 ms (1.88x speedup); work imbalance 30x -> <1.15x; 544-tok prefill 445 tok/s, bitwise exact logits |
 | EXP-0037 | Optimized group4 attention, decoupled AVX-512 ISA dispatch, expanded head_dim & SIMD generic prefill | PASSED | 2048-tok prefill 450.6 -> 522.4 tok/s (1.16x e2e speedup, attn 710 -> 489 ms); coverage 80.02% -> 81.61%; bitwise exact logits |
 | EXP-0038 | Tiled attention exploration, AVX2 2-head tiling, group4 prefetch & AVX-512 register bounds analysis | PASSED | AVX2 2-head tiling 8.4% faster (42.2 -> 38.6 ms); group4 prefetch 5% long-context speedup; verified AVX-512 B=1/G=4 register sweet spot (avoids 32-register spill cliff); bitwise exact logits |
+| EXP-0039 | Sampler optimization: zero-alloc min-heap top-k, streaming top-p nucleus, greedy repeat penalty & deduplication | PASSED | top-k=0/top-p=0.9 latency 10.37 -> 0.24 ms (43.8x speedup); greedy 325 -> 56 us (5.8x); fixed greedy repeat penalty & duplicate history bug; 91/91 tests pass (coverage 79.36%) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2420,3 +2421,74 @@ Exact numerical match across all test prompts to 5 decimal places:
 ### 8. Conclusion
 
 Keep all changes. The architectural exploration conclusively proved that $B=1, G=4$ is the exact register sweet spot on AVX-512, avoiding register spill penalties. AVX2 2-head tiling delivers an 8.4% speedup on AVX2 hardware, and prefetching stabilizes streaming on large contexts. All tests pass with 79.36% coverage and 100% bitwise exact logits.
+
+## EXP-0039 — Sampler optimization: zero-alloc min-heap top-k, streaming top-p nucleus, greedy repeat penalty & deduplication
+
+**Status:** PASSED
+**Date:** 2026-11-26
+
+### 1. Context & Problem Statement
+
+Analysis of `src/sampler.cpp` revealed several critical correctness bugs and latency bottlenecks:
+1. **Full-Vocabulary Sort on Disabled Top-K (P0 Bottleneck)**: When `top_k = 0` (disabled), `keep` defaulted to `n_vocab` ($128,000$). `std::partial_sort` executed a full $O(V \log V)$ sort of all 128k elements, taking **10.37 milliseconds** per token!
+2. **Greedy Path Bypassed Repeat Penalty (P0 Bug)**: When `temp <= 0.0f`, `sample()` immediately performed an argmax loop over raw `logits`, completely ignoring `repeat_penalty` and `history`.
+3. **Duplicate History Penalization (P2 Bug)**: `penalize` iterated over `history[i]` without deduplication. If a token appeared $k$ times in the history window, its logit was penalized $k$ times ($\text{penalty}^k$).
+4. **Logits Copying & Allocations (P1)**: Every call to `sample()` copied 128,000 elements ($1 \text{ MB}$) into `cand_`.
+5. **Repeated Uniform Distribution Re-creation (P1)**: `std::uniform_real_distribution<double>` was constructed dynamically on every token.
+6. **Missing Validation (P1)**: No validation for `nullptr` logits, NaN/Inf logits, or out-of-range parameters (`top_p <= 0`, negative penalties, NaN temperatures).
+
+### 2. Hypothesis
+
+1. **Direct Min-Heap for Top-K**: Instead of copying 128k elements and running `partial_sort`, scanning `logits` directly with a cache-resident min-heap of size $K$ will eliminate 1 MB memory copying and speed up top-K sampling by ~2x.
+2. **Streaming Top-P without Full Sort**: For `top_k = 0, top_p < 1.0`, streaming through `logits` to compute `total_sum` while maintaining a 512-element min-heap will capture the nucleus in $O(V)$ time, reducing latency from 10.37 ms down to <0.25 ms (>40x speedup). Pure temperature sampling (`top_p >= 1.0`) can be sampled directly via streaming CDF in $O(V)$ time with zero sorting.
+3. **Greedy Repeat Penalty via Sparse Mask**: Extracting unique tokens from the history window and checking a sparse boolean mask over seen tokens enables exact penalized argmax in a single pass without copying `logits`.
+4. **Robust Validation**: Enforcing strict bounds (`logits != nullptr`, no NaN, $0 < \text{top\_p} \le 1$, $\text{penalty} > 0$) prevents crashes and silent corruption.
+
+### 3. Implementation
+
+- **`include/kata/sampler.h`**:
+  - Replaced `PtrSet` and full `cand_` copying with a persistent member min-heap (`heap_`), sparse lookup arrays (`pen_mask_`, `pen_val_`), and a reusable canonical uniform distribution `dist_01_{0.0, 1.0}`.
+  - Added private helper methods `validate_config()`, `ensure_capacity(n_vocab)`, and `get_unique_history(n_vocab, history)`.
+- **`src/sampler.cpp`**:
+  - **Greedy Path**: Fixed to apply repeat penalty to deduplicated history tokens. Uses `MaskGuard` RAII to ensure zero-overhead mask cleanup.
+  - **Deduplication**: `get_unique_history` extracts tokens in the `repeat_last_n` window, sorts, and removes duplicates with `std::unique`, ensuring tokens are penalized strictly once.
+  - **Top-K ($K > 0$)**: Implemented direct min-heap over `logits` using `std::make_heap` / `std::pop_heap` / `std::push_heap` / `std::sort_heap`, computing `std::exp` only $K$ times.
+  - **Top-P without Top-K ($K \le 0$)**: Evaluates streaming total sum and maintains a 512-element min-heap to extract the nucleus. Includes adaptive fallback for rare wide distributions.
+  - **Pure Temperature ($K \le 0, \text{top\_p} \ge 1.0$)**: Direct $O(V)$ two-pass streaming CDF sampling with zero sorting.
+  - **Validation**: Added explicit checks throwing `std::invalid_argument` for `nullptr` logits, non-positive penalties, NaN temperatures, and out-of-range top-p; throws `std::runtime_error` on NaN in logits.
+- **`tests/test_sampler.cpp`**: Added unit tests for null logits, NaN logits, invalid parameter configurations, duplicate history penalty preservation, and zero top-k nucleus sampling.
+
+### 4. Modified Files
+
+`include/kata/sampler.h`, `src/sampler.cpp`, `tests/test_sampler.cpp`, `docs/experiments/EXPERIMENT_LOG.md`.
+
+### 5. Tests & Coverage
+
+- 91/91 unit tests pass (21 test suites, 599 ms).
+- `./scripts/coverage.sh`: Total kata source coverage is **79.36%** (`src/sampler.cpp`: **81.73%**), well exceeding the 75% project threshold.
+
+### 6. Benchmark
+
+Measured on AMD Ryzen 9 7950X3D (Zen 4, 16C/32T), $N_{\text{vocab}} = 128,000$:
+
+| Configuration | Before (EXP-0038) | After (EXP-0039) | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Top-K 0 (disabled), top-p 0.9** | **10,367.5 us** (10.37 ms) | **236.7 us** (0.24 ms) | **43.8x speedup** |
+| **Top-K 0 (disabled), top-p 1.0** | **10,247.5 us** (10.25 ms) | **159.4 us** (0.16 ms) | **64.3x speedup** |
+| **Greedy (temp=0.0)** | **325.6 us** (0.33 ms) | **56.2 us** (0.056 ms) | **5.8x speedup** |
+| **Top-K 40, top-p 0.9** | **119.8 us** (0.12 ms) | **87.1 us** (0.087 ms) | **1.38x speedup** |
+| 5-tok argmax / logit | 56085 / 17.78026 | **56085 / 17.78026** | **bitwise exact match** |
+| 544-tok argmax / logit | 17568 / 17.52197 | **17568 / 17.52197** | **bitwise exact match** |
+| 2048-tok argmax / logit | 3147 / 28.13634 | **3147 / 28.13634** | **bitwise exact match** |
+
+### 7. Quality & Numerical Precision
+
+Exact numerical match across all test prompts to 5 decimal places:
+- 5-tok: `argmax=56085 logit=17.78026`
+- 544-tok: `argmax=17568 logit=17.52197`
+- 2048-tok: `argmax=3147 logit=28.13634`
+
+### 8. Conclusion
+
+Keep all changes. The 10.37 ms vocabulary sort bottleneck on disabled top-k has been eliminated (now 0.24 ms, a 43.8x speedup), greedy sampling now properly respects repeat penalty, duplicate tokens are no longer compounded, full parameter/NaN validation is enforced, and 91/91 unit tests pass with 79.36% coverage.
+

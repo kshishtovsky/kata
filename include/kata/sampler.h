@@ -27,16 +27,23 @@ public:
     const SamplerConfig & config() const { return cfg_; }
 
 private:
+    struct Cand {
+        float logit;
+        uint32_t id;
+    };
+
     SamplerConfig cfg_;
     std::mt19937_64 rng_;
-    // A logit array addressed by vocab id, or the same thing inside cand_.
-    struct PtrSet {
-        float * v;
-        float get(size_t i) const { return v[i]; }
-        void set(size_t i, float x) const { v[i] = x; }
-    };
-    template <class Set> void penalize(Set set, size_t n_vocab, const std::vector<uint32_t> & history) const;
+    mutable std::uniform_real_distribution<double> dist_01_{0.0, 1.0};
+
+    std::vector<Cand> heap_;
     std::vector<std::pair<float, uint32_t>> cand_;
+    std::vector<uint8_t> pen_mask_;
+    std::vector<float> pen_val_;
+
+    void validate_config() const;
+    void ensure_capacity(size_t n_vocab);
+    std::vector<uint32_t> get_unique_history(size_t n_vocab, const std::vector<uint32_t> & history) const;
 };
 
 }  // namespace kata
