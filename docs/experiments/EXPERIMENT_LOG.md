@@ -32,6 +32,7 @@
 | EXP-0028 | Grouped prefill attention (4 query heads share one kv head) | PASSED | long-context prefill 25070 tok 108.7 -> 137.0 tok/s (1.26x); 544 tok 253 -> 258 tok/s; argmax unchanged vs llama.cpp batched |
 | EXP-0029 | VNNI microkernel for q6_K, bias folded into the scale multiply | PASSED | 651 -> 1415 GMAC/s (2.2x); prefill 260 -> 268 tok/s, 25070 tok 137.0 -> 138.6 |
 | EXP-0030 | Spin-then-park thread pool (the CPU load "wave") | PASSED | prefill 268 -> 330 tok/s, 25070 tok 138.6 -> 154.7, decode 36.1 -> 41.6 tok/s |
+| EXP-0031 | Reuse MoE scratch across layers; ring-buffer shortconv | PASSED | prefill 330 -> 354-370 tok/s, logits unchanged; shortconv 331 -> 364 tok/s on its own (serial history shift removed, OOB at m<l_cache fixed) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1874,3 +1875,107 @@ with the adaptive budget the wall-clock win is real, and the setting is capped.
 
 **Next bottleneck:** `q4_K_vnni_tile` is still ~45% of prefill and the expert
 buckets are still dispatched one pool run at a time.
+
+## EXP-0031 — Reuse MoE scratch across layers; ring-buffer shortconv
+
+**ID:** EXP-0031
+**Date:** 2026-11-26
+**Status:** PASSED
+
+### 1. Problem
+
+After EXP-0030 the prefill profile showed 46% of samples inside the thread-pool
+worker loop (`std::thread::_State_impl<...ThreadPool>::_M_run`), i.e. workers were
+parked waiting rather than working, and the per-phase split was
+
+```
+[phase] emb 0.9 norm 25.8 mix 459.8 (attn 147.6 conv 312.1) res 12.8 ffn 967.0
+```
+
+on a 1469 ms chunk = 370 tok/s. Two serial regions sat between fan-outs:
+`moe_ffn_rows` allocated its scratch every layer, and `shortconv_rows` ran a
+fully scalar convolution with a hand-rolled history shift.
+
+### 2. Hypothesis
+
+Both costs are serial glue, not arithmetic: moving the MoE buffers to persistent
+members and making the shortconv conv parallel-friendly should remove most of the
+wall time workers spend parked.
+
+### 3. Implementation
+
+**MoE scratch.** `std::vector`s declared at the top of `Impl` and sized in
+`alloc()`: `mprobs`, `mpairs` (`struct ExpertPair { uint32_t expert, token; float weight; }`),
+`msel`, `maq_g`, `maq_d`, `mgout`, `muout`, `mdout`, `mptok`, `mpw`, all sized
+`np_max = ubatch * n_expert_used`. `moe_ffn_rows` takes raw pointers
+(`float * probs = mprobs.data();`) so the loop bodies are unchanged.
+
+Instrumentation that motivated it (temporary, `KATA_MOE`): router 1.0 ms plus
+allocation 3.2-4.7 ms **per layer**, 38.8 ms + 150.8 ms over a chunk.
+
+**Shortconv, new module.** `include/kata/shortconv.h` + `src/shortconv.cpp`:
+
+```cpp
+void shortconv_bx(const float * bcx, float * bx, size_t m, size_t nc);
+void shortconv_conv(const float * bx, const float * bcx, size_t m, size_t nc,
+                    size_t ntaps, const float * kern, float * out);
+```
+
+`bx = b*x` for the whole chunk first, so the conv has no cross-row dependency
+left; then `y[i] = c[i] * sum_t kern[e*ntaps+t] * bx[i-(ntaps-1)+t]`. `bx` is
+written at its final offset inside a `[history][chunk]` buffer, so the previous
+rows are just `cur - nc` and `cur - 2*nc` and no branch or shift is needed. This
+replaced the old loop that shifted the history element-by-element inside the row
+loop and read before the buffer start whenever `m < l_cache`.
+
+### 4. Modified Files
+
+`src/model.cpp`, `src/shortconv.cpp` (new), `include/kata/shortconv.h` (new),
+`tests/test_shortconv.cpp` (new), `CMakeLists.txt`.
+
+### 5. Tests
+
+80/80 pass, 5 of them new in `ShortConv`: `MatchesDefinitionOnAContiguousChunk`,
+`HistoryCarriesAcrossChunksLikeOneLongRun`, `ChunkShorterThanKernelStillUsesHistory`
+(the regression for the out-of-bounds read), `ZeroCLeavesNothing`,
+`ResetOfTheFilterIsTheIdentity`. The first compares against an independent
+transcription of the definition with `ASSERT_NEAR(.., 1e-7f)` because the vector
+path contracts into an FMA and the reference does not.
+
+### 6. Coverage
+
+79.08% total (`src/shortconv.cpp` 86.11%, `src/prefill.cpp` 87.37%,
+`src/gemm.cpp` 54.04%).
+
+### 7. Benchmark
+
+| Metric | Before | After | Delta |
+| --- | --- | --- | --- |
+| Prefill 544 tok | 330 tok/s | 354-370 tok/s | +8-12% |
+| Prefill 544 tok (shortconv only, same binary) | 331.9 | 364.5 | +10% |
+| Decode 128 tok | 41.6 tok/s | 40.7 tok/s | wash |
+| Top-1 logit, 544 tok | 17.59454 | 17.59454 | unchanged |
+| Top-1 argmax, 5 tok | 56085 | 56085 | unchanged |
+
+`KATA_UBATCH` 1/2/7/1024 now all give `argmax=17568 logit=17.52197`; before this
+change `ubatch=1` produced a different token, which is how the out-of-bounds read
+was found.
+
+### 8. Quality
+
+Unchanged: same argmax and same logits as before the rewrite on every prompt
+checked, and prefill vs per-token decode agree at 4 valid digits.
+
+### 9. Bottleneck Analysis
+
+MoE matmul and attention remain; the pool worker loop is still the largest single
+profile entry, so the next target is the number of fan-outs (10112 per 544-token
+chunk) rather than their cost.
+
+### 10. Conclusion
+
+Keep both. They remove serial work without touching numerics.
+
+### 11. Next Iteration
+
+Batch the per-expert GEMMs of a layer into one `pool.run`, then re-measure.

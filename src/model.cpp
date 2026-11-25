@@ -1,4 +1,5 @@
 #include "kata/model.h"
+#include "kata/shortconv.h"
 
 #include <algorithm>
 #include <cmath>
@@ -138,8 +139,19 @@ struct Model::Impl {
     size_t ubatch = 1;
     std::vector<float> px, pprev, pnorm, pffn, pffn2, pffn_out;
     std::vector<float> pq, pk, pv, pattn, pbcx, pexpacc;
-    std::vector<float> pconv_out, gact, ggate, gup;
+    std::vector<float> pconv_out, pbx, gact, ggate, gup;
     std::vector<block_q8_K> paq, paq2;
+    // MoE scratch, sized once. These were locals inside moe_ffn_rows, so every
+    // one of the 38 MoE layers re-allocated ~100 MB at ubatch 1024: 151 ms of a
+    // 1734 ms prefill, all of it serial inside the pool's idle window.
+    struct ExpertPair { uint32_t expert, token; float weight; };
+    std::vector<float> mprobs;
+    std::vector<ExpertPair> mpairs;
+    std::vector<std::pair<float, uint32_t>> msel;
+    std::vector<block_q8_K> maq_g, maq_d;
+    std::vector<float> mgout, muout, mdout;
+    std::vector<uint32_t> mptok;
+    std::vector<float> mpw;
     ThreadPool pool{ThreadPool::default_threads()};
 
     // Set KATA_DUMP=<dir> to write intermediates for diffing against a reference.
@@ -207,11 +219,23 @@ struct Model::Impl {
         pbcx.assign(ubatch * 3 * n_embd, 0.0f);
         pexpacc.assign(ubatch * n_embd, 0.0f);
         pconv_out.assign(ubatch * n_embd, 0.0f);
+        pbx.assign((ubatch + 4) * n_embd, 0.0f);
         gact.assign(ubatch * n_embd, 0.0f);
         ggate.assign(ubatch * n_ff_exp, 0.0f);
         gup.assign(ubatch * n_ff_exp, 0.0f);
         paq.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
         paq2.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
+        const size_t np_max = ubatch * n_expert_used;
+        mprobs.assign(ubatch * n_expert, 0.0f);
+        mpairs.resize(np_max);
+        msel.resize(n_expert);
+        maq_g.assign(np_max * (n_embd / QK_K), {});
+        maq_d.assign(np_max * (n_ff_exp / QK_K), {});
+        mgout.assign(np_max * n_ff_exp, 0.0f);
+        muout.assign(np_max * n_ff_exp, 0.0f);
+        mdout.assign(np_max * n_embd, 0.0f);
+        mptok.resize(np_max);
+        mpw.resize(np_max);
     }
 
     // Quantises the activation block and runs one quantised matvec.
@@ -534,30 +558,30 @@ struct Model::Impl {
 
     // shortconv over a whole chunk. One row was the encode path; here every row
     // has its own 2-token history, and the recurrence within the chunk is the
-    // same three-tap filter applied in order.
+    // bx lives in one buffer in front of the history: [d_conv history rows][m chunk rows].
+    // Row i of the chunk is then row d_conv+i, its two inputs are the rows before it,
+    // and the carry-over is a memcpy of the tail. The old form shifted the history
+    // by hand inside the row loop, which serialised the layer and read out of
+    // bounds whenever a chunk was shorter than d_conv.
+
     void shortconv_rows(size_t il, const Layer & L, size_t m) {
         const size_t nc3 = 3 * n_embd;
+        const size_t nc = n_embd;
+        const size_t d_conv = l_cache - 1;
+
         q8_rows(pnorm.data(), m, n_embd, paq.data());
         mmn(L.t_in, nc3, n_embd, pbcx.data(), nc3, L.in_proj, paq.data(), m);
 
-        const size_t d_conv = l_cache - 1;
-        float * hist = conv_state.data() + il * d_conv * n_embd;
-        const float * kern = static_cast<const float *>(L.conv);
-        for (size_t i = 0; i < m; ++i) {
-            const float * b = pbcx.data() + i * nc3;
-            const float * c = b + n_embd;
-            const float * xx = b + 2 * n_embd;
-            float * o = pconv_out.data() + i * n_embd;
-            for (size_t e = 0; e < n_embd; ++e) {
-                const float bxe = b[e] * xx[e];
-                const float * k3 = kern + e * 3;
-                o[e] = c[e] * (k3[0] * hist[0 * n_embd + e] + k3[1] * hist[1 * n_embd + e] + k3[2] * bxe);
-            }
-            for (size_t e = 0; e < n_embd; ++e) {
-                for (size_t j = 0; j + 1 < d_conv; ++j) hist[j * n_embd + e] = hist[(j + 1) * n_embd + e];
-                hist[(d_conv - 1) * n_embd + e] = b[e] * xx[e];
-            }
-        }
+        float * seq = pbx.data();
+        float * hist = conv_state.data() + il * d_conv * nc;
+        std::memcpy(seq, hist, d_conv * nc * sizeof(float));
+        float * bx = seq + d_conv * nc;
+        shortconv_bx(pbcx.data(), bx, m, nc);
+        shortconv_conv(bx, pbcx.data(), m, nc, l_cache,
+                       static_cast<const float *>(L.conv), pconv_out.data());
+        // Tail of this chunk becomes the history for the next one.
+        std::memcpy(hist, seq + m * nc, d_conv * nc * sizeof(float));
+
         q8_rows(pconv_out.data(), m, n_embd, paq.data());
         mmn(L.t_out, n_embd, n_embd, pattn.data(), n_embd, L.out_proj, paq.data(), m);
     }
@@ -606,43 +630,41 @@ struct Model::Impl {
     // tokens that picked it.
     void moe_ffn_rows(size_t il, const Layer & L, size_t m) {
         const float * bias = static_cast<const float *>(L.exp_probs_b);
-        std::vector<float> probs(m * n_expert);
-        gemm_f32_mt(m, n_expert, n_embd, probs.data(), n_expert,
+        float * probs = mprobs.data();
+        gemm_f32_mt(m, n_expert, n_embd, probs, n_expert,
                     static_cast<const float *>(L.gate_inp), pnorm.data(), pool);
-        for (auto & v : probs) v = sigmoid_gate ? 1.0f / (1.0f + std::exp(-v)) : v;
+        for (size_t i = 0; i < m * n_expert; ++i)
+            probs[i] = sigmoid_gate ? 1.0f / (1.0f + std::exp(-probs[i])) : probs[i];
 
-        struct Pair { uint32_t expert, token; float weight; };
-        std::vector<Pair> pairs;
-        pairs.reserve(m * n_expert_used);
+        ExpertPair * pairs = mpairs.data();
+        size_t np = 0;
         for (size_t t = 0; t < m; ++t) {
-            const float * p = probs.data() + t * n_expert;
-            std::vector<std::pair<float, uint32_t>> sel(n_expert);
+            const float * p = probs + t * n_expert;
+            auto * sel = msel.data();
             for (size_t e = 0; e < n_expert; ++e) sel[e] = { p[e] + bias[e], static_cast<uint32_t>(e) };
-            std::partial_sort(sel.begin(), sel.begin() + n_expert_used, sel.end(),
+            std::partial_sort(sel, sel + n_expert_used, sel + n_expert,
                               [](const auto & a, const auto & b) { return a.first > b.first; });
             float wsum = 0.0f;
             for (size_t i = 0; i < n_expert_used; ++i) wsum += p[sel[i].second];
             if (wsum < 6.103515625e-5f) wsum = 6.103515625e-5f;
             for (size_t i = 0; i < n_expert_used; ++i)
-                pairs.push_back({sel[i].second, static_cast<uint32_t>(t), p[sel[i].second] / wsum});
+                pairs[np++] = {sel[i].second, static_cast<uint32_t>(t), p[sel[i].second] / wsum};
             if (router_log) {
                 std::fprintf(stderr, "router serial il=%zu [", il);
                 for (size_t i = 0; i < n_expert_used; ++i) std::fprintf(stderr, " %u", sel[i].second);
                 std::fprintf(stderr, " ]\n");
             }
         }
-        std::sort(pairs.begin(), pairs.end(),
-                  [](const Pair & a, const Pair & b) { return a.expert < b.expert; });
+        std::sort(pairs, pairs + np,
+                  [](const ExpertPair & a, const ExpertPair & b) { return a.expert < b.expert; });
 
-        // One row per (token, expert) pair, i.e. m*n_expert_used rows, not m.
-        const size_t np = m * n_expert_used;
-        // aq_g holds n_embd-wide rows (8 blocks at n_embd=2048), not n_ff_exp-wide
-        // ones; sizing it by n_ff_exp wrote 2 blocks per row past the end of the
-        // vector on every expert pair.
-        std::vector<block_q8_K> aq_g(np * (n_embd / QK_K)), aq_d(np * (n_ff_exp / QK_K));
-        std::vector<float> gout(np * n_ff_exp), uout(np * n_ff_exp), dout(np * n_embd);
-        std::vector<uint32_t> ptok(np);
-        std::vector<float> pw(np);
+        block_q8_K * aq_g = maq_g.data();
+        block_q8_K * aq_d = maq_d.data();
+        float * gout = mgout.data();
+        float * uout = muout.data();
+        float * dout = mdout.data();
+        uint32_t * ptok = mptok.data();
+        float * pw = mpw.data();
         std::fill(pexpacc.begin(), pexpacc.begin() + m * n_embd, 0.0f);
 
         const size_t sb_g = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ge);
@@ -652,25 +674,26 @@ struct Model::Impl {
         const uint8_t * bu = static_cast<const uint8_t *>(L.up_exps);
         const uint8_t * bd = static_cast<const uint8_t *>(L.down_exps);
 
-        for (size_t first = 0; first < pairs.size();) {
+        for (size_t first = 0; first < np;) {
             size_t last = first;
-            while (last < pairs.size() && pairs[last].expert == pairs[first].expert) ++last;
+            while (last < np && pairs[last].expert == pairs[first].expert) ++last;
             const size_t c = last - first;
             const uint32_t e = pairs[first].expert;
 
             for (size_t i = 0; i < c; ++i) ptok[i] = pairs[first + i].token;
-            q8_rows_gather_mt(pnorm.data(), ptok.data(), c, n_embd, aq_g.data());
-            mmn(L.t_ge, n_ff_exp, n_embd, gout.data(), n_ff_exp, bg + e * sb_g, aq_g.data(), c);
-            mmn(L.t_ue, n_ff_exp, n_embd, uout.data(), n_ff_exp, bu + e * sb_u, aq_g.data(), c);
-            silu_mul_mt(gout.data(), uout.data(), c * n_ff_exp);
-            q8_rows_mt(gout.data(), c, n_ff_exp, aq_d.data());
-            mmn(L.t_de, n_embd, n_ff_exp, dout.data(), n_embd, bd + e * sb_d, aq_d.data(), c);
+            q8_rows_gather_mt(pnorm.data(), ptok, c, n_embd, aq_g);
+            mmn(L.t_ge, n_ff_exp, n_embd, gout, n_ff_exp, bg + e * sb_g, aq_g, c);
+            mmn(L.t_ue, n_ff_exp, n_embd, uout, n_ff_exp, bu + e * sb_u, aq_g, c);
+            silu_mul_mt(gout, uout, c * n_ff_exp);
+            q8_rows_mt(gout, c, n_ff_exp, aq_d);
+            mmn(L.t_de, n_embd, n_ff_exp, dout, n_embd, bd + e * sb_d, aq_d, c);
             for (size_t i = 0; i < c; ++i) pw[i] = pairs[first + i].weight;
-            scatter_add(dout.data(), ptok.data(), pw.data(), c, n_embd, pexpacc.data());
+            scatter_add(dout, ptok, pw, c, n_embd, pexpacc.data());
             first = last;
         }
-        for (size_t i = 0; i < m; ++i)
-            std::memcpy(pffn_out.data() + i * n_embd, pexpacc.data() + i * n_embd, n_embd * sizeof(float));
+        // pexpacc is the accumulator, so the copy into pffn_out is the only
+        // hand-off the caller needs; it is 4.5 MB per layer at ubatch 544.
+        std::memcpy(pffn_out.data(), pexpacc.data(), m * n_embd * sizeof(float));
     }
 
     const float * prefill(const uint32_t * tokens, size_t n, ModelState & st) {
@@ -680,7 +703,7 @@ struct Model::Impl {
             const size_t m = std::min(ubatch, n - done);
             const size_t pos0 = st.pos + done;
             const auto t_start = std::chrono::steady_clock::now();
-            double t_emb_s=0,t_norm_s=0,t_mix_s=0,t_res_s=0,t_ffn_s=0;
+            double t_emb_s=0,t_norm_s=0,t_mix_s=0,t_res_s=0,t_ffn_s=0,t_attn_s=0,t_conv_s=0;
             auto NS=[&]{return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();};
             double a=NS();
             embed_rows(tokens + done, m); t_emb_s+=NS()-a;
@@ -688,8 +711,8 @@ struct Model::Impl {
                 const Layer & L = layers[il];
                 a=NS(); std::memcpy(pprev.data(), px.data(), m * n_embd * sizeof(float));
                 rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.attn_norm), eps); t_norm_s+=NS()-a;
-                a=NS(); if (L.attn) attention_rows(il, L, m, pos0);
-                else shortconv_rows(il, L, m); t_mix_s+=NS()-a;
+                a=NS(); if (L.attn) { attention_rows(il, L, m, pos0); t_attn_s+=NS()-a; }
+                else { shortconv_rows(il, L, m); t_conv_s+=NS()-a; } t_mix_s+=NS()-a;
                 a=NS(); for (size_t i = 0; i < m * n_embd; ++i) px[i] = pprev[i] + pattn[i]; t_res_s+=NS()-a;
 
                 a=NS(); rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps); t_norm_s+=NS()-a;
@@ -709,7 +732,7 @@ struct Model::Impl {
                 const double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_start).count();
                 std::fprintf(stderr, "[prefill] chunk %zu tok in %.2f ms = %.1f tok/s\n", m, ms, 1000.0 * m / ms);
-                std::fprintf(stderr, "[phase] emb %.1f norm %.1f mix %.1f res %.1f ffn %.1f => sum %.1f\n", t_emb_s,t_norm_s,t_mix_s,t_res_s,t_ffn_s, t_emb_s+t_norm_s+t_mix_s+t_res_s+t_ffn_s);
+                std::fprintf(stderr, "[phase] emb %.1f norm %.1f mix %.1f (attn %.1f conv %.1f) res %.1f ffn %.1f\n", t_emb_s,t_norm_s,t_mix_s,t_attn_s,t_conv_s,t_res_s,t_ffn_s);
             }
         }
         st.pos += n;
