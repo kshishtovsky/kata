@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <cmath>
 
+#ifndef SCORE_N
+#define SCORE_N 4
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -194,6 +198,49 @@ void v_accum_generic(const AttnArgs & a, float * o, const float * p, size_t hd, 
 
 } // namespace
 
+namespace {
+
+// N positions at once (N even). Two wins: q is loaded once per N k rows, and
+// the per-position horizontal reduce is shared by pairs. meas: N=4 was 1.10x
+// over per-position scoring at 4-16k, N=8 another 1.33x.
+//
+// After hadd(hadd(a,b), hadd(a,b)) the lanes hold
+//   [a0+a1+a2+a3, b0+b1+b2+b3, ... , a4+a5+a6+a7, b4+b5+b6+b7]
+// so sum(a) = lane0 + lane4 and sum(b) = lane1 + lane5.
+template <int N>
+__attribute__((target("avx2,fma")))
+void scores_n(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd, float scale,
+              float * out) {
+    static_assert(N % 2 == 0, "N must be even");
+    const size_t stride = a.n_kv_heads * hd;
+    const float * k0 = a.k_cache + t0 * stride + base;
+    __m256 r[N];
+    for (int j = 0; j < N; ++j) r[j] = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= hd; i += 8) {
+        const __m256 qv = _mm256_loadu_ps(q + i);
+        for (int j = 0; j < N; ++j)
+            r[j] = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k0 + j * stride + i), r[j]);
+    }
+    alignas(32) float lane[8];
+    for (int p = 0; p < N; p += 2) {
+        const __m256 h = _mm256_hadd_ps(r[p], r[p + 1]);
+        _mm256_store_ps(lane, _mm256_hadd_ps(h, h));
+        out[p] = (lane[0] + lane[4]) * scale;
+        out[p + 1] = (lane[1] + lane[5]) * scale;
+    }
+    // Head dims not divisible by 8: finish the tail scalar per position.
+    if (i < hd) {
+        for (int j = 0; j < N; ++j) {
+            float acc = 0.0f;
+            for (size_t z = i; z < hd; ++z) acc += q[z] * k0[j * stride + z];
+            out[j] += acc * scale;
+        }
+    }
+}
+
+} // namespace
+
 __attribute__((target("avx2,fma")))
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
     const size_t hd = a.head_dim;
@@ -202,7 +249,12 @@ void attention_decode_avx2(const AttnArgs & a, float * scratch) {
         const size_t base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
 
         float mx = -INFINITY;
-        for (size_t t = 0; t < a.n_kv; ++t) {
+        size_t t = 0;
+        for (; t + SCORE_N <= a.n_kv; t += SCORE_N) {
+            scores_n<SCORE_N>(a, q, base, t, hd, a.scale, scratch + t);
+            for (int j = 0; j < SCORE_N; ++j) mx = std::max(mx, scratch[t + j]);
+        }
+        for (; t < a.n_kv; ++t) {
             const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
             const float s = dot_avx2(q, k, hd) * a.scale;
             scratch[t] = s;

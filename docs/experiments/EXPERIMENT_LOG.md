@@ -15,6 +15,7 @@
 | EXP-0011 | Decode attention + KV layout | PASSED | 2.2-2.9x over scalar; 17.5 ms at 32k context, becomes the dominant cost |
 | EXP-0012 | Grouped-KV decode attention | FAILED | All 4 variants slower at 32k (24.2 vs 17.5 ms); reverted |
 | EXP-0013 | Register accumulators + vectorised exp | PASSED | 32k decode 17.5 -> 11.7 ms (1.50x); gain over scalar 2.84x -> 4.16x |
+| EXP-0014 | Batched score pass (4 positions/iter) | PASSED | 16k 4206 -> 3863 us (1.09x); 32k flat; N=8/16/32 all worse |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -930,7 +931,43 @@ independent 1.17x-1.28x steps. 48/48 tests, coverage 87.09%.
 
 ### Next
 
-The remaining 3.7-5x at 32k is in the score pass. Its inner loop is a
-`dot_avx2` + horizontal reduce per position, and the horizontal reduce
-(`vhaddps` twice) was 10.5% of samples by itself. 4 positions at a time would
-amortise it 4x; that is the next experiment.
+## EXP-0014 — Batched score pass
+
+**Status:** PASSED at N=4 for 4-16k, flat at 32k. N=8 and above rejected.
+
+**Hypothesis.** EXP-0013 left the score pass as the dominant cost: `dot_avx2`
+plus a horizontal reduce per position, with `vhaddps` at 10.5% of samples.
+Scoring N positions per iteration loads `q` once per N k-rows and shares one
+reduce per pair, so N=4 should cut that 10.5% by ~4x.
+
+**Implementation.** `src/attn.cpp`, `scores_n<N>()`: N independent `__m256`
+accumulators over head_dim, then `hadd(hadd(r[p], r[p+1]))` per pair. After
+`hadd(hadd(a,b), hadd(a,b))` the lanes hold
+`[a0+a1+a2+a3, b0+b1+b2+b3, ... , a4+a5+a6+a7, b4+b5+b6+b7]`, so
+`sum(a) = lane0 + lane4` and `sum(b) = lane1 + lane5`. `SCORE_N` is a
+compile-time knob (default 4); head dims not divisible by 8 finish scalar.
+
+**Measured** (Ryzen 9 7950X3D, 1 thread pinned, 32 heads / 8 kv heads x 64 dim,
+median of 40 iters, A/B on the same binary against `8b629bb`):
+
+| SCORE_N | 4k us | 16k us | 32k us |
+|---|---|---|---|
+| per-position (8b629bb) | 951 | 4206 | 12691-13291 |
+| 4 | 950 | **3863** | 12837-13283 |
+| 8 | 1044 | 4150 | 13721 |
+| 16 | 1107 | 4599 | 14054 |
+| 32 | 1855 | 7430 | 19837 |
+
+**Analysis.** 16k gains 8%; 4k is a wash because at 4k the KV is 16 MiB and the
+kernel is L2/L3-bound rather than reduce-bound; 32k is flat. Above N=4 every
+variant regresses monotonically: N accumulators plus N live k-pointers exceed
+the 16 ymm registers, so `r[]` spills to stack and the `static_assert(N%2==0)`
+pairing turns into load/store traffic. The 32k plateau is consistent with the
+KV being exactly L3-sized (128 MiB), where the extra streams stop helping.
+
+**Conclusion.** Keep N=4. Not worth pushing further: the score pass is no longer
+where the 3.5x gap to the memory ceiling lives, and every larger batch size
+costs more than it saves.
+
+**Next.** Measure the score and v passes separately so the remaining 12.8 ms at
+32k can be attributed before choosing another target.
