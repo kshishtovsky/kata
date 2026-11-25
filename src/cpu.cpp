@@ -30,7 +30,10 @@ static Isa detect_isa() {
     const bool avx512vl    = (r[1] >> 31) & 1u;  // EBX bit 31
     const bool avx512vnni  = (r[2] >> 11) & 1u;  // ECX bit 11
 
-    if (avx && f16c && fma && avx512f && avx512bw && avx512vl && avx512vnni) return Isa::Avx512Vnni;
+    if (avx && f16c && fma && avx512f && avx512bw && avx512vl) {
+        if (avx512vnni) return Isa::Avx512Vnni;
+        return Isa::Avx512;
+    }
     if (avx && f16c && fma && avx2) return Isa::Avx2;
     return Isa::Scalar;
 }
@@ -48,6 +51,7 @@ Isa cpu_isa() {
 const char * isa_name(Isa isa) {
     switch (isa) {
         case Isa::Avx512Vnni: return "avx512-vnni";
+        case Isa::Avx512:     return "avx512";
         case Isa::Avx2:       return "avx2";
         default:              return "scalar";
     }

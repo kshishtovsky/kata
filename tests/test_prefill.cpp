@@ -79,6 +79,8 @@ TEST(Prefill, MatchesRefAcrossShapes) {
     check({4, 5, 4, 1, 80});
     check({6, 2, 4, 2, 60});
     check({2, 9, 2, 1, 8});
+    check({2, 7, 8, 2, 128});
+    check({2, 3, 4, 1, 256});
     check({8, 2048, 32, 8, 64});
 }
 

@@ -242,6 +242,7 @@ void gemv_q4_0_q8_0_avx512(size_t rows, size_t cols, float * out, const block_q4
 GemvFn gemv_q4_0_q8_0_best() {
     switch (cpu_isa()) {
         case Isa::Avx512Vnni: return gemv_q4_0_q8_0_avx512;
+        case Isa::Avx512:
         case Isa::Avx2:       return gemv_q4_0_q8_0_avx2;
         default:              return gemv_q4_0_q8_0_ref;
     }
@@ -250,6 +251,7 @@ GemvFn gemv_q4_0_q8_0_best() {
 const char * gemv_best_name() {
     switch (cpu_isa()) {
         case Isa::Avx512Vnni: return "q4_0_q8_0/avx512-vnni";
+        case Isa::Avx512:     return "q4_0_q8_0/avx512";
         case Isa::Avx2:       return "q4_0_q8_0/avx2";
         default:              return "q4_0_q8_0/ref";
     }
@@ -507,6 +509,7 @@ void gemv_q6_K_q8_K_avx2(size_t rows, size_t cols, float * out, const block_q6_K
 GemvK6fn gemv_q6_K_q8_K_best() {
     switch (cpu_isa()) {
         case Isa::Avx512Vnni:
+        case Isa::Avx512:
         case Isa::Avx2:       return gemv_q6_K_q8_K_avx2;
         default:              return [](size_t rows, size_t cols, float * out, const block_q6_K * w, const block_q8_K * x) {
             const size_t nb = cols / QK_K;
@@ -559,6 +562,7 @@ GemvKNfn gemv_q4_K_q8_K_best() {
         // 512-bit op in two, so dropping the byte shuffle did not pay for the
         // extra zmm inserts and 32-bit mullo. Revisit only on a real 512-bit core.
         case Isa::Avx512Vnni:
+        case Isa::Avx512:
         case Isa::Avx2:       return gemv_q4_K_q8_K_avx2;
         default:              return gemv_q4_K_q8_K_ref;
     }
