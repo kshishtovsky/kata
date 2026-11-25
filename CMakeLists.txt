@@ -11,7 +11,9 @@ endif()
 option(KATA_COVERAGE "Build with gcov instrumentation" OFF)
 
 add_library(kata_core
+  src/backend.cpp
   src/cpu.cpp
+  src/norm.cpp
   src/gguf.cpp
   src/gemv.cpp
   src/pool.cpp
@@ -34,6 +36,9 @@ endif()
 add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv PRIVATE kata_core)
 
+add_executable(bench_norm bench/bench_norm.cpp)
+target_link_libraries(bench_norm PRIVATE kata_core)
+
 add_executable(bench_real_weights bench/bench_real_weights.cpp)
 add_executable(bench_k4 bench/bench_k4.cpp)
 target_link_libraries(bench_real_weights PRIVATE kata_core ${CMAKE_DL_LIBS})
@@ -48,12 +53,12 @@ if(NOT GTest_FOUND)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(GTEST REQUIRED gtest_main)
   add_executable(kata_tests EXCLUDE_FROM_ALL)
-  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp)
+  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp)
   target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
   target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
 else()
   enable_testing()
-  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp)
+  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp tests/test_norm.cpp)
   target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
 endif()
 

@@ -10,6 +10,7 @@
 | EXP-0006 | q4_K GEMV on real model weights (CPU-first format pivot) | PASSED | 1.006x ggml at 26.95 GB/s DRAM-bound; AVX-512 path 0.83x, rejected |
 | EXP-0007 | q4_K multi-row tiling + multi-thread driver | PASSED (threads) / REJECTED (tiling) | tiling 13.5 vs 26.7 GB/s; 1-2 threads 1.05-1.08x, 4 threads 0.99x (DRAM saturated) |
 | EXP-0008 | q6_K GEMV (22.3% of the shipped models) | PASSED | 1.03x ggml at 35.92 GB/s; caught a two-sub-block-per-maddubs scale bug |
+| EXP-0009 | RMSNorm + backend boundary | PASSED | 5.5-6.3x over scalar, 97-112 GB/s; coverage tool was under-reporting by 19pp |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -563,3 +564,74 @@ A forward pass needs more than GEMV: RMSNorm, RoPE, attention with a KV cache,
 and the MoE router/dispatch. Next iteration: RMSNorm + the block/backends
 boundary, so subsequent kernels plug into a backend interface rather than growing
 free functions (CPU now, ROCm later — per the m00800 direction).
+
+## EXP-0009 — RMSNorm and the backend boundary
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** RMSNorm is memory-bound at decode (2048 floats in, 2048 out), so a
+straightforward AVX2 reduction should already sit at the bandwidth ceiling and
+needs no trickery. Separately: kernel free functions are about to multiply
+(RoPE, attention, MoE router), so the second kernel family is the right moment to
+introduce the backend interface rather than after five of them exist.
+
+### Implementation
+
+- `include/kata/backend.h` — `class Backend` with `name()`, `available()`,
+  `rms_norm(const RmsNormArgs&)`, `gemv_q4_K_q8_K(const GemvArgs&)`,
+  `gemv_q6_K_q8_K(const GemvArgs&)`, plus `const Backend & backend()` for
+  process-wide selection. Argument structs are plain data so a GPU backend can
+  copy them to a queue without changing the signature.
+- `src/backend.cpp` — `CpuBackend`, the only implementation today, delegating to
+  the existing `*_best()` kernel selectors and `kata::rms_norm`.
+- `include/kata/norm.h`, `src/norm.cpp` — `rms_norm_ref` and `rms_norm_avx2`.
+  The reduction accumulates in `double` in the scalar path; summing 4096 squared
+  floats in float loses enough precision to move the last digits of every output.
+
+**Deliberately NOT in the interface:** RoPE. The first draft had
+`virtual void rope(const RopeArgs&)` with an empty CPU body, i.e. a silent no-op
+that would have produced plausible-looking garbage the first time attention ran.
+Removed before commit. A kernel joins the interface when it has a real
+implementation, not in anticipation.
+
+### Correctness
+
+`rms_norm_avx2` matches `rms_norm_ref` to 1.4e-07 relative across widths
+1/7/8/15/16/23/64/257 with and without a weight vector, i.e. every unaligned-tail
+combination. Zero-input rows give zero, not NaN. 37/37 tests.
+
+### Benchmark
+
+1 thread pinned to CPU 0, median of 200-300 calls, bytes counted as read x +
+read w + write out:
+
+| case | scalar | vector | speedup |
+|---|---|---|---|
+| 1 row x 2048 (decode shape) | 1.39 us / 17.7 GB/s | **0.22 us / 111.7 GB/s** | 6.32x |
+| 256 rows x 2048 (prefill shape) | 358.5 us / 17.6 GB/s | **64.7 us / 97.2 GB/s** | 5.54x |
+
+The vector path exceeds the 78 GB/s DRAM ceiling because a single 8 KB row stays
+in L1/L2 across iterations — this measures the kernel, not the memory system.
+
+### Tooling bug found
+
+Coverage was under-reporting by ~19 points and `src/quant.cpp` was listed twice
+(once at 98.09% of 209 lines, once at 57.07% of **1810** lines). gcov prints a
+trailing aggregate `Lines executed:` line with no `File` line in front of it, and
+`scripts/coverage.py` charged it to whichever file came last, also leaving `cur`
+set so a following file inherited the wrong name. Fixed by clearing `cur` after
+each match. Real total went from 64.31% to **86.01%**; the same script bug had
+been quietly under-reporting every previous iteration's number.
+
+### Conclusion
+
+Both cheap, both kept. The honest note: 111 GB/s is a cache-resident figure, and
+RMSNorm at decode scale (2048 floats) is ~0.22 us, which is small next to a single
+GEMV row (2048 wide, ~0.08 us/row at 78 GB/s but thousands of rows per layer). So
+RMSNorm is not a bottleneck and must not be optimised further until profiling of a
+real forward pass says otherwise.
+
+### Next
+
+RoPE with a real implementation, then a single transformer block wired through the
+backend so a full forward pass can be profiled end to end.
