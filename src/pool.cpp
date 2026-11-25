@@ -1,4 +1,5 @@
 #include "kata/pool.h"
+#include "kata/throttle.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -71,10 +72,10 @@ void ThreadPool::run(const std::function<void(unsigned)> & fn) {
 }
 
 unsigned ThreadPool::default_threads() {
-    const unsigned hw = std::thread::hardware_concurrency();
-    // 7950X3D-style parts lose more to scheduling than they gain past the
-    // physical core count, and this leaves headroom for the rest of the engine.
-    return hw > 2 ? hw - 1 : 1;
+    // physical core count: SMT gives latency hiding, not throughput, for GEMV
+    const unsigned want = std::min(std::max(1u, std::thread::hardware_concurrency() / 2),
+                                   throttle::max_threads());
+    return want;
 }
 
 } // namespace kata

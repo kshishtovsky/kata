@@ -1,6 +1,8 @@
 #include "kata/gemv.h"
 #include "kata/quant.h"
 #include "kata/cpu.h"
+#include "kata/pool.h"
+#include "kata/throttle.h"
 
 #include <algorithm>
 #include <chrono>
@@ -57,6 +59,7 @@ int main(int argc, char ** argv) {
         else if (a == "--mb") mb = strtoul(next(), nullptr, 10);
         else if (a == "--iters") iters = atoi(next());
         else if (a == "--threads") threads = atoi(next());
+        else if (a == "--allow-full-load") {}   // documented no-op; cap is env-driven
         else if (a == "--reps") reps = std::max(1, atoi(next()));
         else if (a == "--kernel") kernel = next();
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
@@ -98,6 +101,12 @@ int main(int argc, char ** argv) {
     if (!iters) iters = (int)std::clamp(2.0e9 / std::max(bytes, 1.0), 5.0, 2000.0);
 
     // Threading multiplies effective bandwidth, so the iteration budget shrinks.
+    // Hard cap: sustained all-core memory saturation has hard-reset this box.
+    const unsigned tcap = throttle::max_threads();
+    if (threads > (int)tcap) {
+        printf("threads %d capped to %u by KATA_MAX_THREADS (env to override)\n", threads, tcap);
+        threads = (int)tcap;
+    }
     if (threads > 1) iters = std::max(3, iters * 2 / threads);
 
     ThreadPool pool((unsigned)threads);
@@ -115,9 +124,11 @@ int main(int argc, char ** argv) {
     for (int r = 0; r < reps; ++r) {
         std::vector<double> cur;
         for (int i = 0; i < iters; ++i) {
+            const auto w0 = std::chrono::steady_clock::now();
             const double t0 = now_s();
             call();
             cur.push_back(now_s() - t0);
+            throttle::pause_since(w0);
         }
         std::sort(cur.begin(), cur.end());
         run_best.push_back(cur[cur.size() / 2]);

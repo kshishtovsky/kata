@@ -136,6 +136,13 @@ size_t ggml_type_size(uint32_t type) {
         case 15: return 292; // Q8_K
         case 20: return 18;  // IQ4_NL
         case 23: return 36;  // IQ4_XS
+        case 16: return 66;  // IQ2_XXS: 2 + 32*2
+        case 17: return 74;  // IQ2_XS: 2 + 32*2 + 8
+        case 18: return 98;  // IQ3_XXS: 2 + 3*32
+        case 19: return 50;  // IQ1_S: 2 + 32 + 16
+        case 21: return 110; // IQ3_S: 2 + 13*8 + 4
+        case 22: return 82;  // IQ2_S: 2 + 64 + 16
+        case 29: return 56;  // IQ1_M: 32 + 16 + 8
         case 24: return 1;   // I8
         case 25: return 2;   // I16
         case 26: return 4;   // I32

@@ -6,6 +6,7 @@
 #include "kata/cpu.h"
 #include "kata/gemv.h"
 #include "kata/gguf.h"
+#include "kata/throttle.h"
 #include "kata/pool.h"
 #include "kata/quant.h"
 
@@ -53,6 +54,7 @@ int main(int argc, char ** argv) {
     int iters = 20;
 
     std::vector<unsigned> thread_list{1, 8, 16, 32};
+    const unsigned tcap = throttle::max_threads();
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -65,6 +67,10 @@ int main(int argc, char ** argv) {
         else if (a == "--threads") { thread_list.clear(); for (auto s : {next()}) thread_list.push_back((unsigned)atoi(s.c_str())); }
         else if (a == "--threads-list") { thread_list.clear(); std::string s = next(); size_t p = 0; while (p < s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); thread_list.push_back((unsigned)atoi(s.substr(p, q - p).c_str())); p = q + 1; } }
     }
+
+    for (auto & t : thread_list) t = std::min(t, tcap);
+    std::sort(thread_list.begin(), thread_list.end());
+    thread_list.erase(std::unique(thread_list.begin(), thread_list.end()), thread_list.end());
 
     GgufFile f;
     f.open(path);
@@ -240,6 +246,7 @@ int main(int argc, char ** argv) {
         // Order alternates: whoever runs second inherits a warmer cache, which is
         // worth several percent on a buffer that half-fits in L3.
         for (int it = 0; it < iters; ++it) {
+            const auto w0 = std::chrono::steady_clock::now();
             const bool kata_first = (it & 1) == 0;
             if (kata_first) {
                 const double t0 = now_s();
@@ -274,6 +281,7 @@ int main(int argc, char ** argv) {
                 else gemv_q4_0_q8_0_auto(total_rows, cols, ours.data(), wq.data(), aq.data(), nt);
                 tk.push_back(now_s() - t0);
             }
+            throttle::pause_since(w0);
         }
         const double mk = tk[tk.size() / 2], mg = tg[tg.size() / 2], mr = tr[tr.size() / 2];
         // Quartile spread so a 5% difference is not read out of a 30% noise floor.

@@ -187,3 +187,72 @@ no thermal trip logged. Preceding coredumps were ggml SIGSEGVs from a mistyped
 `ggml_vec_dot_t` signature (fixed: it takes `(n, s, bs, x, bx, y, by, nrc)`),
 not a hardware fault. Cause of the reset remains unidentified; if it repeats under
 the same memory-heavy benchmark, treat it as a suspect PSU/RAM stability issue.
+
+## EXP-0004 — Load guard for benchmarks (and a rejected micro-optimisation)
+
+**Date:** 2026-11-25
+**Status:** PASSED (guard) / REJECTED (correction hoist)
+**Hypothesis:** (a) benchmark harnesses can be made safe on a box that hard-resets
+under sustained all-core memory saturation; (b) hoisting the q4_0 `-8` bias
+correction out of the inner loop would recover the 25% it appeared to cost.
+
+### (a) Load guard — PASSED
+
+`include/kata/throttle.h` adds an env-driven cap consulted by every harness:
+`KATA_MAX_THREADS` (default `hardware_concurrency()/2`, i.e. the physical core
+count) and `KATA_DUTY` (default 0.90). `throttle::pause_since(t0)` idles
+`(1-duty)/duty` of the elapsed work time after each iteration.
+
+- `bench_gemv` caps `--threads` and prints `threads 32 capped to 16`.
+- `bench_real_weights` clamps its thread list through the same cap.
+- `ThreadPool::default_threads()` now returns the capped physical core count
+  instead of `hw-1`.
+- `/tmp/safe_run.sh` wraps any run with `flock` so two benchmarks cannot overlap.
+
+Verified: `--threads 32` → capped to 16, `run_spread` 6.5%; single-thread run at
+90% duty completes with `run_spread=0.2%`.
+
+### (b) Correction hoist — REJECTED
+
+The `-8` bias correction depends only on the activation row, so it can be
+precomputed once per call instead of `rows * nb` times. A microbenchmark measured
+the no-correction variant at 22.48 GB/s against 17.97 for the full kernel, which
+looked like 25% of headroom.
+
+Implemented as `activation_corrections()` writing into a `thread_local
+std::vector<int32_t>`, loaded back with `_mm256_loadu_si256` per block.
+
+Measured A/B, same binary layout, single thread pinned, 288 MiB working set:
+
+| variant | GB/s |
+|---|---|
+| recompute per block (baseline) | 16.63 |
+| hoisted per call | 16.30 |
+
+**Rejected — 2% slower.** The saved ALU work is invisible because the loop is
+memory-bound, while the extra pass over the activation row costs a real
+cache-resident read. Reverted with `git checkout src/gemv.cpp`.
+
+**Lesson.** On this kernel the "-8 correction costs 25%" measurement was an
+artifact of comparing against a kernel that also skipped a dependency chain; the
+correction is free in the memory-bound regime. Do not micro-optimise ALU on a
+kernel whose measured gap to `memcpy` is 4x.
+
+### Incident log
+
+Four hard resets during this session (17:33, 17:44, 17:53, 17:55). Three ended
+with no shutdown sequence at all in the journal; one was a clean
+`systemd-shutdown`. No OOM, no MCE, no thermal trip in any of them. Resets
+cluster on multi-threaded memory-bandwidth benchmarks. Two additional "crashes"
+turned out to be my own `abort()` from an uncaught `gguf: unsupported tensor type
+18` exception — the GGUF reader lacked IQ-type sizes, now added for types
+16-19, 21, 22, 29.
+
+A third failure mode appeared: a reset during `cmake --build` left
+`build/bench_real_weights`, `build/bench_gemv`, `build/bench_vs_ggml`,
+`build/kata_tests` and one `.o` file at **0 bytes**, and ninja then reported
+"no work to do" because the timestamps were newer than the sources. Always check
+`find build -size 0 -type f` after a reset.
+
+**Guard added to this log's procedure:** no benchmark may exceed
+`KATA_MAX_THREADS`, and every harness must idle `1-KATA_DUTY` of wall clock.
