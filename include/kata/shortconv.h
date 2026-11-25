@@ -13,4 +13,9 @@ void shortconv_bx(const float * bcx, float * bx, size_t m, size_t nc);
 void shortconv_conv(const float * bx, const float * bcx, size_t m, size_t nc,
                     size_t ntaps, const float * kern, float * out);
 
+// Decode step: processes 1 token row and updates the history state in place.
+void shortconv_step(const float * b, const float * c, const float * x,
+                    float * hist, const float * kern, size_t d_conv,
+                    size_t nc, float * out);
+
 } // namespace kata

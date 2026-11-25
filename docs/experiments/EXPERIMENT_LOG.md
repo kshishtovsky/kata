@@ -34,6 +34,7 @@
 | EXP-0030 | Spin-then-park thread pool (the CPU load "wave") | PASSED | prefill 268 -> 330 tok/s, 25070 tok 138.6 -> 154.7, decode 36.1 -> 41.6 tok/s |
 | EXP-0031 | Reuse MoE scratch across layers; ring-buffer shortconv | PASSED | prefill 330 -> 354-370 tok/s, logits unchanged; shortconv 331 -> 364 tok/s on its own (serial history shift removed, OOB at m<l_cache fixed) |
 | EXP-0033 | Multithreaded prefill quantisation (`q8_rows_mt`); decode scratch reuse | PASSED (prefill) / NEUTRAL (decode) | prefill 544 tok 354-370 -> 445.3-467.6 tok/s (parity with llama.cpp 465.23); decode 41.55-42.31 vs 45.78 tok/s (pool overhead ~25% in perf) |
+| EXP-0034 | Vectorised router GEMV (`gemv_f32_avx2`) and shortconv decode step | PASSED | decode 24.1 -> 22.8 ms/token (41.5 -> 42.9 tok/s); exact numerical match (56085 / 17568 unchanged); router GEMV 1.36 -> 0.16 ms (8.3x) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2058,3 +2059,72 @@ Keep both changes: `q8_rows_mt` brings prefill to full parity with `llama.cpp` (
 ### 11. Next Iteration
 
 Attribute and reduce decode thread-pool dispatch overhead (~25% of decode cycles across 503 fan-outs/token) and `mm_batch`/GEMV latency (e.g., evaluate whether fewer worker threads or CCD0-local execution reduces `ThreadPool::_M_run` spin/sync overhead on small GEMV buckets, and check `mm_batch` activation reuse / dispatch overhead in `ffn` and `mix`).
+
+---
+
+## EXP-0034 — Vectorised router GEMV (`gemv_f32_avx2`) and shortconv decode step
+
+**ID:** EXP-0034
+**Date:** 2026-11-26
+**Status:** PASSED
+
+### 1. Problem
+
+Detailed profile attribution of decode (23.63 ms/token vs llama.cpp's 21.84 ms/token, gap of 1.79 ms) revealed that thread 0 ran several unvectorised serial regions while 15 worker threads spun in `ThreadPool`:
+1. `gemv_f32` (MoE router gating projection `64 x 2048` in all 38 MoE layers) was implemented with a scalar unvectorised loop in `src/model.cpp`, taking **1.365 ms per token**.
+2. `shortconv` on decode quantised `3 * n_embd` (6144 floats) instead of `n_embd` (2048 floats) into `spr_3` across 30 layers, reading out of bounds past `in` and adding redundant quantisation latency (~0.07 ms).
+3. The 1D depthwise convolution in `shortconv` on decode was executed via two scalar loops over 2048 channels with element-by-element history shifts.
+
+### 2. Hypothesis
+
+1. Vectorising `gemv_f32` with AVX2 + FMA and a 4-row unrolled kernel (`gemv_f32_avx2`) will reuse activation loads across 4 rows and cut router gating time from 1.36 ms to <0.20 ms.
+2. Replacing the scalar 1D convolution with an AVX2 fused decode step (`shortconv_step`) and fixing the activation quantisation size from `3 * n_embd` to `n_embd` will eliminate buffer overread and shave another ~0.1 ms.
+3. Total per-token decode latency will drop by ~0.8-1.0 ms without any drift in output logits or tokens.
+
+### 3. Implementation
+
+- **`include/kata/simd.h`**: added `exp256_ps(__m256 x)` (degree-5 minimax polynomial on `[-0.5, 0.5]` with exponent field addition).
+- **`include/kata/gemv.h` & `src/gemv.cpp`**: declared and implemented `gemv_f32_ref`, `gemv_f32_avx2` (4-row unroll + FMA + horizontal reduce), and `gemv_f32` with runtime ISA dispatch. Microbenchmark confirmed AVX2 (0.165 ms) outperforms AVX-512 (0.186 ms) on Zen 4 due to L1 load port saturation and lower reduction latency.
+- **`include/kata/shortconv.h` & `src/shortconv.cpp`**: declared and implemented `shortconv_step` with 8-wide AVX2 loads of `b`, `c`, `x`, `h0`, `h1` and in-place history shift.
+- **`src/model.cpp`**: routed router gating to `kata::gemv_f32`, corrected shortconv input quantisation to `n_embd`, and called `shortconv_step`.
+- **`tests/test_gemv.cpp` & `tests/test_shortconv.cpp`**: added unit tests (`GemvF32.Avx2MatchesRef`, `GemvF32.NonMultipleShapesAndDispatches`, `ShortConv.StepMatchesChunkDriver`).
+
+### 4. Modified Files
+
+`include/kata/gemv.h`, `include/kata/shortconv.h`, `include/kata/simd.h`, `src/gemv.cpp`, `src/model.cpp`, `src/shortconv.cpp`, `tests/test_gemv.cpp`, `tests/test_shortconv.cpp`, `docs/experiments/EXPERIMENT_LOG.md`.
+
+### 5. Tests
+
+83/83 unit tests pass (20 test suites, 590 ms).
+
+### 6. Coverage
+
+`./scripts/coverage.sh`: **79.47%** across kata sources (threshold >= 75%).
+
+### 7. Benchmark
+
+Ryzen 9 7950X3D, `LFM2.5-24B-A2B-Q4_K_M.gguf`, `KATA_MAX_THREADS=16`:
+
+| Metric | Before (EXP-0033) | After (EXP-0034) | Delta |
+| --- | --- | --- | --- |
+| Router GEMV 38 layers (`gemv_f32`) | 1.365 ms/token | **0.165 ms/token** | **8.3x faster (-1.20 ms)** |
+| Mix phase (`KATA_PROF=1`) | 5.68 ms/token | **5.20 ms/token** | **-0.48 ms** |
+| FFN phase (`KATA_PROF=1`) | 15.17 ms/token | **14.81 ms/token** | **-0.36 ms** |
+| Total steady-state decode | 23.66 ms/token | **22.78 ms/token** | **-0.88 ms** |
+| Decode tok/s (128 tokens, warm) | 41.55 - 42.31 tok/s | **42.88 - 42.89 tok/s** | **+0.6-1.3 tok/s** |
+| 5-tok argmax / logit | 56085 / 17.78026 | **56085 / 17.78026** | **exact match** |
+| 544-tok argmax / logit | 17568 / 17.52197 | **17568 / 17.52197** | **exact match** |
+
+### 8. Quality
+
+Exact numerical match across all reference prompts to 5 decimal places (`argmax=56085 logit=17.78026` on 5-token, `argmax=17568 logit=17.52197` on 544-token prompt).
+
+### 9. Conclusion
+
+Keep all changes. Vectorising the serial glue on thread 0 reduced steady-state per-token latency from 23.66 ms to 22.78 ms without modifying mathematical results or introducing drift.
+
+### 10. Next Iteration
+
+Address the remaining gap to llama.cpp (22.78 ms vs 21.84 ms = 0.94 ms):
+1. Fused QKV projection in decode attention: currently `q`, `k`, `v` are 3 separate pool fan-outs (`2048`, `512`, `512` rows) all reading the same `in` vector.
+2. Batching small expert matvecs or reducing thread-pool synchronization overhead.

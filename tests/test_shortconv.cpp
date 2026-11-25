@@ -140,3 +140,25 @@ TEST(ShortConv, ResetOfTheFilterIsTheIdentity) {
             ASSERT_FLOAT_EQ(out[i * nc + e], r[nc + e] * r[e] * r[2 * nc + e]) << i << "," << e;
         }
 }
+
+TEST(ShortConv, StepMatchesChunkDriver) {
+    const size_t total = 10, nc = 64, ntaps = 3, d_conv = ntaps - 1;
+    auto bcx = random_vec(total * 3 * nc, 11);
+    auto kern = random_vec(nc * ntaps, 12);
+
+    std::vector<float> seq_flat((d_conv + total) * nc, 0.0f);
+    std::vector<float> flat(total * nc, 0.0f);
+    run_chunk(bcx, kern, seq_flat, total, nc, ntaps, flat);
+
+    std::vector<float> hist(d_conv * nc, 0.0f);
+    std::vector<float> got(nc, 0.0f);
+    for (size_t i = 0; i < total; ++i) {
+        const float * b = bcx.data() + i * 3 * nc;
+        const float * c = b + nc;
+        const float * x = b + 2 * nc;
+        kata::shortconv_step(b, c, x, hist.data(), kern.data(), d_conv, nc, got.data());
+        for (size_t e = 0; e < nc; ++e) {
+            ASSERT_NEAR(got[e], flat[i * nc + e], 1e-6f) << "row " << i << " e " << e;
+        }
+    }
+}

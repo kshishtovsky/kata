@@ -286,3 +286,32 @@ TEST(GemvK6, PerSubBlockScalesAreNotDuplicated) {
     EXPECT_GT(std::fabs(want), 1e-6f);
     EXPECT_NEAR(got, want, 1e-4 * std::max(1.0, double(std::fabs(want))));
 }
+
+TEST(GemvF32, Avx2MatchesRef) {
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    std::mt19937 g(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const size_t rows = 64, cols = 2048;
+    std::vector<float> w(rows * cols), x(cols), want(rows), got(rows);
+    for (auto & v : w) v = dist(g);
+    for (auto & v : x) v = dist(g);
+    kata::gemv_f32_ref(rows, cols, want.data(), w.data(), x.data());
+    kata::gemv_f32_avx2(rows, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < rows; ++r) {
+        EXPECT_NEAR(got[r], want[r], 1e-4f * std::max(1.0f, std::fabs(want[r]))) << "row " << r;
+    }
+}
+
+TEST(GemvF32, NonMultipleShapesAndDispatches) {
+    std::mt19937 g(77);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const size_t rows = 13, cols = 77;
+    std::vector<float> w(rows * cols), x(cols), want(rows), got(rows);
+    for (auto & v : w) v = dist(g);
+    for (auto & v : x) v = dist(g);
+    kata::gemv_f32_ref(rows, cols, want.data(), w.data(), x.data());
+    kata::gemv_f32(rows, cols, got.data(), w.data(), x.data());
+    for (size_t r = 0; r < rows; ++r) {
+        EXPECT_NEAR(got[r], want[r], 1e-4f * std::max(1.0f, std::fabs(want[r]))) << "row " << r;
+    }
+}

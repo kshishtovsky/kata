@@ -35,6 +35,27 @@ inline float hsum_ps(__m256 v) {
     return _mm_cvtss_f32(_mm_add_ss(lo, sh));
 }
 
+// Vectorised exp(x) via degree-5 minimax polynomial for 2^f on [-0.5, 0.5]
+// and 2^k via IEEE-754 exponent field addition. Clamped to [-87, 88].
+__attribute__((target("avx2,fma")))
+inline __m256 exp256_ps(__m256 x) {
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    x = _mm256_max_ps(_mm256_min_ps(x, _mm256_set1_ps(88.0f)), _mm256_set1_ps(-87.0f));
+    x = _mm256_mul_ps(x, log2e);
+    const __m256 k = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256 f = _mm256_sub_ps(x, k);
+    __m256 poly = _mm256_set1_ps(1.3143408886e-04f);
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(1.3534167919e-03f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(9.6181291076e-03f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(5.5504108665e-02f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(2.4022650696e-01f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(6.9314718056e-01f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(1.0f));
+    const __m256i ki = _mm256_cvtps_epi32(k);
+    const __m256 pow2k = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(ki, _mm256_set1_epi32(127)), 23));
+    return _mm256_mul_ps(poly, pow2k);
+}
+
 // Unpack the 12 packed q4_K scale bytes into utmp[0..3]: scales in the low byte
 // of each word, mins in the high byte. Same bit shuffling as ggml's reference.
 __attribute__((target("avx2")))

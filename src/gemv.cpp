@@ -1,4 +1,5 @@
 #include "kata/gemv.h"
+#include "kata/simd.h"
 
 #include <map>
 #include <memory>
@@ -576,6 +577,71 @@ void gemv_q4_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q4_K *
         const size_t r1 = std::min(rows, r0 + chunk);
         if (r0 < r1) fn(r1 - r0, cols, out + r0, w + r0 * (cols / QK_K), x);
     });
+}
+
+void gemv_f32_ref(size_t rows, size_t cols, float * out, const float * w, const float * x) {
+    for (size_t r = 0; r < rows; ++r) {
+        const float * wr = w + r * cols;
+        float sum = 0.0f;
+        for (size_t c = 0; c < cols; ++c) sum += wr[c] * x[c];
+        out[r] = sum;
+    }
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2,fma")))
+void gemv_f32_avx2(size_t rows, size_t cols, float * out, const float * w, const float * x) {
+    size_t r = 0;
+    for (; r + 4 <= rows; r += 4) {
+        const float * w0 = w + (r + 0) * cols;
+        const float * w1 = w + (r + 1) * cols;
+        const float * w2 = w + (r + 2) * cols;
+        const float * w3 = w + (r + 3) * cols;
+        __m256 a0 = _mm256_setzero_ps();
+        __m256 a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps();
+        __m256 a3 = _mm256_setzero_ps();
+        size_t c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            const __m256 xv = _mm256_loadu_ps(x + c);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + c), xv, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + c), xv, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + c), xv, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + c), xv, a3);
+        }
+        out[r + 0] = hsum_ps(a0);
+        out[r + 1] = hsum_ps(a1);
+        out[r + 2] = hsum_ps(a2);
+        out[r + 3] = hsum_ps(a3);
+        for (; c < cols; ++c) {
+            out[r + 0] += w0[c] * x[c];
+            out[r + 1] += w1[c] * x[c];
+            out[r + 2] += w2[c] * x[c];
+            out[r + 3] += w3[c] * x[c];
+        }
+    }
+    for (; r < rows; ++r) {
+        const float * wr = w + r * cols;
+        __m256 a0 = _mm256_setzero_ps();
+        size_t c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(wr + c), _mm256_loadu_ps(x + c), a0);
+        }
+        float sum = hsum_ps(a0);
+        for (; c < cols; ++c) sum += wr[c] * x[c];
+        out[r] = sum;
+    }
+}
+#endif
+
+void gemv_f32(size_t rows, size_t cols, float * out, const float * w, const float * x) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpu_isa() >= Isa::Avx2) {
+        gemv_f32_avx2(rows, cols, out, w, x);
+        return;
+    }
+#endif
+    gemv_f32_ref(rows, cols, out, w, x);
 }
 
 } // namespace kata

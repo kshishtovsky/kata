@@ -53,6 +53,12 @@ void gemv_q6_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * o
                              const block_q6_K * const * w, const block_q8_K * const * x,
                              ThreadPool & pool);
 
+// ---- f32 x f32 ---------------------------------------------------------
+// Dense F32 GEMV, used for the router gate projection (e.g. 64x2048 in MoE).
+void gemv_f32_ref (size_t rows, size_t cols, float * out, const float * w, const float * x);
+void gemv_f32_avx2(size_t rows, size_t cols, float * out, const float * w, const float * x);
+void gemv_f32     (size_t rows, size_t cols, float * out, const float * w, const float * x);
+
 // Multi-threaded driver. Rows are split into one contiguous block per worker so
 // each worker streams a single region of the weight matrix (TLB friendly).
 void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x, ThreadPool & pool);

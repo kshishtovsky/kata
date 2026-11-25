@@ -24,6 +24,7 @@
 #include "kata/prefill.h"
 #include "kata/quant.h"
 #include "kata/rope.h"
+#include "kata/simd.h"
 #include "kata/types.h"
 
 namespace kata {
@@ -51,22 +52,6 @@ struct Layer {
     const void * gate_exps = nullptr, * up_exps = nullptr, * down_exps = nullptr;
     uint32_t t_ge = 0, t_ue = 0, t_de = 0;
 };
-
-void gemv_f32(size_t rows, size_t cols, float * out, const float * w, const float * x) {
-    for (size_t r = 0; r < rows; ++r) {
-        const float * wr = w + r * cols;
-        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-        size_t c = 0;
-        for (; c + 4 <= cols; c += 4) {
-            s0 += wr[c] * x[c];
-            s1 += wr[c + 1] * x[c + 1];
-            s2 += wr[c + 2] * x[c + 2];
-            s3 += wr[c + 3] * x[c + 3];
-        }
-        for (; c < cols; ++c) s0 += wr[c] * x[c];
-        out[r] = (s0 + s1) + (s2 + s3);
-    }
-}
 
 // Dispatches on the gguf type, so the forward pass never assumes a format.
 void gemv_quant(uint32_t type, size_t rows, size_t cols, float * out,
@@ -306,30 +291,16 @@ struct Model::Impl {
 
     void shortconv(size_t il, const Layer & L, const std::vector<float> & in, std::vector<float> & out) {
         // in_proj emits b, c, x as three contiguous chunks of n_embd.
-        quantize_row_q8_K(in.data(), spr_3.data(), 3 * n_embd);
+        quantize_row_q8_K(in.data(), spr_3.data(), n_embd);
         gemv_quant(L.t_in, 3 * n_embd, n_embd, bcx.data(), L.in_proj, spr_3.data(), pool);
 
         const size_t d_conv = l_cache - 1;
         float * hist = conv_state.data() + il * d_conv * n_embd;
-        // conv.weight is ggml [3, n_embd]: ne[0]=3 varies fastest, so channel e
-        // owns the three consecutive floats kern[e*3 .. e*3+2].
         const float * kern = static_cast<const float *>(L.conv);
         const float * b = bcx.data();
         const float * c = bcx.data() + n_embd;
         const float * xx = bcx.data() + 2 * n_embd;
-        for (size_t e = 0; e < n_embd; ++e) {
-            const float bxe = b[e] * xx[e];
-            const float * k3 = kern + e * 3;
-            float s = k3[0] * hist[0 * n_embd + e]
-                    + k3[1] * hist[1 * n_embd + e]
-                    + k3[2] * bxe;
-            spr_out[e] = c[e] * s;
-        }
-        // Shift the history window: newest bx becomes hist[d_conv-1].
-        for (size_t e = 0; e < n_embd; ++e) {
-            for (size_t j = 0; j + 1 < d_conv; ++j) hist[j * n_embd + e] = hist[(j + 1) * n_embd + e];
-            hist[(d_conv - 1) * n_embd + e] = b[e] * xx[e];
-        }
+        shortconv_step(b, c, xx, hist, kern, d_conv, n_embd, spr_out.data());
         quantize_row_q8_K(spr_out.data(), spr_ao.data(), n_embd);
         gemv_quant(L.t_out, n_embd, n_embd, out.data(), L.out_proj, spr_ao.data(), pool);
     }
