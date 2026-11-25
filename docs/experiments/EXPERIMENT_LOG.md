@@ -17,6 +17,7 @@
 | EXP-0013 | Register accumulators + vectorised exp | PASSED | 32k decode 17.5 -> 11.7 ms (1.50x); gain over scalar 2.84x -> 4.16x |
 | EXP-0014 | Batched score pass (4 positions/iter) | PASSED | 16k 4206 -> 3863 us (1.09x); 32k flat; N=8/16/32 all worse |
 | EXP-0015 | Grouped decode (one kv walk per GQA group) | PASSED | 32k 13.3 -> 8.0 ms (1.66x); 16k 3.81 -> 2.05 ms (1.86x) |
+| EXP-0016 | Tiled score pass (8x8 transpose) | PASSED | 32k 8.0 -> 7.2 ms (1.11x); 16k 2.05 -> 1.78 ms (1.15x) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1037,4 +1038,58 @@ G=4, which is what LFM2.5 and Qwen3.6 use.
 `set1` per head per position and re-reads v once per group; splitting it so v is
 read once into L1 and used by all four heads, and hoisting the four
 probabilities into one broadcast, is the next experiment.
+
+## EXP-0016 — Tiled score pass, 8x8 transpose
+
+**Status:** PASSED.
+
+**Hypothesis.** After EXP-0015 the score pass was 7088 us and `perf annotate`
+showed `vhaddps` at 24-32% of samples. The pairwise reduce
+`hadd(hadd(r[p], r[p+1]))` is three dependent adds per (position, head) pair.
+An 8x8 lane transpose turns eight accumulators into eight column sums in one
+shot: `w = a[0] + a[1] + ... + a[7]`.
+
+**Implementation.** `src/attn.cpp`:
+- `transpose8(__m256*)` — unpacklo/hi, shuffle_ps, permute2f128; verified
+  standalone against hand-computed column sums before it went in.
+- `scores_8x()` — 2 positions x 4 query heads of one kv group, 8 accumulators
+  indexed `j*4 + h`. **Each k vector is loaded once per 8 floats and used by all
+  four heads**, which is what makes the grouping pay. Scalar tail for head dims
+  with a remainder; `scale` applied once at the end.
+
+**Correctness.** 49/49 tests, including `Attn.GroupedMatchesPlainDecode` over
+8 shapes and the G=1 / hd=96 / hd=32 fallbacks. `hd % 8 == 0` is guaranteed by
+the existing `hd % 16 == 0` dispatch guard, so the tiled path has no partial
+8-float block.
+
+**Measured** (Ryzen 9 7950X3D, 1 thread pinned, 32 heads / 8 kv heads x 64 dim):
+
+| n_kv | EXP-0015 | EXP-0016 | gain |
+|---|---|---|---|
+| 4096 | 557 us | 437 us | 1.27x |
+| 16384 | 2053 us | 1777 us | 1.16x |
+| 32768 | 8012 us | 7210 us | 1.11x |
+
+Cumulative against the original scalar decode at 32k: 53.5 ms -> 7.2 ms, **7.4x**.
+
+**Dead end inside this experiment.** The first `scores_8x` kept the 8-way tile
+but loaded k inside the per-head loop, reintroducing the four-fold re-read:
+9657 us, worse than EXP-0015. The win only appears when k is hoisted out of the
+head loop. Same lesson as EXP-0015, applied one level deeper.
+
+**Analysis.** The gain shrinks with depth (1.27x at 4k, 1.11x at 32k) because at
+32k the kernel is closer to a memory wall, where killing ALU chains cannot help
+much. `v_group<4,4>` is now 21% of the profile and the grouped driver 38%.
+
+**Bottleneck after this change.** v pass: `_mm512_set1_ps` per head per position
+(four broadcasts per position) and 16 zmm accumulators, reading v once per group.
+Effective traffic 64 MiB in ~5.5 ms = 12 GB/s against a 43-59 GB/s ceiling, so
+the v pass is still instruction-bound, not memory-bound.
+
+**Conclusion.** Keep. Both passes now use a transpose-style reduce.
+
+**Next.** Hoist the four probabilities into one broadcast per position in
+`v_group` (a `_mm512_set1_ps` of a 4-float load instead of four separate ones)
+and check whether the 16 zmm accumulators are spilling; if they are, the v pass
+splits into two halves of head_dim 32 rather than four.
 

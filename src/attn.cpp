@@ -278,6 +278,81 @@ void attn_head_v(const AttnArgs & a, const float * p, float inv) {
     }
 }
 
+// 8x8 transpose of ymm lanes. After it, a[i] holds lane i of all eight
+// accumulators, so one vector add across a[0..7] yields the eight horizontal
+// sums. The per-pair hadd chain this replaces was 32% of the kernel.
+__attribute__((target("avx2,fma")))
+void transpose8(__m256 * a) {
+    const __m256 t0 = _mm256_unpacklo_ps(a[0], a[1]);
+    const __m256 t1 = _mm256_unpackhi_ps(a[0], a[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(a[2], a[3]);
+    const __m256 t3 = _mm256_unpackhi_ps(a[2], a[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(a[4], a[5]);
+    const __m256 t5 = _mm256_unpackhi_ps(a[4], a[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(a[6], a[7]);
+    const __m256 t7 = _mm256_unpackhi_ps(a[6], a[7]);
+    const __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+    a[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+    a[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+    a[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+    a[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+    a[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+    a[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    a[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
+    a[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
+}
+
+// 8 (position, head) pairs: 2 positions x 4 query heads of one kv group. Each
+// k vector is loaded once and used by all four heads, which is the whole point
+// of grouping; the transpose at the end replaces eight hadd chains with one.
+// acc index is j*4 + h, matching the out[j][h] layout the caller wants.
+__attribute__((target("avx2,fma")))
+void scores_8x(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd,
+               float scale, float * out) {
+    const size_t stride = a.n_kv_heads * hd;
+    const float * k0 = a.k_cache + t0 * stride + base;
+    const float * k1 = k0 + stride;
+    __m256 r[8];
+    for (int i = 0; i < 8; ++i) r[i] = _mm256_setzero_ps();
+
+    size_t z = 0;
+    for (; z + 8 <= hd; z += 8) {
+        const __m256 kk0 = _mm256_loadu_ps(k0 + z);
+        const __m256 kk1 = _mm256_loadu_ps(k1 + z);
+        for (int h = 0; h < 4; ++h) {
+            const __m256 qh = _mm256_loadu_ps(q + h * hd + z);
+            r[h] = _mm256_fmadd_ps(qh, kk0, r[h]);
+            r[4 + h] = _mm256_fmadd_ps(qh, kk1, r[4 + h]);
+        }
+    }
+    transpose8(r);
+    __m256 w = r[0];
+    for (int i = 1; i < 8; ++i) w = _mm256_add_ps(w, r[i]);
+    alignas(32) float lane[8];
+    _mm256_store_ps(lane, w);
+    for (int i = 0; i < 8; ++i) out[i] = lane[i];
+    // Head dims with a remainder: finish scalar, per (position, head).
+    if (z < hd) {
+        for (int h = 0; h < 4; ++h) {
+            float a0 = 0.0f, a1 = 0.0f;
+            for (size_t i = z; i < hd; ++i) {
+                a0 += q[h * hd + i] * k0[i];
+                a1 += q[h * hd + i] * k1[i];
+            }
+            out[h] += a0;
+            out[4 + h] += a1;
+        }
+    }
+    for (int i = 0; i < 8; ++i) out[i] *= scale;
+}
+
 // G query heads share one kv head. Walking the kv head once and scoring all G
 // against the same k block removes the G-fold re-read of K, which the phase
 // split showed was 256 MiB per token at 32k for 64 MiB of actual data.
@@ -315,32 +390,34 @@ void scores_group(const AttnArgs & a, const float * q, size_t base, size_t t0, s
     }
 }
 
-// G heads sharing one kv head: weighted sum of v. AVX-512 is used for the
-// register budget alone -- 4 heads x 64 floats is 16 zmm accumulators, which
-// AVX2's 16 ymm cannot hold without spilling.
-template <int G>
+// G heads sharing one kv head: weighted sum of v. NZ is a compile-time zmm
+// count on purpose: with a runtime bound the accumulator array lives on the
+// stack and GCC emits one kmovw per spill reload, which profiling showed as 35%
+// of the kernel.
+template <int G, int NZ>
 __attribute__((target("avx512f,avx512vl,avx512bw,fma")))
 void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const float * inv,
-             float * out, size_t nv_zmm) {
+             float * out) {
     const size_t stride = a.n_kv_heads * hd;
-    __m512 acc[G][4];
+    __m512 acc[G][NZ];
     for (int h = 0; h < G; ++h)
-        for (size_t j = 0; j < nv_zmm; ++j) acc[h][j] = _mm512_setzero_ps();
+        for (int j = 0; j < NZ; ++j) acc[h][j] = _mm512_setzero_ps();
 
     for (size_t t = 0; t < a.n_kv; ++t) {
         const float * v = a.v_cache + t * stride + base;
         __m512 pv[G];
         for (int h = 0; h < G; ++h) pv[h] = _mm512_set1_ps(p[h * a.n_kv + t]);
-        for (size_t j = 0; j < nv_zmm; ++j) {
+        for (int j = 0; j < NZ; ++j) {
             const __m512 vv = _mm512_loadu_ps(v + j * 16);
             for (int h = 0; h < G; ++h) acc[h][j] = _mm512_fmadd_ps(pv[h], vv, acc[h][j]);
         }
     }
+    const size_t done = size_t(NZ) * 16;
     for (int h = 0; h < G; ++h) {
         const __m512 iv = _mm512_set1_ps(inv[h]);
-        for (size_t j = 0; j < nv_zmm; ++j)
+        for (int j = 0; j < NZ; ++j)
             _mm512_storeu_ps(out + h * hd + j * 16, _mm512_mul_ps(acc[h][j], iv));
-        for (size_t i = nv_zmm * 16; i < hd; ++i) {
+        for (size_t i = done; i < hd; ++i) {
             float s = 0.0f;
             for (size_t t = 0; t < a.n_kv; ++t) s += p[h * a.n_kv + t] * a.v_cache[t * stride + base + i];
             out[h * hd + i] = s * inv[h];
@@ -396,8 +473,19 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
 
         float * p = scratch;  // 4 heads x n_kv probabilities, head-major
         size_t t = 0;
-        for (; t + 2 <= a.n_kv; t += 2)
-            scores_group<4, 2>(a, q, base, t, hd, scale, p, mxv);
+        alignas(32) float tile[8];
+        // hd % 8 == 0 is guaranteed by the hd % 16 check above, so the tiled
+        // path covers whole tiles and only the odd position is left over.
+        for (; t + 2 <= a.n_kv; t += 2) {
+            scores_8x(a, q, base, t, hd, a.scale, tile);
+            for (int j = 0; j < 2; ++j) {
+                for (int h = 0; h < 4; ++h) {
+                    const float sc = tile[j * 4 + h];
+                    p[h * a.n_kv + t + j] = sc;
+                    mxv[h] = std::max(mxv[h], sc);
+                }
+            }
+        }
         // Odd tail position: reuse the NT=2 kernel on a copy would read past the
         // cache, so score it per head.
         if (t < a.n_kv) {
@@ -416,7 +504,13 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
             inv[h] = 1.0f / sum;
         }
 
-        v_group<4>(a, p, hd, base, inv, a.out + gb * 4 * hd, hd / 16);
+        // head_dim / 16 is compile-time per case so the accumulators stay in zmm.
+        switch (hd / 16) {
+        case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        case 2: v_group<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        }
     }
 }
 

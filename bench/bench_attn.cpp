@@ -62,10 +62,11 @@ int main(int argc, char ** argv) {
             std::sort(t.begin(), t.end());
             return t[t.size() / 2];
         };
-        const double ts = vector_only ? 0.0 : time_it(true);
+        const double ts = (vector_only || grouped || phases) ? 0.0 : time_it(true);
         const double tv = time_it(false);
         const double kv_mib = 2.0 * n_kv * n_kv_heads * head_dim * sizeof(float) / (1024.0 * 1024.0);
         if (grouped) {
+            const double tv2 = time_it(false);
             std::vector<float> sg(kata::attention_scratch_floats_grouped(a));
             auto time_grouped = [&] {
                 std::vector<double> t;
@@ -79,8 +80,8 @@ int main(int argc, char ** argv) {
                 return t[t.size() / 2];
             };
             const double tg = time_grouped();
-            std::printf("%8zu %10.1f %10.1f %9.2fx %10.1f\n", n_kv, tv, tg, tv / tg, kv_mib);
-            std::printf("CSV,attn_grouped,%zu,%.3f,%.3f\n", n_kv, tv, tg);
+            std::printf("%8zu %10.1f %10.1f %9.2fx %10.1f\n", n_kv, tv2, tg, tv2 / tg, kv_mib);
+            std::printf("CSV,attn_grouped,%zu,%.3f,%.3f\n", n_kv, tv2, tg);
             continue;
         }
         if (phases) {
