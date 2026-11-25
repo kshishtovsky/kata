@@ -1289,3 +1289,63 @@ Keep. This is the base the rest of the project optimises.
 
 ### Next
 EXP-0020: attribute per-stage time with KATA_PROF and rank the real hot spots.
+
+## EXP-0020: where the token time actually goes
+
+**Status:** PASSED
+**Date:** 2026-11-25
+
+### Problem
+EXP-0019 left a 315 ms/token figure with no attribution, while the arithmetic
+bounds said 19 ms/token at the 78 GB/s ceiling. 16x unexplained.
+
+### Implementation
+Wired the previously dead `t_mix` accumulator and added `t_mm` / `t_q` / `n_mm`
+inside `Impl::mm`, so every GEMV call is counted and timed. `KATA_PROF=1` prints
+a per-token breakdown to stderr.
+
+### Results (8 threads, 8-token prompt, steady state)
+```
+mm        23.2-26.4 ms in 503 calls (46-52 us/call), quantize 2.4 ms
+total     32.7-36.6 ms | mix 21% | ffn 69% | lm 9% | norm 0.1%
+```
+
+| phase | ms/token | share |
+|---|---|---|
+| GEMV (all 503 calls) | 23-26 | 69% |
+| mixer (attention + shortconv non-GEMV work) | 6.9-7.9 | 21% |
+| lm_head GEMV | 3.2-3.6 | 9% |
+| RMSNorm | 0.02 | 0.1% |
+| embedding | 0.00 | — |
+
+### The real finding: per-call dispatch costs ~45% of throughput
+Isolated with `/tmp/moebench.cpp` — the same 269 MB walked as 152 calls of
+1536x2048 q4_K, versus one call of 233472 rows:
+
+| threads | 152 small calls | one big call |
+|---|---|---|
+| 1 | 22.59 GB/s | 23.55 GB/s |
+| 4 | 47.24 GB/s | **80.43 GB/s** |
+| 8 | 47.16 GB/s | **85.07 GB/s** |
+| 16 | 44.14 GB/s | 79.91 GB/s |
+
+Single-threaded the two are identical, so the loss is not arithmetic — it is
+fan-out. At 4-8 threads each call wakes the pool for a slice of only ~1.5 MB
+(1536 rows), the workers finish before they are all scheduled, and the run
+serialises. One big call reaches 85 GB/s, above the 78 GB/s DRAM estimate,
+because the 269 MB buffer is partly L3-resident.
+
+Quantisation of the activation is 2.4 ms/token (7%) — worth attacking only after
+dispatch is fixed.
+
+### Conclusion
+The engine is dispatch-bound, not memory-bound and not arithmetic-bound. 503
+GEMV calls per token, each too small to amortise a thread-pool wake-up, is the
+single largest lever and it is a scheduling fix, not a kernel fix.
+
+### Next
+EXP-0021: batch the per-expert GEMVs. The four experts of a layer share one
+activation row and one 1536-wide output row, so they can be issued as one call
+over a concatenated 4x1536 view when the four expert matrices are contiguous —
+they are not in the GGUF, so this needs a gather into a per-layer staging buffer,
+or a row-count-multiplied kernel that takes 4 base pointers.

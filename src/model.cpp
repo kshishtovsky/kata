@@ -119,7 +119,8 @@ struct Model::Impl {
     std::string dump_dir;
     // Per-phase wall clock, printed only when KATA_PROF is set.
     bool prof = std::getenv("KATA_PROF") != nullptr;
-    double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0;
+    double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
+    size_t n_mm = 0;
     struct Tick { double * acc; std::chrono::steady_clock::time_point t0; bool on;
         Tick(double * a, bool o) : acc(a), on(o), t0(std::chrono::steady_clock::now()) {}
         ~Tick() { if (on) *acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } };
@@ -156,8 +157,16 @@ struct Model::Impl {
 
     // Quantises the activation block and runs one quantised matvec.
     void mm(uint32_t type, size_t rows, size_t cols, float * out, const void * w, const float * in) {
+        const auto q0 = std::chrono::steady_clock::now();
         quantize_row_q8_K(in, aq.data(), cols);
+        const auto q1 = std::chrono::steady_clock::now();
         gemv_quant(type, rows, cols, out, w, aq.data(), pool);
+        const auto q2 = std::chrono::steady_clock::now();
+        if (prof) {
+            t_q += std::chrono::duration<double, std::milli>(q1 - q0).count();
+            t_mm += std::chrono::duration<double, std::milli>(q2 - q1).count();
+            ++n_mm;
+        }
     }
 
     void embed(uint32_t token) {
@@ -310,8 +319,9 @@ struct Model::Impl {
             prev = x;
             { Tick tk(&t_norm, prof); rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.attn_norm), eps); }
             if (pos == 0) dump(("norm" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
-            if (L.attn) attention(il, L, norm_out, pos);
-            else shortconv(il, L, norm_out, attn_out);
+            { Tick tk(&t_mix, prof);
+              if (L.attn) attention(il, L, norm_out, pos);
+              else shortconv(il, L, norm_out, attn_out); }
             if (pos == 0) dump(("mixer" + std::to_string(il)).c_str(), attn_out.data(), n_embd);
             for (size_t j = 0; j < n_embd; ++j) x[j] = prev[j] + attn_out[j];
 
@@ -327,6 +337,13 @@ struct Model::Impl {
         rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(out_norm), eps);
         { Tick tk(&t_lm, prof); mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd, norm_out.data()); }
         st.pos = pos + 1;
+        if (prof) {
+            const double tot = t_emb + t_mix + t_ffn + t_lm + t_norm;
+            std::fprintf(stderr, "[prof] mm %7.2f ms in %zu calls (%.1f us/call), quantize %5.2f ms\n", t_mm, n_mm, n_mm ? 1000.0*t_mm/n_mm : 0.0, t_q);
+            std::fprintf(stderr, "[prof] total %7.2f ms | mix %7.2f (%4.1f%%) | ffn %7.2f (%4.1f%%) | lm %6.2f (%4.1f%%) | norm %5.2f (%4.1f%%) | emb %5.2f\n",
+                         tot, t_mix, 100*t_mix/tot, t_ffn, 100*t_ffn/tot, t_lm, 100*t_lm/tot, t_norm, 100*t_norm/tot, t_emb);
+            t_emb = t_mix = t_ffn = t_lm = t_norm = t_mm = t_q = 0; n_mm = 0;
+        }
         return logits.data();
     }
 };
