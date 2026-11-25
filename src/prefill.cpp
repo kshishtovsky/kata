@@ -144,38 +144,99 @@ void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const fl
     const size_t kv_stride = n_kv_heads * head_dim;
     for (size_t t = 0; t < n_tok; ++t) {
         const size_t n_kv = n_kv_begin + t + 1;
-        for (size_t h = 0; h < n_heads; ++h) {
-            const float * qv = q + (t * n_heads + h) * head_dim;
-            const size_t kvh = h / group;
-            __m256 acc[NV];
-            for (int r = 0; r < NV; ++r) acc[r] = _mm256_setzero_ps();
-            float m = -INFINITY, s = 0.0f;
-            for (size_t p = 0; p < n_kv; ++p) {
-                const float * kp = k_cache + p * kv_stride + kvh * head_dim;
-                const float sc = dot_avx2(qv, kp, head_dim) * scale;
-                // The running max rises O(log n) times over a whole row, so most
-                // positions take the pure-FMA path: acc += e*v with no rescale of
-                // the 64-float accumulator. Rescaling every position was 2 mul + 1
-                // add per element instead of one fused multiply-add.
-                const float * vp = v_cache + p * kv_stride + kvh * head_dim;
-                if (sc > m) {
-                    const float corr = m == -INFINITY ? 0.0f : exp_fast(m - sc);
-                    const __m256 cv = _mm256_set1_ps(corr);
-                    s = s * corr + 1.0f;
-                    m = sc;
-                    for (int r = 0; r < NV; ++r)
-                        acc[r] = _mm256_add_ps(_mm256_mul_ps(acc[r], cv), _mm256_loadu_ps(vp + 8 * r));
-                } else {
-                    const float e = exp_fast(sc - m);
-                    s += e;
-                    const __m256 ev = _mm256_set1_ps(e);
-                    for (int r = 0; r < NV; ++r)
-                        acc[r] = _mm256_fmadd_ps(ev, _mm256_loadu_ps(vp + 8 * r), acc[r]);
+        for (size_t kvh = 0; kvh < n_kv_heads; ++kvh) {
+            const size_t h_base = kvh * group;
+            size_t h = 0;
+            // 2-head tiling when group >= 2: loads K and V once for two query heads
+            for (; h + 2 <= group; h += 2) {
+                const size_t h0 = h_base + h;
+                const size_t h1 = h0 + 1;
+                const float * qv0 = q + (t * n_heads + h0) * head_dim;
+                const float * qv1 = q + (t * n_heads + h1) * head_dim;
+
+                __m256 acc0[NV], acc1[NV];
+                for (int r = 0; r < NV; ++r) {
+                    acc0[r] = _mm256_setzero_ps();
+                    acc1[r] = _mm256_setzero_ps();
                 }
+                float m0 = -INFINITY, s0 = 0.0f;
+                float m1 = -INFINITY, s1 = 0.0f;
+
+                for (size_t p = 0; p < n_kv; ++p) {
+                    const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                    const float sc0 = dot_avx2(qv0, kp, head_dim) * scale;
+                    const float sc1 = dot_avx2(qv1, kp, head_dim) * scale;
+                    const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+
+                    if (sc0 > m0) {
+                        const float corr0 = m0 == -INFINITY ? 0.0f : exp_fast(m0 - sc0);
+                        const __m256 cv0 = _mm256_set1_ps(corr0);
+                        s0 = s0 * corr0 + 1.0f;
+                        m0 = sc0;
+                        for (int r = 0; r < NV; ++r)
+                            acc0[r] = _mm256_add_ps(_mm256_mul_ps(acc0[r], cv0), _mm256_loadu_ps(vp + 8 * r));
+                    } else {
+                        const float e0 = exp_fast(sc0 - m0);
+                        s0 += e0;
+                        const __m256 ev0 = _mm256_set1_ps(e0);
+                        for (int r = 0; r < NV; ++r)
+                            acc0[r] = _mm256_fmadd_ps(ev0, _mm256_loadu_ps(vp + 8 * r), acc0[r]);
+                    }
+
+                    if (sc1 > m1) {
+                        const float corr1 = m1 == -INFINITY ? 0.0f : exp_fast(m1 - sc1);
+                        const __m256 cv1 = _mm256_set1_ps(corr1);
+                        s1 = s1 * corr1 + 1.0f;
+                        m1 = sc1;
+                        for (int r = 0; r < NV; ++r)
+                            acc1[r] = _mm256_add_ps(_mm256_mul_ps(acc1[r], cv1), _mm256_loadu_ps(vp + 8 * r));
+                    } else {
+                        const float e1 = exp_fast(sc1 - m1);
+                        s1 += e1;
+                        const __m256 ev1 = _mm256_set1_ps(e1);
+                        for (int r = 0; r < NV; ++r)
+                            acc1[r] = _mm256_fmadd_ps(ev1, _mm256_loadu_ps(vp + 8 * r), acc1[r]);
+                    }
+                }
+
+                const __m256 inv0 = _mm256_set1_ps(1.0f / s0);
+                float * o0 = out + (t * n_heads + h0) * head_dim;
+                for (int r = 0; r < NV; ++r) _mm256_storeu_ps(o0 + 8 * r, _mm256_mul_ps(acc0[r], inv0));
+
+                const __m256 inv1 = _mm256_set1_ps(1.0f / s1);
+                float * o1 = out + (t * n_heads + h1) * head_dim;
+                for (int r = 0; r < NV; ++r) _mm256_storeu_ps(o1 + 8 * r, _mm256_mul_ps(acc1[r], inv1));
             }
-            const __m256 inv = _mm256_set1_ps(1.0f / s);
-            float * o = out + (t * n_heads + h) * head_dim;
-            for (int r = 0; r < NV; ++r) _mm256_storeu_ps(o + 8 * r, _mm256_mul_ps(acc[r], inv));
+
+            for (; h < group; ++h) {
+                const size_t h0 = h_base + h;
+                const float * qv = q + (t * n_heads + h0) * head_dim;
+                __m256 acc[NV];
+                for (int r = 0; r < NV; ++r) acc[r] = _mm256_setzero_ps();
+                float m = -INFINITY, s = 0.0f;
+                for (size_t p = 0; p < n_kv; ++p) {
+                    const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                    const float sc = dot_avx2(qv, kp, head_dim) * scale;
+                    const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+                    if (sc > m) {
+                        const float corr = m == -INFINITY ? 0.0f : exp_fast(m - sc);
+                        const __m256 cv = _mm256_set1_ps(corr);
+                        s = s * corr + 1.0f;
+                        m = sc;
+                        for (int r = 0; r < NV; ++r)
+                            acc[r] = _mm256_add_ps(_mm256_mul_ps(acc[r], cv), _mm256_loadu_ps(vp + 8 * r));
+                    } else {
+                        const float e = exp_fast(sc - m);
+                        s += e;
+                        const __m256 ev = _mm256_set1_ps(e);
+                        for (int r = 0; r < NV; ++r)
+                            acc[r] = _mm256_fmadd_ps(ev, _mm256_loadu_ps(vp + 8 * r), acc[r]);
+                    }
+                }
+                const __m256 inv = _mm256_set1_ps(1.0f / s);
+                float * o = out + (t * n_heads + h0) * head_dim;
+                for (int r = 0; r < NV; ++r) _mm256_storeu_ps(o + 8 * r, _mm256_mul_ps(acc[r], inv));
+            }
         }
     }
 }
@@ -271,9 +332,11 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
             }
             for (size_t p = 0; p < n_kv; ++p) {
                 const float * kp = k_cache + p * kv_stride + kvh * HD;
+                _mm_prefetch(reinterpret_cast<const char *>(kp + 4 * kv_stride), _MM_HINT_T0);
                 const __m512 k0 = _mm512_loadu_ps(kp), k1 = _mm512_loadu_ps(kp + 16),
                              k2 = _mm512_loadu_ps(kp + 32), k3 = _mm512_loadu_ps(kp + 48);
                 const float * vp = v_cache + p * kv_stride + kvh * HD;
+                _mm_prefetch(reinterpret_cast<const char *>(vp + 4 * kv_stride), _MM_HINT_T0);
 
                 float sc[4];
                 for (size_t h = 0; h < G; ++h) {
