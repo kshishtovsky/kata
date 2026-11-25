@@ -16,11 +16,13 @@ using Clock = std::chrono::steady_clock;
 int main(int argc, char ** argv) {
     size_t n_heads = 32, n_kv_heads = 8, head_dim = 64;
     int iters = 200;
+    bool vector_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--heads")) n_heads = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--kv-heads")) n_kv_heads = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--head-dim")) head_dim = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--iters")) iters = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--vector-only")) vector_only = true;
     }
 
     std::mt19937 g(42);
@@ -56,10 +58,11 @@ int main(int argc, char ** argv) {
             std::sort(t.begin(), t.end());
             return t[t.size() / 2];
         };
-        const double ts = time_it(true);
+        const double ts = vector_only ? 0.0 : time_it(true);
         const double tv = time_it(false);
         const double kv_mib = 2.0 * n_kv * n_kv_heads * head_dim * sizeof(float) / (1024.0 * 1024.0);
-        std::printf("%8zu %10.2f %10.2f %9.2fx %10.1f\n", n_kv, ts, tv, ts / tv, kv_mib);
+        if (vector_only) std::printf("%8zu %10.2f %10.1f\n", n_kv, tv, kv_mib);
+        else std::printf("%8zu %10.2f %10.2f %9.2fx %10.1f\n", n_kv, ts, tv, ts / tv, kv_mib);
         std::printf("CSV,attn,%zu,%.3f,%.3f\n", n_kv, tv, ts);
     }
     return 0;

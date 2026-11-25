@@ -14,6 +14,7 @@
 | EXP-0010 | RoPE | PASSED | 1.05-1.15x over scalar after caching the frequency table; both layouts supported |
 | EXP-0011 | Decode attention + KV layout | PASSED | 2.2-2.9x over scalar; 17.5 ms at 32k context, becomes the dominant cost |
 | EXP-0012 | Grouped-KV decode attention | FAILED | All 4 variants slower at 32k (24.2 vs 17.5 ms); reverted |
+| EXP-0013 | Register accumulators + vectorised exp | PASSED | 32k decode 17.5 -> 11.7 ms (1.50x); gain over scalar 2.84x -> 4.16x |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -850,3 +851,86 @@ comment recording why the grouped shape was abandoned.
 
 Vectorised exp (polynomial or `exp2` with a folded scale) as the measured 17%
 target, then blocked v accumulation.
+
+## EXP-0013 — Register accumulators and a vectorised exp
+
+**Status:** PASSED
+**Date:** 2026-11-25
+**Hypothesis:** EXP-0012 proved the kernel is ALU/overhead bound, not
+bandwidth-bound, and named two suspects: the v-accumulation round trip through
+memory, and the scalar `exp()`. `perf` is now installed, so both are measurable
+rather than guessed.
+
+### Profiling setup
+
+Installed `perf` (`pacman -Sy perf`) and set `kernel.perf_event_paranoid=1`.
+`bench_attn` gained `--vector-only` because the first profile was 65% scalar-ref
+code — profiling a benchmark that times two implementations measures both.
+
+`perf annotate` on the vector path put **38%** of cycles on
+`vmovups (%rdx,%r11,4)` / `vfmadd213ps` / `vmovups %ymm0,(%rcx,%r11,4)` — i.e. the
+v loop was loading the output row from memory, adding, and storing it back on
+every position. That is a store-forwarding round trip per 8 floats.
+
+### Change 1: accumulators in registers
+
+`v_accum<NV>` holds the whole output row in `NV` ymm registers for head dims that
+fit (8/16/32/64/128 -> NV 1/2/4/8/16), with `v_accum_generic` as the spill
+fallback for unusual head dims. Result at 32k: **17.5 -> 14.9 ms**. Confirmed the
+diagnosis; gain over scalar 2.84x -> 3.39x.
+
+### Change 2: vectorised exp
+
+AVX2 has no `exp2` instruction, so `exp256_ps` splits the exponent: `x*log2(e)`,
+round to nearest int, degree-5 minimax polynomial for `2^f` on `f in [-0.5, 0.5]`,
+and `2^k` as an exponent-field add. Argument clamped to [-87, 88] to keep the
+shift in range. Standalone check: **max relative error 6.8e-06** over
+x in [-80, 80]. Result at 32k: **14.9 -> 11.7 ms**.
+
+### Bug caught
+
+The first version summed the scalar tail with `_mm256_add_ps(s0, _mm256_set1_ps(p[i]))`,
+adding each tail value to all eight lanes — an 8x inflated denominator whenever
+`n_kv % 32 != 0`. `Attn.VectorMatchesRefAcrossShapes` failed at `n_kv = 1` with
+`ref 0.700000 vec 0.087500` (exactly 1/8). Fixed with a scalar `tail` accumulated
+and added once.
+
+A second, non-code bug: `kata_tests` is `EXCLUDE_FROM_ALL`, so a plain
+`cmake --build build` **does not rebuild it**, and I twice read a stale binary
+that still contained the bug I had just fixed. Always
+`cmake --build build --target kata_tests`.
+
+### Benchmark
+
+1 thread pinned, `32 heads / 8 kv heads x 64 dim`, median of 200:
+
+| n_kv | scalar | vector | gain | vs EXP-0011 |
+|---|---|---|---|---|
+| 1 | 1.59 us | 0.66 us | 2.41x | 0.77 -> 0.66 |
+| 128 | 134.9 us | **25.8 us** | 5.23x | 64.6 -> 25.8 |
+| 1024 | 1266 us | **261 us** | 4.84x | 438 -> 261 |
+| 4096 | 4960 us | **1051 us** | 4.72x | 1734 -> 1051 |
+| 16384 | 19409 us | **4201 us** | 4.62x | 6925 -> 4201 |
+| 32768 | 48617 us | **11678 us** | 4.16x | 17544 -> 11678 |
+
+At 32k the kernel now moves 128 MiB in 11.7 ms = **11.5 GB/s** against a 43-59 GB/s
+ceiling, so a 3.7-5x gap remains. It is no longer in the accumulator or in `exp`.
+
+### New test
+
+`Attn.ExtremeScoresMatchRefAfterClamp` feeds scores with sigma 40 (saturated
+attention) at n_kv 8 and 257, asserting no NaN and agreement within 5e-4. This is
+the test that would have caught a too-narrow clamp, and it is the only test that
+exercises the polynomial at its limits.
+
+### Conclusion
+
+Keep both. 1.50x on the operation that dominates long-context decode, from two
+independent 1.17x-1.28x steps. 48/48 tests, coverage 87.09%.
+
+### Next
+
+The remaining 3.7-5x at 32k is in the score pass. Its inner loop is a
+`dot_avx2` + horizontal reduce per position, and the horizontal reduce
+(`vhaddps` twice) was 10.5% of samples by itself. 4 positions at a time would
+amortise it 4x; that is the next experiment.

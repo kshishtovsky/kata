@@ -107,3 +107,33 @@ TEST(Attn, KvSlotIsDisjointAndPositionMajor) {
         for (size_t i = 0; i < n_kv_heads * hd; ++i)
             EXPECT_EQ(kata::kv_slot(cache.data(), p, n_kv_heads, hd)[i], (float)(p * 100 + i));
 }
+TEST(Attn, ExtremeScoresMatchRefAfterClamp) {
+    // The vector path replaces exp with a polynomial and clamps the exponent
+    // range. Wild score spans are normal with untrained or saturated attention,
+    // and a clamp that is too narrow shows up here as NaN or a wrong winner.
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    const size_t n_heads = 4, n_kv_heads = 2, hd = 32;
+    std::mt19937 g(99);
+    std::normal_distribution<float> nd(0.0f, 40.0f);
+    for (size_t n_kv : {size_t(8), size_t(257)}) {
+        std::vector<float> k(n_kv * n_kv_heads * hd), v(n_kv * n_kv_heads * hd), q(n_heads * hd);
+        for (auto & x : k) x = nd(g);
+        for (auto & x : v) x = nd(g);
+        for (auto & x : q) x = nd(g);
+        kata::AttnArgs a{};
+        a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
+        a.n_kv = n_kv; a.n_heads = n_heads; a.n_kv_heads = n_kv_heads; a.head_dim = hd;
+        a.scale = 1.0f / std::sqrt((float)hd);
+        std::vector<float> want(n_heads * hd), got(n_heads * hd);
+        std::vector<float> s(kata::attention_scratch_floats(a));
+        a.out = want.data();
+        kata::attention_decode_ref(a, s.data());
+        a.out = got.data();
+        kata::attention_decode(a, s.data());
+        for (size_t i = 0; i < want.size(); ++i) {
+            ASSERT_FALSE(std::isnan(got[i])) << "i=" << i << " n_kv=" << n_kv;
+            EXPECT_NEAR(got[i], want[i], 5e-4f * std::max(1.0f, std::fabs(want[i])))
+                << "n_kv=" << n_kv << " i=" << i;
+        }
+    }
+}

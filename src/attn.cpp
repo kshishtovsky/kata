@@ -79,6 +79,121 @@ float dot_avx2(const float * x, const float * y, size_t n) {
 
 } // namespace
 
+namespace {
+
+// exp(x) = exp2(x * log2(e)). There is no exp2 instruction on AVX2, so this is a
+// polynomial with the integer exponent split out: 2^(k + f) = 2^k * 2^f, where
+// 2^f comes from a degree-5 minimax fit on f in [-0.5, 0.5] and 2^k is an
+// exponent-field add. Range is clamped to keep the shift in range.
+// 4 independent accumulator chains: one chain would measure the add latency.
+__attribute__((target("avx2,fma")))
+__m256 exp256_ps(__m256 x) {
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    x = _mm256_mul_ps(x, log2e);
+    // round to nearest int (ties to even)
+    __m256 k = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256 f = _mm256_sub_ps(x, k);
+    // 2^f on f in [-0.5, 0.5]
+    __m256 poly = _mm256_set1_ps(1.3333558146e-03f);
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(9.6181291076e-03f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(5.5504108665e-02f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(2.4022650696e-01f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(6.9314718056e-01f));
+    poly = _mm256_fmadd_ps(poly, f, _mm256_set1_ps(1.0f));
+    // 2^k via exponent field; k is in [-126, 127] after the clamp above.
+    const __m256i ki = _mm256_cvtps_epi32(k);
+    const __m256 pow2k = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(ki, _mm256_set1_epi32(127)), 23));
+    return _mm256_mul_ps(poly, pow2k);
+}
+
+__attribute__((target("avx2,fma")))
+float softmax_exp_inplace(float * p, size_t n, float mx) {
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 upper = _mm256_set1_ps(88.0f);
+    const __m256 lower = _mm256_set1_ps(-87.0f);
+    const __m256 damax = _mm256_set1_ps(mx);
+    __m256 s0 = zero, s1 = zero, s2 = zero, s3 = zero;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256 v0 = _mm256_sub_ps(_mm256_loadu_ps(p + i), damax);
+        __m256 v1 = _mm256_sub_ps(_mm256_loadu_ps(p + i + 8), damax);
+        __m256 v2 = _mm256_sub_ps(_mm256_loadu_ps(p + i + 16), damax);
+        __m256 v3 = _mm256_sub_ps(_mm256_loadu_ps(p + i + 24), damax);
+        v0 = _mm256_max_ps(_mm256_min_ps(v0, upper), lower);
+        v1 = _mm256_max_ps(_mm256_min_ps(v1, upper), lower);
+        v2 = _mm256_max_ps(_mm256_min_ps(v2, upper), lower);
+        v3 = _mm256_max_ps(_mm256_min_ps(v3, upper), lower);
+        v0 = exp256_ps(v0);
+        v1 = exp256_ps(v1);
+        v2 = exp256_ps(v2);
+        v3 = exp256_ps(v3);
+        _mm256_storeu_ps(p + i, v0);
+        _mm256_storeu_ps(p + i + 8, v1);
+        _mm256_storeu_ps(p + i + 16, v2);
+        _mm256_storeu_ps(p + i + 24, v3);
+        s0 = _mm256_add_ps(s0, v0);
+        s1 = _mm256_add_ps(s1, v1);
+        s2 = _mm256_add_ps(s2, v2);
+        s3 = _mm256_add_ps(s3, v3);
+    }
+    // Tail accumulates into a scalar: _mm256_set1_ps would add the value to all
+    // eight lanes and inflate the sum eightfold (caught at n_kv = 1).
+    float tail = 0.0f;
+    for (; i < n; ++i) {
+        p[i] = std::exp(p[i] - mx);
+        tail += p[i];
+    }
+    (void)one;
+    s0 = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    __m128 lo = _mm256_castps256_ps128(s0), hi = _mm256_extractf128_ps(s0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) + tail;
+}
+
+// NV ymm registers of accumulator, NV*8 floats of head_dim handled in registers.
+template <int NV>
+__attribute__((target("avx2,fma")))
+void v_accum(const AttnArgs & a, float * o, const float * p, size_t hd, size_t base, float inv) {
+    __m256 acc[NV];
+    for (int j = 0; j < NV; ++j) acc[j] = _mm256_setzero_ps();
+    for (size_t t = 0; t < a.n_kv; ++t) {
+        const __m256 pv = _mm256_set1_ps(p[t]);
+        const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
+        for (int j = 0; j < NV; ++j) acc[j] = _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + 8 * j), acc[j]);
+    }
+    const __m256 iv = _mm256_set1_ps(inv);
+    for (int j = 0; j < NV; ++j) _mm256_storeu_ps(o + 8 * j, _mm256_mul_ps(acc[j], iv));
+    for (size_t i = size_t(NV) * 8; i < hd; ++i) {
+        float s = 0.0f;
+        for (size_t t = 0; t < a.n_kv; ++t) s += p[t] * a.v_cache[t * a.n_kv_heads * hd + base + i];
+        o[i] = s * inv;
+    }
+}
+
+// Fallback for head dims whose ymm count would spill the registers anyway.
+__attribute__((target("avx2,fma")))
+void v_accum_generic(const AttnArgs & a, float * o, const float * p, size_t hd, size_t base, float inv) {
+    const size_t nv = (hd / 8) * 8;
+    for (size_t i = 0; i < nv; i += 8) _mm256_storeu_ps(o + i, _mm256_setzero_ps());
+    for (size_t i = nv; i < hd; ++i) o[i] = 0.0f;
+    for (size_t t = 0; t < a.n_kv; ++t) {
+        const __m256 pv = _mm256_set1_ps(p[t]);
+        const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
+        for (size_t i = 0; i < nv; i += 8)
+            _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + i), _mm256_loadu_ps(o + i)));
+        for (size_t i = nv; i < hd; ++i) o[i] += p[t] * v[i];
+    }
+    const __m256 iv = _mm256_set1_ps(inv);
+    for (size_t i = 0; i < nv; i += 8)
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_loadu_ps(o + i), iv));
+    for (size_t i = nv; i < hd; ++i) o[i] *= inv;
+}
+
+} // namespace
+
 __attribute__((target("avx2,fma")))
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
     const size_t hd = a.head_dim;
@@ -94,34 +209,23 @@ void attention_decode_avx2(const AttnArgs & a, float * scratch) {
             mx = std::max(mx, s);
         }
 
-        // exp() has no vector form here, but it is one call per position rather
-        // than one per element, so this pass stays cheap relative to the dots.
-        float sum = 0.0f;
-        for (size_t t = 0; t < a.n_kv; ++t) {
-            scratch[t] = std::exp(scratch[t] - mx);
-            sum += scratch[t];
-        }
+        const float sum = softmax_exp_inplace(scratch, a.n_kv, mx);
 
         float * o = a.out + h * hd;
         const float inv = 1.0f / sum;
-        const size_t nv = (hd / 8) * 8;
+        const size_t nv = hd / 8;
 
-        for (size_t i = 0; i < nv; i += 8) _mm256_storeu_ps(o + i, _mm256_setzero_ps());
-        for (size_t i = nv; i < hd; ++i) o[i] = 0.0f;
-
-        // Position-major v means walking t is sequential; the output row stays
-        // in L1 across positions, so re-reading it each step costs nothing.
-        for (size_t t = 0; t < a.n_kv; ++t) {
-            const __m256 pv = _mm256_set1_ps(scratch[t]);
-            const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
-            for (size_t i = 0; i < nv; i += 8)
-                _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + i), _mm256_loadu_ps(o + i)));
-            for (size_t i = nv; i < hd; ++i) o[i] += scratch[t] * v[i];
+        // The accumulator has to live in a register. Storing it back to o every
+        // position forces a store-forwarding round trip per 8 floats, which
+        // profiling put at 38% of the kernel.
+        switch (nv) {
+        case 1:  v_accum<1>(a, o, scratch, hd, base, inv); break;
+        case 2:  v_accum<2>(a, o, scratch, hd, base, inv); break;
+        case 4:  v_accum<4>(a, o, scratch, hd, base, inv); break;
+        case 8:  v_accum<8>(a, o, scratch, hd, base, inv); break;
+        case 16: v_accum<16>(a, o, scratch, hd, base, inv); break;
+        default: v_accum_generic(a, o, scratch, hd, base, inv); break;
         }
-        const __m256 iv = _mm256_set1_ps(inv);
-        for (size_t i = 0; i < nv; i += 8)
-            _mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_loadu_ps(o + i), iv));
-        for (size_t i = nv; i < hd; ++i) o[i] *= inv;
     }
 }
 
