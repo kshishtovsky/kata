@@ -13,6 +13,7 @@
 | EXP-0009 | RMSNorm + backend boundary | PASSED | 5.5-6.3x over scalar, 97-112 GB/s; coverage tool was under-reporting by 19pp |
 | EXP-0010 | RoPE | PASSED | 1.05-1.15x over scalar after caching the frequency table; both layouts supported |
 | EXP-0011 | Decode attention + KV layout | PASSED | 2.2-2.9x over scalar; 17.5 ms at 32k context, becomes the dominant cost |
+| EXP-0012 | Grouped-KV decode attention | FAILED | All 4 variants slower at 32k (24.2 vs 17.5 ms); reverted |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -780,3 +781,72 @@ long-context cost is. 88.39% coverage, 47/47 tests.
 
 Blocked (tiled) decode attention — loop over KV in L2-sized chunks so the v pass
 never re-reads DRAM, and measure whether the 5.9x gap to the read ceiling closes.
+
+## EXP-0012 — Grouped-KV decode attention
+
+**Status:** FAILED
+**Date:** 2026-11-25
+**Hypothesis:** at 32k the kernel read 512 MiB of KV per token because each of
+the 4 query heads in a group re-read the shared kv head (4x amplification). Driving
+the loop by kv head instead of query head should cut that to 128 MiB and land the
+kernel near the read ceiling.
+
+### Why the hypothesis was plausible
+
+Traffic arithmetic checked out: 2 * 32 heads * 32768 * 64 * 4 B = 512 MiB today vs
+2 * 8 * 32768 * 64 * 4 B = 128 MiB grouped, an ideal 12.5 ms -> 3.1 ms at the
+43 GB/s single-thread read ceiling. Two more measurements supported it:
+
+- A pure-read sweep of the same 128 MiB KV in both layouts reached
+  **59.4 GB/s strided** (256 B used out of every 2048 B) and 50.2 GB/s contiguous —
+  so the position-major layout is not a problem and the DRAM can feed this.
+  (A first version of that sweep reported 12.6 GB/s for both layouts; the limit
+  was a single dependent float-add chain, not memory. Independent accumulators
+  fixed it. Lesson: a bandwidth probe with one accumulator measures the FPU.)
+- `exp()` costs 2.7 ns/call, i.e. **2.9 ms** for 1.05M scores per token at 32k —
+  17% of the kernel and not vectorisable without a polynomial approximation.
+
+### What was tried, all measured, all reverted
+
+| variant | 4k | 16k | 32k |
+|---|---|---|---|
+| baseline (per-head scoring, pos-major) | 1734 us | 6925 us | **17544 us** |
+| kv-head outer, head inner, scores [g][t] | 1581 | 6317 | 18656 |
+| ...scores transposed, [t][g] | 1628 | 6468 | 19594 |
+| ...+ position-outer scoring | 1686 | 6826 | 23692 |
+| ...+ register accumulators in the v pass | 1667 | 6638 | 21861 |
+| ...+ stale `mx0` fix (incremental max removed) | 1635 | 6526 | 24198 |
+| **final: reverted to baseline** | 1740 | 6948 | **17679** |
+
+Every grouped variant helps at 4-16k (up to 10%) and loses at 32k, monotonically
+worse the more of them are stacked. The traffic saving is real but it does not
+survive 128 MiB: at that size the working set is exactly L3, and the grouped code
+walks it in a different order (one kv head's 8 MB slab at a time, 8 slabs) which
+appears to interact worse with L3/DRAM than the linear per-head walk. The 10%
+win at 16k is inside run-to-run noise for this kernel.
+
+### What was learned (worth keeping)
+
+- The kernel is **not** bandwidth-bound at 32k: 128 MiB of KV in 17.5 ms is
+  7.3 GB/s against 43-59 GB/s achievable. The gap is ALU and per-position
+  overhead, so reducing bytes was attacking the wrong resource.
+- `exp()` alone is ~17% of the cost and is scalar. A vectorised exp (or an
+  `exp2`-based approximation with the base-2 scale folded into `a.scale`) is a
+  bigger, cleaner lever than anything done here.
+- Storing a value to the scratch array and immediately reading it back for the
+  running max costs a store-forwarding stall per position. Keep it in a register.
+- Blocking the v pass over positions (chunk KV to L2 size) remains untested and
+  is the more promising direction than grouping, since it improves locality in
+  the original loop order instead of changing it.
+
+### Conclusion
+
+Rejected and reverted with `git checkout src/attn.cpp`. Keeping a slower kernel
+because the traffic arithmetic looked right would be exactly the "optimisation on
+faith" this project forbids. `attention_scratch_floats()` is left in place with a
+comment recording why the grouped shape was abandoned.
+
+### Next
+
+Vectorised exp (polynomial or `exp2` with a folded scale) as the measured 17%
+target, then blocked v accumulation.

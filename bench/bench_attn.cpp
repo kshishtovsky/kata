@@ -38,12 +38,11 @@ int main(int argc, char ** argv) {
         std::vector<float> k(n_kv * n_kv_heads * head_dim), v(n_kv * n_kv_heads * head_dim);
         fill(k);
         fill(v);
-        std::vector<float> scratch(n_kv + 64);
-
         kata::AttnArgs a{};
         a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
         a.n_kv = n_kv; a.n_heads = n_heads; a.n_kv_heads = n_kv_heads; a.head_dim = head_dim;
         a.scale = 1.0f / std::sqrt((float)head_dim); a.out = out.data();
+        std::vector<float> scratch(kata::attention_scratch_floats(a));
 
         auto time_it = [&](bool use_scalar) {
             std::vector<double> t;

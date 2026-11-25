@@ -35,12 +35,12 @@ TEST(Attn, VectorMatchesRefAcrossShapes) {
         auto k = rnd(c.n_kv * c.n_kv_heads * c.head_dim, 2);
         auto v = rnd(c.n_kv * c.n_kv_heads * c.head_dim, 3);
         std::vector<float> want(c.n_heads * c.head_dim), got(c.n_heads * c.head_dim);
-        std::vector<float> s1(c.n_kv + 64), s2(c.n_kv + 64);
         kata::AttnArgs a{};
         a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
         a.n_kv = c.n_kv; a.n_heads = c.n_heads; a.n_kv_heads = c.n_kv_heads;
         a.head_dim = c.head_dim; a.scale = 1.0f / std::sqrt((float)c.head_dim);
         a.out = want.data();
+        std::vector<float> s1(kata::attention_scratch_floats(a)), s2(s1.size());
         kata::attention_decode_ref(a, s1.data());
         a.out = got.data();
         kata::attention_decode(a, s2.data());
@@ -58,7 +58,8 @@ TEST(Attn, FirstTokenReturnsExactlyV) {
     auto q = rnd(n_heads * hd, 4);
     auto k = rnd(n_kv * n_kv_heads * hd, 5);
     auto v = rnd(n_kv * n_kv_heads * hd, 6);
-    std::vector<float> out(n_heads * hd), scratch(n_kv + 64);
+    std::vector<float> out(n_heads * hd);
+    std::vector<float> scratch(n_heads / n_kv_heads * n_kv + 8);
     kata::AttnArgs a{};
     a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
     a.n_kv = n_kv; a.n_heads = n_heads; a.n_kv_heads = n_kv_heads;
@@ -79,7 +80,7 @@ TEST(Attn, EqualScoresGiveMeanOfV) {
     for (size_t t = 0; t < n_kv; ++t)
         for (size_t i = 0; i < n_kv_heads * hd; ++i) kk[t * n_kv_heads * hd + i] = k[i];
     auto v = rnd(n_kv * n_kv_heads * hd, 9);
-    std::vector<float> out(n_heads * hd), s(n_kv + 64);
+    std::vector<float> out(n_heads * hd), s(n_heads / n_kv_heads * n_kv + 8);
     kata::AttnArgs a{};
     a.q = q.data(); a.k_cache = kk.data(); a.v_cache = v.data();
     a.n_kv = n_kv; a.n_heads = n_heads; a.n_kv_heads = n_kv_heads; a.head_dim = hd;

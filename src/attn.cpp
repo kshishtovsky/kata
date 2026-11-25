@@ -133,6 +133,13 @@ void attention_decode_avx2(const AttnArgs & a, float * scratch) {
 
 #endif
 
+size_t attention_scratch_floats(const AttnArgs & a) {
+    // EXP-0012 showed the grouped loop loses at depth, so scoring stays per
+    // query head and scratch only needs one head's scores.
+    (void)a;
+    return a.n_kv + 8;
+}
+
 void attention_decode(const AttnArgs & a, float * scratch) {
     if (cpu_isa() == Isa::Scalar) {
         attention_decode_ref(a, scratch);

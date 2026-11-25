@@ -21,7 +21,9 @@ struct AttnArgs {
 
 void attention_decode_ref(const AttnArgs & a, float * scratch);
 void attention_decode_avx2(const AttnArgs & a, float * scratch);
-// scratch must hold at least n_kv floats.
+// scratch must hold at least attention_scratch_floats(a) floats: the scores of
+// one kv group, which is (n_heads / n_kv_heads) * n_kv.
+size_t attention_scratch_floats(const AttnArgs & a);
 void attention_decode(const AttnArgs & a, float * scratch);
 
 // Writes k and v for one token into the cache slot at a->n_kv - 1, applying
