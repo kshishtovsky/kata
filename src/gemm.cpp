@@ -257,7 +257,7 @@ constexpr size_t VRN = 8;  // weight rows per band
 
 struct alignas(64) VaTile {
     int32_t codes[QK_K / 4][VTN]; // 4 int8 codes per u32, one u32 per 4 k values
-    int32_t bsum[QK_K / 32][VTN];
+    int32_t bsum[QK_K / 32][VTN]; // sum of each 32-value group, for q4_K's min term
     float d[VTN];
 };
 
@@ -303,11 +303,19 @@ void unpack_w_band(const block_q4_K * w, size_t nb, size_t nr, VwBand & o) {
         const block_q4_K & wr = w[r * nb];
         o.d[r] = f16_fast(wr.d);
         o.dmin[r] = f16_fast(wr.dmin);
-        for (int s = 0; s < QK_K / 32; ++s) {
-            uint8_t sc8 = 0, mn8 = 0;
-            q4_K_scale_min(s, wr.scales, &sc8, &mn8);
-            o.sc[r][s] = sc8;
-            o.mn[r][s] = mn8;
+        // Same bit layout as q4_K_scale_min, unrolled: the j<4 and j>=4 cases
+        // have no branch left after unrolling, and this was 5.9% of prefill as
+        // an out-of-line call with a runtime index.
+        const uint8_t * q = wr.scales;
+#pragma GCC unroll 4
+        for (int s = 0; s < 4; ++s) {
+            o.sc[r][s] = q[s] & 63;
+            o.mn[r][s] = q[s + 4] & 63;
+        }
+#pragma GCC unroll 4
+        for (int s = 4; s < 8; ++s) {
+            o.sc[r][s] = (uint32_t)(q[s + 4] & 0x0f) | ((uint32_t)(q[s - 4] >> 6) << 4);
+            o.mn[r][s] = (uint32_t)(q[s + 4] >> 4) | ((uint32_t)(q[s] >> 6) << 4);
         }
         // Sub-block pair (s, s+1) shares qs[(s/2)*32 .. +32]: the low nibbles are
         // sub-block s's 32 values, the high nibbles sub-block s+1's. Both become
@@ -472,11 +480,26 @@ void gemm_q4_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
     const unsigned nt = pool.size();
     if (nt <= 1 || n < nt) { gemm_q4_K_q8_K(m, n, k, out, ldc, w, a); return; }
     const size_t nb = k / QK_K;
+    if (cpu_isa() != Isa::Avx512Vnni || k % QK_K != 0) {
+        const size_t chunk = (n + nt - 1) / nt;
+        pool.run([&](unsigned tid) {
+            const size_t lo = std::min(n, (size_t)tid * chunk);
+            const size_t hi = std::min(n, lo + chunk);
+            if (lo < hi) gemm_q4_K_q8_K(m, hi - lo, k, out + lo, ldc, w + lo * nb, a);
+        });
+        return;
+    }
+    // The activation tiles depend only on `a`, not on the weight chunk, so pack
+    // them once here. Packing inside each worker packed n/nt copies of the same
+    // bytes and showed up as 4.4% of prefill.
+    std::vector<VaTile> tiles;
+    pack_a_tiles(a, m, nb, tiles);
+    const size_t ntile = (m + VTN - 1) / VTN;
     const size_t chunk = (n + nt - 1) / nt;
     pool.run([&](unsigned tid) {
         const size_t lo = std::min(n, (size_t)tid * chunk);
         const size_t hi = std::min(n, lo + chunk);
-        if (lo < hi) gemm_q4_K_q8_K(m, hi - lo, k, out + lo, ldc, w + lo * nb, a);
+        if (lo < hi) q4_K_vnni_rows(tiles.data(), ntile, m, nb, hi - lo, w + lo * nb, out + lo, ldc);
     });
 }
 

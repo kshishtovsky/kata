@@ -27,6 +27,8 @@
 | EXP-0023 | Batched prefill GEMM, phase A | PASSED | 1.7-7.1x over per-row GEMV, relerr 1e-7; prefill wired end to end |
 | EXP-0024 | AVX-512 VNNI microkernel for prefill GEMM | PASSED | 160.7 vs 57.5 GMAC/s (2.79x); prefill 113 -> 145.7 tok/s |
 | EXP-0025 | Load-guard pool fix + honest CPU baseline | PASSED | spin 15.8% -> 5.3%; llama.cpp CPU prefill is 441 tok/s, not 4540 |
+| EXP-0026 | VNNI microkernel for q6_K | FAILED | prefill 145.0 -> 87.8 tok/s (0.61x); 16 sub-block epilogues per band vs q4_K's 8 |
+| EXP-0027 | Parallel prefill attention + parallel expert glue | PASSED | prefill 146.4 -> 231.9 tok/s (1.58x); attention 654 -> 196 ms, MoE glue 1032 -> 450 ms |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1644,3 +1646,118 @@ artifact of the same GPU cache, not of the benchmark method.
 and decode (1.3x). The measured kernel throughput ceiling for the ggml tiled
 kernels is 2029 GMAC/s at 16 threads, which for 512 tokens corresponds to ~900
 tok/s, so 441 is implementation, not silicon.
+
+## EXP-0026 — VNNI microkernel for q6_K
+
+**Status:** FAILED. Prefill 145.0 -> 87.8 tok/s (0.61x). Reverted.
+
+**Hypothesis.** EXP-0024 gave q4_K a 2.79x kernel win with an 8x16 VNNI tile,
+and q6_K was 15% of the prefill profile (`gemm_q6_K_row_mr`, no VNNI path at
+all) plus all of `down_exps`, `attn_v` and `token_embd`. The same tile shape
+should buy the same kind of win.
+
+**Implementation.** `VwBand6 { uint8_t g[VRN][QK_K/4]; int32_t sc[VRN][QK_K/16];
+float d[VRN]; }`, `unpack_w_band6`, `q6_K_vnni_tile`, `q6_K_vnni_rows`, and the
+same `cpu_isa()` dispatch in `gemm_q6_K_q8_K`. q6_K's -32 bias needs a scale per
+16-value sub-block (`value = d*sc*q - 32`), so the correction cannot be folded
+into one term per block the way q4_K's min is:
+`sum_s(sc_s * q8sum_s) << 5`, accumulated in a second `s2[]` from `bsum16`.
+
+**Bug found on the way, worth keeping.** `unpack_w_band6` first stored the four
+32-value runs with `_mm256_unpacklo_epi8(q0,q2)` / `unpackhi_epi8(q0,q2)`, which
+interleaves them instead of placing them end to end. Verified with a standalone
+checker (`/tmp/chk6.cpp`, comparing against `dequantize_row_q6_K`) that four
+plain sequential stores `q0,q2,q1,q3` into `dst+0/32/64/96` give
+**bad = 0/256**, and the interleave is wrong. The codes also had to be declared
+`uint32_t g[...]` rather than `uint8_t` so `set1_epi32` reads a whole 4-code
+group; with `uint8_t` the broadcast picked up 3 neighbouring bytes and the
+result was off by 574x-1520x on the shapes with `n=16`.
+
+**Why it lost.** Per 256-value band the tile issues the same 64 `vpdpbusd` as
+the q4_K version, but q6_K has **16 sub-blocks of 16 values instead of 8 of
+32**, so the epilogue doubles: 16 x (mullo for `s1`, mullo for `s2`, two adds,
+the `slli`+`sub` bias fix) against q4_K's 8. The byte widening is also worse per
+useful bit -- a 6-bit code is expanded to a full byte, so a q6_K block carries
+210 bytes of source for 256 values while a q4_K block carries 144, yet both feed
+the same 256 code bytes into the kernel. The dpbusd work is flat, the bookkeeping
+is 2x, and the measured result is a 39% regression.
+
+**Rejected rather than tuned.** The AVX2 `maddubs` path that q6_K already uses
+does not have this problem: it consumes 6-bit codes packed two-per-byte and
+folds the two scales of a 32-value `maddubs` into one `madd`, so its epilogue is
+8 sub-blocks, not 16. Killing it to gain 64-wide dpbusd was a net loss on both
+counts, and tuning would only close a gap that should not exist.
+
+**Decision.** q6_K keeps `gemm_q6_K_row_mr` (AVX2 `maddubs`). Reverted with the
+whole `VwBand6`/`q6_K_vnni_*` block deleted; 73/73 tests pass, prefill back to
+141.1-145.0 tok/s over two runs, argmax unchanged at 309 / logit 17.00016.
+
+**Lesson.** Instruction-count reasoning has to count the *epilogue*, not the
+inner product. VNNI is a win only where the metadata is amortised over enough
+values per sub-block — q4_K's 32 values per scale clears that bar, q6_K's 16 does
+not.
+
+## EXP-0027 — Prefill attention and expert glue were single-threaded
+
+**Hypothesis.** After EXP-0024/0025 the two GEMV families ran at 820-897 GMAC/s,
+so the remaining prefill deficit had to be work that is not matmul. `KATA_MAC`
+instrumentation was added to `src/model.cpp` to attribute the 3.71 s of a
+544-token prefill.
+
+**Measurement (before, 16 threads, 544 tokens).**
+
+| component | ms | share |
+|---|---|---|
+| matmul (`mmn` total) | 1497 | 40% |
+| MoE glue (gather, SiLU, quantise, scatter) | 1032 | 28% |
+| `shortconv_rows` | 379 | 10% |
+| `attention_rows` | 654 | 18% |
+| rms_norm | 21 | 1% |
+
+Both non-matmul blocks were serial. `attention_prefill` walked query rows in a
+single thread (16 idle cores during 18% of the run), and `moe_ffn_rows` ran
+`q8_rows_gather`, the SiLU multiply and `q8_rows` single-threaded on each of
+64 expert buckets per layer.
+
+**Implementation.**
+- `attention_prefill_mt(..., ThreadPool &)` in `src/prefill.cpp` and
+  `include/kata/prefill.h`: query rows split into contiguous bands, each worker
+  calls the existing `attention_prefill` on its band with `n_kv_begin + lo`, so
+  row `t` still sees exactly positions `0 .. n_kv_begin + t`. Delegate the
+  kernel itself, do not rewrite it.
+- `q8_rows_gather_mt`, `q8_rows_mt`, `silu_mul_mt` in `src/model.cpp`, split by
+  row with `per = (m + nw - 1) / nw`. Worker count is capped by work:
+  `std::min(pool.size(), (n + per - 1) / per)` and falls back to the serial path
+  when the cap is 1, so a 4-row bucket does not pay for 16 wake-ups.
+- `silu_mul(float*, const float*, size_t)` extracted so the dense and MoE paths
+  share one implementation.
+
+**Result.**
+
+| metric | before | after | delta |
+|---|---|---|---|
+| prefill 544 tok | 146.4 tok/s | **231.9 tok/s** | 1.58x |
+| attention | 654 ms | 196 ms | 3.34x |
+| MoE glue | 1032 ms | 450 ms | 2.29x |
+| matmul | 1497 ms | 1452 ms | 1.03x |
+| decode 128 tok | 34.55 tok/s | 34.55 tok/s | unchanged |
+
+Thread sweep after the change: 4 threads 117.6 tok/s, 8 threads 158.5, 16
+threads 171.0 (measured before the glue fix; the glue fix moves all three up).
+
+**Profile after.** `q4_K_vnni_tile` 45.0%, `gemm_q6_K_row_mr` 15.4%,
+`q4_K_vnni_rows` 8.7%, `native_queued_spin_lock_slowpath` 5.7%,
+`quantize_row_q8_K` 3.8%, `prefill_rows<8>` 2.5%, `gemm_f32` 2.2%. Matmul is
+dominant again, which is where the ceiling now is.
+
+**Test.** `Prefill.MtSplitMatchesSingleThreaded` asserts the MT result is
+bit-identical, not merely close, for `n_tok` = 1/3/7/16/37 and 2/3/8 workers
+(37 rows over 8 workers leaves a partial band). 74/74 pass.
+
+**Verdict: keep.** Both changes are pure parallelism over independent output
+rows, so they cannot change results, and the test proves it.
+
+**Next.** `q4_K_vnni_tile` at 45% of prefill and 894 GMAC/s against the
+measured ggml ceiling of ~2029 GMAC/s. The gap is the `-8` bias correction and
+the per-band weight unpack, both of which ggml amortises by repacking weights
+once instead of per call.

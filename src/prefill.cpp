@@ -4,6 +4,7 @@
 // produced them. This walks the kv prefix once per query row with an online
 // softmax and keeps the weighted-v accumulator in registers the whole time.
 #include "kata/prefill.h"
+#include "kata/pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -187,7 +188,30 @@ void attention_prefill(const float * q, size_t n_tok,
     }
 }
 
-#else
+#endif
+
+void attention_prefill_mt(const float * q, size_t n_tok,
+                          const float * k_cache, const float * v_cache,
+                          size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
+                          size_t head_dim, float scale, float * out, ThreadPool & pool) {
+    if (n_tok == 0) return;
+    const unsigned nw = pool.size();
+    // Rows are cheap individually (~35 us each at 512 tokens), so give each
+    // worker a contiguous band and let it walk it: false sharing is impossible
+    // because every output row is 256 bytes and bands are row-aligned.
+    const size_t rows_per = (n_tok + nw - 1) / nw;
+    const size_t qw = n_heads * head_dim;
+    pool.run([&](unsigned w) {
+        const size_t lo = std::min(n_tok, w * rows_per);
+        const size_t hi = std::min(n_tok, lo + rows_per);
+        if (lo >= hi) return;
+        attention_prefill(q + lo * qw, hi - lo,
+                          k_cache, v_cache, n_kv_begin + lo, n_heads, n_kv_heads,
+                          head_dim, scale, out + lo * qw);
+    });
+}
+
+#if !defined(__x86_64__) && !defined(__i386__)
 
 void attention_prefill(const float * q, size_t n_tok,
                        const float * k_cache, const float * v_cache,

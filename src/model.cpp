@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "kata/attn.h"
 #include "kata/gguf.h"
 #include "kata/gemm.h"
@@ -87,6 +91,15 @@ uint32_t type_of(const GgufFile & f, const std::string & name) {
 
 inline void silu_inplace(float * x, size_t n) {
     for (size_t i = 0; i < n; ++i) x[i] = x[i] / (1.0f + std::exp(-x[i]));
+}
+
+// SwiGLU product: g = silu(g) * u. The same pass that folds the two expert
+// projections together; keeping it in one function lets the MT split cover it.
+inline void silu_mul(float * g, const float * u, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const float x = g[i];
+        g[i] = (x / (1.0f + std::exp(-x))) * u[i];
+    }
 }
 
 } // namespace
@@ -416,6 +429,7 @@ struct Model::Impl {
     // ---- prefill helpers -------------------------------------------------
 
     // One quantised matmul over m token rows. mi is the block index of a row.
+    size_t nmac = 0;
     void mmn(uint32_t type, size_t rows, size_t cols, float * out, size_t ldc,
              const void * w, const block_q8_K * a, size_t m) {
         switch (type) {
@@ -431,6 +445,79 @@ struct Model::Impl {
     void q8_rows(const float * a, size_t m, size_t cols, block_q8_K * dst) {
         const size_t nb = cols / QK_K;
         for (size_t i = 0; i < m; ++i) quantize_row_q8_K(a + i * cols, dst + i * nb, cols);
+    }
+
+    // Same, but the source rows are gathered from a separate token buffer. Fusing
+    // the gather into the quantiser removes one full copy of every expert input:
+    // at 544 tokens x 38 layers x 4 experts that was 660 MB of memcpy.
+    void q8_rows_gather(const float * a, const uint32_t * rows, size_t m, size_t cols,
+                        block_q8_K * dst) {
+        const size_t nb = cols / QK_K;
+        for (size_t i = 0; i < m; ++i) quantize_row_q8_K(a + rows[i] * cols, dst + i * nb, cols);
+    }
+
+    // The expert bucket's glue (gather, SiLU, re-quantise) was single-threaded
+    // and cost 1.03 s of a 3.18 s prefill: 64 buckets per layer, 38 layers, and
+    // ~425 us of serial work each against ~0 GEMM time saved by shrinking the
+    // batch. These three walk whole rows, so the split is by row and exact.
+    unsigned band(size_t n, size_t per) const { return (unsigned)((n + per - 1) / per); }
+
+    void q8_rows_gather_mt(const float * a, const uint32_t * rows, size_t m, size_t cols,
+                           block_q8_K * dst) {
+        const size_t nb = cols / QK_K;
+        const unsigned nw = std::min<unsigned>(pool.size(), band(m, 4));
+        if (nw <= 1) { q8_rows_gather(a, rows, m, cols, dst); return; }
+        const size_t per = (m + nw - 1) / nw;
+        pool.run([&](unsigned w) {
+            const size_t lo = std::min(m, w * per), hi = std::min(m, lo + per);
+            for (size_t i = lo; i < hi; ++i)
+                quantize_row_q8_K(a + rows[i] * cols, dst + i * nb, cols);
+        });
+    }
+
+    void q8_rows_mt(const float * a, size_t m, size_t cols, block_q8_K * dst) {
+        const size_t nb = cols / QK_K;
+        const unsigned nw = std::min<unsigned>(pool.size(), band(m, 4));
+        if (nw <= 1) { q8_rows(a, m, cols, dst); return; }
+        const size_t per = (m + nw - 1) / nw;
+        pool.run([&](unsigned w) {
+            const size_t lo = std::min(m, w * per), hi = std::min(m, lo + per);
+            for (size_t i = lo; i < hi; ++i)
+                quantize_row_q8_K(a + i * cols, dst + i * nb, cols);
+        });
+    }
+
+    void silu_mul_mt(float * g, const float * u, size_t n) {
+        const unsigned nw = std::min<unsigned>(pool.size(), band(n, 2048));
+        if (nw <= 1) { silu_mul(g, u, n); return; }
+        const size_t per = (n + nw - 1) / nw;
+        pool.run([&](unsigned w) {
+            const size_t lo = std::min(n, w * per), hi = std::min(n, lo + per);
+            silu_mul(g + lo, u + lo, hi - lo);
+        });
+    }
+
+    // dst[rows[i]] += w[i] * src[i]. Scalar before: 2048 float ops per expert
+    // pair, 82k pairs on a 544-token prompt, entirely single-threaded.
+#if defined(__x86_64__) || defined(__i386__)
+    __attribute__((target("avx2,fma")))
+#endif
+    void scatter_add(const float * src, const uint32_t * rows, const float * w, size_t m,
+                     size_t cols, float * dst) {
+        for (size_t i = 0; i < m; ++i) {
+            const float * s = src + i * cols;
+            float * d = dst + rows[i] * cols;
+#if defined(__x86_64__) || defined(__i386__)
+            const __m256 wv = _mm256_set1_ps(w[i]);
+            size_t j = 0;
+            for (; j + 8 <= cols; j += 8)
+                _mm256_storeu_ps(d + j, _mm256_fmadd_ps(wv, _mm256_loadu_ps(s + j),
+                                                        _mm256_loadu_ps(d + j)));
+#else
+            size_t j = 0;
+#endif
+            for (; j < cols; ++j) d[j] += w[i] * s[j];
+        }
     }
 
     void embed_rows(const uint32_t * tokens, size_t m) {
@@ -491,10 +578,10 @@ struct Model::Impl {
             std::memcpy(k_cache.data() + (il * n_ctx + pos) * kvw, pk.data() + i * kvw, kvw * sizeof(float));
             std::memcpy(v_cache.data() + (il * n_ctx + pos) * kvw, pv.data() + i * kvw, kvw * sizeof(float));
         }
-        attention_prefill(pq.data(), m, k_cache.data() + il * n_ctx * kvw,
+        attention_prefill_mt(pq.data(), m, k_cache.data() + il * n_ctx * kvw,
                           v_cache.data() + il * n_ctx * kvw, pos0, n_head, n_head_kv,
                           head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)),
-                          pattn.data());
+                          pattn.data(), pool);
         q8_rows(pattn.data(), m, qw, paq.data());
         mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
     }
@@ -503,10 +590,7 @@ struct Model::Impl {
         q8_rows(pnorm.data(), m, n_embd, paq.data());
         mmn(L.tg, n_ff, n_embd, pffn.data(), n_ff, L.gate, paq.data(), m);
         mmn(L.tu, n_ff, n_embd, pffn2.data(), n_ff, L.up, paq.data(), m);
-        for (size_t i = 0; i < m * n_ff; ++i) {
-            const float g = pffn[i];
-            pffn[i] = (g / (1.0f + std::exp(-g))) * pffn2[i];
-        }
+        silu_mul(pffn.data(), pffn2.data(), m * n_ff);
         q8_rows(pffn.data(), m, n_ff, paq.data());
         mmn(L.td, n_embd, n_ff, pffn_out.data(), n_embd, L.down, paq.data(), m);
     }
@@ -549,8 +633,13 @@ struct Model::Impl {
 
         // One row per (token, expert) pair, i.e. m*n_expert_used rows, not m.
         const size_t np = m * n_expert_used;
-        std::vector<block_q8_K> aq_g(np * (n_ff_exp / QK_K)), aq_d(np * (n_ff_exp / QK_K));
+        // aq_g holds n_embd-wide rows (8 blocks at n_embd=2048), not n_ff_exp-wide
+        // ones; sizing it by n_ff_exp wrote 2 blocks per row past the end of the
+        // vector on every expert pair.
+        std::vector<block_q8_K> aq_g(np * (n_embd / QK_K)), aq_d(np * (n_ff_exp / QK_K));
         std::vector<float> gout(np * n_ff_exp), uout(np * n_ff_exp), dout(np * n_embd);
+        std::vector<uint32_t> ptok(np);
+        std::vector<float> pw(np);
         std::fill(pexpacc.begin(), pexpacc.begin() + m * n_embd, 0.0f);
 
         const size_t sb_g = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ge);
@@ -566,24 +655,15 @@ struct Model::Impl {
             const size_t c = last - first;
             const uint32_t e = pairs[first].expert;
 
-            for (size_t i = 0; i < c; ++i)
-                std::memcpy(gact.data() + i * n_embd, pnorm.data() + pairs[first + i].token * n_embd,
-                            n_embd * sizeof(float));
-            q8_rows(gact.data(), c, n_embd, aq_g.data());
+            for (size_t i = 0; i < c; ++i) ptok[i] = pairs[first + i].token;
+            q8_rows_gather_mt(pnorm.data(), ptok.data(), c, n_embd, aq_g.data());
             mmn(L.t_ge, n_ff_exp, n_embd, gout.data(), n_ff_exp, bg + e * sb_g, aq_g.data(), c);
             mmn(L.t_ue, n_ff_exp, n_embd, uout.data(), n_ff_exp, bu + e * sb_u, aq_g.data(), c);
-            for (size_t i = 0; i < c * n_ff_exp; ++i) {
-                const float g = gout[i];
-                gout[i] = (g / (1.0f + std::exp(-g))) * uout[i];
-            }
-            q8_rows(gout.data(), c, n_ff_exp, aq_d.data());
+            silu_mul_mt(gout.data(), uout.data(), c * n_ff_exp);
+            q8_rows_mt(gout.data(), c, n_ff_exp, aq_d.data());
             mmn(L.t_de, n_embd, n_ff_exp, dout.data(), n_embd, bd + e * sb_d, aq_d.data(), c);
-            for (size_t i = 0; i < c; ++i) {
-                const float * d = dout.data() + i * n_embd;
-                float * acc = pexpacc.data() + pairs[first + i].token * n_embd;
-                const float wj = pairs[first + i].weight;
-                for (size_t j = 0; j < n_embd; ++j) acc[j] += wj * d[j];
-            }
+            for (size_t i = 0; i < c; ++i) pw[i] = pairs[first + i].weight;
+            scatter_add(dout.data(), ptok.data(), pw.data(), c, n_embd, pexpacc.data());
             first = last;
         }
         for (size_t i = 0; i < m; ++i)

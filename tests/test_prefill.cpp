@@ -6,6 +6,7 @@
 
 #include "kata/attn.h"
 #include "kata/prefill.h"
+#include "kata/pool.h"
 
 using namespace kata;
 
@@ -111,4 +112,28 @@ TEST(Prefill, AttentionRowsDoNotSeeTheFuture) {
     for (size_t i = kv; i < k.size(); ++i) { k[i] = 1e6f; v[i] = -1e6f; }
     attention_prefill(q.data(), n_tok, k.data(), v.data(), 0, heads, kvh, hd, 0.125f, b.data());
     for (size_t i = 0; i < heads * hd; ++i) ASSERT_FLOAT_EQ(a[i], b[i]);
+}
+TEST(Prefill, MtSplitMatchesSingleThreaded) {
+    // The MT split is by query row and every row reads the same kv prefix, so
+    // it must be bit-identical, not merely close. n_tok deliberately does not
+    // divide evenly by the worker count.
+    const size_t heads = 8, kvh = 2, hd = 64, n_kv_begin = 7;
+    for (size_t n_tok : {1u, 3u, 7u, 16u, 37u}) {
+        std::mt19937 rng(21);
+        std::normal_distribution<float> nd;
+        const size_t kv = kvh * hd, total_kv = n_kv_begin + n_tok;
+        std::vector<float> k(total_kv * kv), v(total_kv * kv);
+        for (auto & x : k) x = nd(rng);
+        for (auto & x : v) x = nd(rng);
+        std::vector<float> q(n_tok * heads * hd);
+        for (auto & x : q) x = nd(rng);
+        std::vector<float> a(n_tok * heads * hd), b(a.size());
+        attention_prefill(q.data(), n_tok, k.data(), v.data(), n_kv_begin, heads, kvh, hd, 0.125f, a.data());
+        for (unsigned nt : {2u, 3u, 8u}) {
+            kata::ThreadPool pool(nt);
+            attention_prefill_mt(q.data(), n_tok, k.data(), v.data(), n_kv_begin, heads, kvh, hd,
+                                 0.125f, b.data(), pool);
+            for (size_t i = 0; i < a.size(); ++i) ASSERT_FLOAT_EQ(a[i], b[i]) << "n_tok=" << n_tok << " workers=" << nt;
+        }
+    }
 }
