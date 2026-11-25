@@ -2,6 +2,7 @@
 #include "kata/cpu.h"
 #include "kata/quant.h"
 
+#include <algorithm>
 #include <cstring>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -188,6 +189,27 @@ const char * gemv_best_name() {
         case Isa::Avx2:       return "q4_0_q8_0/avx2";
         default:              return "q4_0_q8_0/ref";
     }
+}
+
+
+void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 * w,
+                       const block_q8_0 * x, ThreadPool & pool) {
+    const unsigned nt = pool.size();
+    if (nt <= 1 || rows < nt * 2) { gemv_q4_0_q8_0_best()(rows, cols, out, w, x); return; }
+
+    const size_t nb = cols / QK;
+    const size_t chunk = (rows + nt - 1) / nt;
+    pool.run([&](unsigned t) {
+        const size_t lo = (size_t)t * chunk;
+        const size_t hi = std::min(lo + chunk, rows);
+        if (lo >= hi) return;
+        gemv_q4_0_q8_0_best()(hi - lo, cols, out + lo, w + lo * nb, x);
+    });
+}
+
+void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+    static ThreadPool pool(ThreadPool::default_threads());
+    gemv_q4_0_q8_0_mt(rows, cols, out, w, x, pool);
 }
 
 } // namespace kata

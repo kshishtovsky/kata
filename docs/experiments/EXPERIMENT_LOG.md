@@ -2,7 +2,8 @@
 
 | ID | Task | Status | Result |
 |----|------|--------|--------|
-| EXP-0001 | q4_0 x q8_0 AVX-512 VNNI GEMV vs ggml | PASSED (with caveat) | 1.26x faster while L3-resident, 0.88x when DRAM-bound |
+| EXP-0001 | q4_0 x q8_0 AVX-512 VNNI GEMV vs ggml | PASSED (compute-bound) / NEEDS_RESEARCH (DRAM) | 1.26x faster L3-resident, 0.88x when DRAM-bound |
+| EXP-0002 | Multi-threaded GEMV + thread pool | PASSED | 19.20 -> 82.77 GB/s (4.31x) at 32 threads; 90.84% coverage |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -53,3 +54,58 @@ SIMD tweaks; the ceiling is memory, not math.
 **Next iteration (EXP-0002).** Multi-threaded GEMV via a static thread pool with
 row-block partitioning, aiming at the 66 GB/s the machine can actually sustain.
 Baseline to beat: 18.36 GB/s at 512 MB (8 threads -> theoretical ~5x).
+
+## EXP-0002 — Multi-threaded GEMV
+
+**Status:** PASSED.
+
+**Hypothesis.** EXP-0001 showed single-thread decode is capped near 12-19 GB/s while
+the machine sustains ~66 GB/s at 8 threads, so partitioning rows across a static
+pool should scale almost linearly. The open question was how far.
+
+**Implementation.** `src/pool.cpp` (`ThreadPool`, generation-counter fan-out, caller
+thread acts as worker 0), `gemv_q4_0_q8_0_mt` in `src/gemv.cpp` — contiguous row
+block per worker so each thread streams one region of the weight matrix.
+
+**Correctness.** 19/19 tests (6 new: 4 pool invariants incl. 100 repeated fan-outs
+and disjoint-range writes, 2 GEMV: 37 rows across 1/2/3/8 threads vs reference,
+tiny matrices). Coverage **90.84%** of kata sources (`scripts/coverage.sh`);
+per file: pool.cpp 100%, gemv.cpp 93.55%, cpu.cpp 85.71%, quant.cpp 84.62%.
+
+**Measured** (512 MB and 1 GiB weight buffers, DRAM-bound, median of 5 whole-run reps):
+
+| Threads | GB/s (1 GiB) | vs 1 thread |
+|---|---|---|
+| 1 | 19.20 | 1.00x |
+| 4 | 60.78 | 3.17x |
+| 8 | 74.96 | 3.90x |
+| 16 | 77.64 | 4.04x |
+| 24 | 80.64 | 4.20x |
+| 32 | 82.77 | 4.31x |
+
+**Analysis — this CPU needs special treatment.** The 7950X3D has two CCDs, and only
+CCD0 (cores 0-7) has the 96 MB 3D V-cache (`/sys/.../index3/shared_cpu_list` →
+`0-7,16-23` and `8-15,24-31`). Measured per-CCD, 8 threads pinned:
+
+| Affinity | GB/s |
+|---|---|
+| CCD0 (0-7), 8 threads | 67.5 (very stable, ~0.1% spread) |
+| CCD1 (8-15), 8 threads | 59.6 |
+| CCD0 + SMT (0-15), 16 threads | 76.5 |
+| CCD1 + SMT (8-23), 16 threads | 76.7 |
+| all 32 | 80.1-83.6 |
+
+So SMT gives +13% (a memory-latency hiding win, not a compute win), and crossing
+to the second CCD is what unlocks the last ~8%. Unpinned runs showed 10-30% run
+spread, pinned runs 0.1-2.5% — **all future benchmarks must pin affinity**.
+
+**Conclusion.** Keep. `default_threads()` returns hw-1 (31 here) which lands in the
+plateau; 16 threads gets 94% of peak for half the threads and is the better default
+for a decode loop that also has to do sampling and graph work. Revisit once a real
+model runs end to end — the pool must not starve the rest of the pipeline.
+
+**Next iteration (EXP-0003).** The 1.26x L3-resident lead from EXP-0001 vanished
+into memory bandwidth, which means kernel quality is currently invisible. Before
+more kernel work: measure q4_0/q8_0 *quantisation* and build a correctness harness
+against llama.cpp on a real model tensor, so later kernel changes are validated
+against real weights rather than synthetic noise.

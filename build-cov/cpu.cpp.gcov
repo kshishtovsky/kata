@@ -1,0 +1,57 @@
+        -:    0:Source:/home/medovarov/kata/src/cpu.cpp
+        -:    1:#include <cpuid.h>
+        -:    2:#include <cstdint>
+        -:    3:#include "kata/cpu.h"
+        -:    4:
+        -:    5:namespace kata {
+        -:    6:
+        -:    7:#if defined(__x86_64__) || defined(__i386__)
+        -:    8:// __builtin_cpu_supports needs literal strings, so probe the CPUID leaves by
+        -:    9:// hand instead of wrapping it in a helper.
+       12:   10:static bool cpuid_leaf(uint32_t leaf, uint32_t sub, uint32_t regs[4]) {
+       12:   11:    __cpuid_count(leaf, sub, regs[0], regs[1], regs[2], regs[3]);
+      12*:   12:    return regs[0] || regs[1] || regs[2] || regs[3];
+        -:   13:}
+        -:   14:
+        4:   15:static Isa detect_isa() {
+        -:   16:    uint32_t r[4];
+       4*:   17:    if (!cpuid_leaf(0, 0, r)) return Isa::Scalar;
+        4:   18:    const uint32_t max_leaf = r[0];
+       4*:   19:    if (max_leaf < 7) return Isa::Scalar;
+        -:   20:
+        4:   21:    cpuid_leaf(1, 0, r);
+        4:   22:    const bool f16c = (r[2] >> 29) & 1u;   // ECX bit 29
+        4:   23:    const bool fma  = (r[2] >> 12) & 1u;   // ECX bit 12
+        4:   24:    const bool avx  = (r[2] >> 28) & 1u;   // ECX bit 28
+        -:   25:
+        4:   26:    cpuid_leaf(7, 0, r);
+        4:   27:    const bool avx2        = (r[1] >> 5) & 1u;   // EBX bit 5
+        4:   28:    const bool avx512f     = (r[1] >> 16) & 1u;  // EBX bit 16
+        4:   29:    const bool avx512bw    = (r[1] >> 30) & 1u;  // EBX bit 30
+        4:   30:    const bool avx512vl    = (r[1] >> 31) & 1u;  // EBX bit 31
+        4:   31:    const bool avx512vnni  = (r[2] >> 11) & 1u;  // ECX bit 11
+        -:   32:
+        4:   33:    if (avx && f16c && fma && avx512f && avx512bw && avx512vl && avx512vnni) return Isa::Avx512Vnni;
+    #####:   34:    if (avx && f16c && fma && avx2) return Isa::Avx2;
+    #####:   35:    return Isa::Scalar;
+        -:   36:}
+        -:   37:#endif
+        -:   38:
+       80:   39:Isa cpu_isa() {
+        -:   40:#if defined(__x86_64__) || defined(__i386__)
+       80:   41:    static const Isa cached = detect_isa();
+       80:   42:    return cached;
+        -:   43:#else
+        -:   44:    return Isa::Scalar;
+        -:   45:#endif
+        -:   46:}
+        -:   47:
+        4:   48:const char * isa_name(Isa isa) {
+        4:   49:    switch (isa) {
+        4:   50:        case Isa::Avx512Vnni: return "avx512-vnni";
+    #####:   51:        case Isa::Avx2:       return "avx2";
+    #####:   52:        default:              return "scalar";
+        -:   53:    }
+        -:   54:}
+        -:   55:
+        -:   56:} // namespace kata

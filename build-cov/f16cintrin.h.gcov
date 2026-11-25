@@ -1,0 +1,99 @@
+        -:    0:Source:/usr/lib/gcc/x86_64-pc-linux-gnu/16/include/f16cintrin.h
+        -:    1:/* Copyright (C) 2011-2026 Free Software Foundation, Inc.
+        -:    2:
+        -:    3:   This file is part of GCC.
+        -:    4:
+        -:    5:   GCC is free software; you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation; either version 3, or (at your option)
+        -:    8:   any later version.
+        -:    9:
+        -:   10:   GCC is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   Under Section 7 of GPL version 3, you are granted additional
+        -:   16:   permissions described in the GCC Runtime Library Exception, version
+        -:   17:   3.1, as published by the Free Software Foundation.
+        -:   18:
+        -:   19:   You should have received a copy of the GNU General Public License and
+        -:   20:   a copy of the GCC Runtime Library Exception along with this program;
+        -:   21:   see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+        -:   22:   <http://www.gnu.org/licenses/>.  */
+        -:   23:
+        -:   24:#if !defined _X86INTRIN_H_INCLUDED && !defined _IMMINTRIN_H_INCLUDED
+        -:   25:# error "Never use <f16intrin.h> directly; include <x86intrin.h> or <immintrin.h> instead."
+        -:   26:#endif
+        -:   27:
+        -:   28:#ifndef _F16CINTRIN_H_INCLUDED
+        -:   29:#define _F16CINTRIN_H_INCLUDED
+        -:   30:
+        -:   31:#ifndef __F16C__
+        -:   32:#pragma GCC push_options
+        -:   33:#pragma GCC target("f16c")
+        -:   34:#define __DISABLE_F16C__
+        -:   35:#endif /* __F16C__ */
+        -:   36:
+        -:   37:extern __inline float __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   38:_cvtsh_ss (unsigned short __S)
+        -:   39:{
+    13738:   40:  __v8hi __H = __extension__ (__v8hi){ (short) __S, 0, 0, 0, 0, 0, 0, 0 };
+    13738:   41:  __v4sf __A = __builtin_ia32_vcvtph2ps (__H);
+    12069:   42:  return __builtin_ia32_vec_ext_v4sf (__A, 0);
+        -:   43:}
+        -:   44:
+        -:   45:extern __inline __m128 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   46:_mm_cvtph_ps (__m128i __A)
+        -:   47:{
+        -:   48:  return (__m128) __builtin_ia32_vcvtph2ps ((__v8hi) __A);
+        -:   49:}
+        -:   50:
+        -:   51:extern __inline __m256 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   52:_mm256_cvtph_ps (__m128i __A)
+        -:   53:{
+        -:   54:  return (__m256) __builtin_ia32_vcvtph2ps256 ((__v8hi) __A);
+        -:   55:}
+        -:   56:
+        -:   57:#ifdef __OPTIMIZE__
+        -:   58:extern __inline unsigned short __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   59:_cvtss_sh (float __F, const int __I)
+        -:   60:{
+        -:   61:  __v4sf __A =  __extension__ (__v4sf){ __F, 0, 0, 0 };
+        -:   62:  __v8hi __H = __builtin_ia32_vcvtps2ph (__A, __I);
+        -:   63:  return (unsigned short) __builtin_ia32_vec_ext_v8hi (__H, 0);
+        -:   64:}
+        -:   65:
+        -:   66:extern __inline __m128i __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   67:_mm_cvtps_ph (__m128 __A, const int __I)
+        -:   68:{
+        -:   69:  return (__m128i) __builtin_ia32_vcvtps2ph ((__v4sf) __A, __I);
+        -:   70:}
+        -:   71:
+        -:   72:extern __inline __m128i __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+        -:   73:_mm256_cvtps_ph (__m256 __A, const int __I)
+        -:   74:{
+        -:   75:  return (__m128i) __builtin_ia32_vcvtps2ph256 ((__v8sf) __A, __I);
+        -:   76:}
+        -:   77:#else
+        -:   78:#define _cvtss_sh(__F, __I)						\
+        -:   79:  (__extension__ 							\
+        -:   80:   ({									\
+        -:   81:      __v4sf __A =  __extension__ (__v4sf){ __F, 0, 0, 0 };		\
+        -:   82:      __v8hi __H = __builtin_ia32_vcvtps2ph (__A, __I);			\
+        -:   83:      (unsigned short) __builtin_ia32_vec_ext_v8hi (__H, 0);		\
+        -:   84:    }))
+        -:   85:
+        -:   86:#define _mm_cvtps_ph(A, I) \
+        -:   87:  ((__m128i) __builtin_ia32_vcvtps2ph ((__v4sf)(__m128) (A), (int) (I)))
+        -:   88:
+        -:   89:#define _mm256_cvtps_ph(A, I) \
+        -:   90:  ((__m128i) __builtin_ia32_vcvtps2ph256 ((__v8sf)(__m256) (A), (int) (I)))
+        -:   91:#endif /* __OPTIMIZE */
+        -:   92:
+        -:   93:#ifdef __DISABLE_F16C__
+        -:   94:#undef __DISABLE_F16C__
+        -:   95:#pragma GCC pop_options
+        -:   96:#endif /* __DISABLE_F16C__ */
+        -:   97:
+        -:   98:#endif /* _F16CINTRIN_H_INCLUDED */

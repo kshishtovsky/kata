@@ -1,0 +1,7 @@
+/home/medovarov/kata/build-cov/CMakeFiles/kata_core.dir
+/home/medovarov/kata/build-cov/CMakeFiles/bench_gemv.dir
+/home/medovarov/kata/build-cov/CMakeFiles/bench_vs_ggml.dir
+/home/medovarov/kata/build-cov/CMakeFiles/kata_tests.dir
+/home/medovarov/kata/build-cov/CMakeFiles/test.dir
+/home/medovarov/kata/build-cov/CMakeFiles/edit_cache.dir
+/home/medovarov/kata/build-cov/CMakeFiles/rebuild_cache.dir

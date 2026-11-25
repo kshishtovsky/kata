@@ -118,3 +118,23 @@ TEST(Gemv, KnownDotValue) {
         EXPECT_NEAR(v, got, 1e-6f);
     }
 }
+
+TEST(Gemv, MultithreadedMatchesReference) {
+    Data d(37, 512, 21);   // prime-ish row count to hit uneven chunks
+    for (unsigned nt : {1u, 2u, 3u, 8u}) {
+        ThreadPool pool(nt);
+        std::vector<float> got(d.rows, 0.0f);
+        gemv_q4_0_q8_0_mt(d.rows, d.cols, got.data(), d.w.data(), d.x.data(), pool);
+        expect_same(d, got, 2e-4f);
+    }
+}
+
+TEST(Gemv, MultithreadedTinyMatrices) {
+    for (size_t rows : {1u, 2u, 3u}) {
+        Data d(rows, 64, 22 + (unsigned)rows);
+        ThreadPool pool(8);
+        std::vector<float> got(rows, 0.0f);
+        gemv_q4_0_q8_0_mt(rows, 64, got.data(), d.w.data(), d.x.data(), pool);
+        expect_same(d, got, 2e-4f);
+    }
+}

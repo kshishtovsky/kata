@@ -1,0 +1,216 @@
+        -:    0:Source:/home/medovarov/kata/src/gemv.cpp
+        -:    1:#include "kata/gemv.h"
+        -:    2:#include "kata/cpu.h"
+        -:    3:#include "kata/quant.h"
+        -:    4:
+        -:    5:#include <algorithm>
+        -:    6:#include <cstring>
+        -:    7:
+        -:    8:#if defined(__x86_64__) || defined(__i386__)
+        -:    9:#include <immintrin.h>
+        -:   10:#endif
+        -:   11:
+        -:   12:namespace kata {
+        -:   13:
+       48:   14:void gemv_q4_0_q8_0_ref(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+       48:   15:    const size_t nb = cols / QK;
+      384:   16:    for (size_t r = 0; r < rows; ++r) {
+      336:   17:        out[r] = vec_dot_q4_0_q8_0_ref(cols, w + r * nb, x);
+        -:   18:    }
+       48:   19:}
+        -:   20:
+        -:   21:#if defined(__x86_64__) || defined(__i386__)
+        -:   22:
+        -:   23:namespace {
+        -:   24:
+        -:   25:// 32 nibbles in block_q4_0 order, still unsigned 0..15.
+        -:   26:__attribute__((target("avx2")))
+     8941:   27:inline __m256i nibbles_q4_avx2(const uint8_t * qs) {
+     8941:   28:    const __m128i tmp = _mm_loadu_si128((const __m128i *)qs);
+    17882:   29:    const __m256i both = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
+    17882:   30:    return _mm256_and_si256(_mm256_set1_epi8(0x0f), both);
+        -:   31:}
+        -:   32:
+        -:   33:// Signed -8..7, the value the format actually encodes.
+        -:   34:__attribute__((target("avx2")))
+      300:   35:inline __m256i expand_q4_avx2(const uint8_t * qs) {
+      600:   36:    return _mm256_sub_epi8(nibbles_q4_avx2(qs), _mm256_set1_epi8(8));
+        -:   37:}
+        -:   38:
+        -:   39:__attribute__((target("avx2")))
+      300:   40:inline __m256 dot_i8_i8_avx2(__m256i qx, __m256i qy) {
+      300:   41:    const __m256i ax = _mm256_sign_epi8(qx, qx);
+      300:   42:    const __m256i sy = _mm256_sign_epi8(qy, qx);
+      300:   43:    const __m256i pairs = _mm256_maddubs_epi16(ax, sy);
+      900:   44:    return _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), pairs));
+        -:   45:}
+        -:   46:
+        -:   47:__attribute__((target("avx2,f16c,fma")))
+      722:   48:inline float hsum_avx2(__m256 v) {
+      722:   49:    __m128 lo = _mm256_castps256_ps128(v);
+      722:   50:    __m128 hi = _mm256_extractf128_ps(v, 1);
+      722:   51:    lo = _mm_add_ps(lo, hi);
+      722:   52:    __m128 sh = _mm_movehdup_ps(lo);
+      722:   53:    lo = _mm_add_ps(lo, sh);
+      722:   54:    sh = _mm_movehl_ps(sh, lo);
+     1444:   55:    return _mm_cvtss_f32(_mm_add_ss(lo, sh));
+        -:   56:}
+        -:   57:
+        -:   58:__attribute__((target("avx2,f16c,fma")))
+      300:   59:inline float scale_pair(uint16_t dx, uint16_t dy) {
+      600:   60:    return _cvtsh_ss(dx) * _cvtsh_ss(dy);
+        -:   61:}
+        -:   62:
+        -:   63:} // namespace
+        -:   64:
+        -:   65:__attribute__((target("avx2,f16c,fma")))
+       12:   66:void gemv_q4_0_q8_0_avx2(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+       12:   67:    const size_t nb = cols / QK;
+       12:   68:    size_t r = 0;
+        -:   69:
+        -:   70:    // Two rows at a time: the activation block is loaded once and feeds two
+        -:   71:    // independent accumulator chains, which keeps the FP ports busy while the
+        -:   72:    // weights stream in.
+       28:   73:    for (; r + 1 < rows; r += 2) {
+       16:   74:        const block_q4_0 * w0 = w + r * nb;
+       16:   75:        const block_q4_0 * w1 = w0 + nb;
+       16:   76:        __m256 acc0 = _mm256_setzero_ps();
+       16:   77:        __m256 acc1 = _mm256_setzero_ps();
+        -:   78:
+      144:   79:        for (size_t b = 0; b < nb; ++b) {
+      128:   80:            const __m256i qy = _mm256_loadu_si256((const __m256i *)x[b].qs);
+      128:   81:            const float d0 = scale_pair(w0[b].d, x[b].d);
+      128:   82:            const float d1 = scale_pair(w1[b].d, x[b].d);
+      128:   83:            const __m256 q0 = dot_i8_i8_avx2(expand_q4_avx2(w0[b].qs), qy);
+      128:   84:            const __m256 q1 = dot_i8_i8_avx2(expand_q4_avx2(w1[b].qs), qy);
+      256:   85:            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), q0, acc0);
+      256:   86:            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), q1, acc1);
+        -:   87:        }
+       16:   88:        out[r]     = hsum_avx2(acc0);
+       16:   89:        out[r + 1] = hsum_avx2(acc1);
+        -:   90:    }
+        -:   91:
+       12:   92:    if (r < rows) {
+       12:   93:        const block_q4_0 * w0 = w + r * nb;
+       12:   94:        __m256 acc = _mm256_setzero_ps();
+       56:   95:        for (size_t b = 0; b < nb; ++b) {
+       44:   96:            const __m256i qy = _mm256_loadu_si256((const __m256i *)x[b].qs);
+       44:   97:            const float d = scale_pair(w0[b].d, x[b].d);
+      132:   98:            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), dot_i8_i8_avx2(expand_q4_avx2(w0[b].qs), qy), acc);
+        -:   99:        }
+       12:  100:        out[r] = hsum_avx2(acc);
+        -:  101:    }
+       12:  102:}
+        -:  103:
+        -:  104:__attribute__((target("avx512f,avx512vl,avx512bw,avx512vnni,f16c,fma")))
+       84:  105:void gemv_q4_0_q8_0_avx512(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+       84:  106:    const size_t nb = cols / QK;
+       84:  107:    size_t r = 0;
+        -:  108:
+        -:  109:    // Four rows at a time so one activation load feeds four dot products.
+      223:  110:    for (; r + 3 < rows; r += 4) {
+      139:  111:        const block_q4_0 * w0 = w + r * nb;
+      139:  112:        const block_q4_0 * w1 = w0 + nb;
+      139:  113:        const block_q4_0 * w2 = w1 + nb;
+      139:  114:        const block_q4_0 * w3 = w2 + nb;
+      139:  115:        __m256 acc0 = _mm256_setzero_ps();
+      139:  116:        __m256 acc1 = _mm256_setzero_ps();
+      139:  117:        __m256 acc2 = _mm256_setzero_ps();
+      139:  118:        __m256 acc3 = _mm256_setzero_ps();
+      139:  119:        const __m256i zero = _mm256_setzero_si256();
+        -:  120:
+     2215:  121:        for (size_t b = 0; b < nb; ++b) {
+     2096:  122:            const __m256i qy = _mm256_loadu_si256((const __m256i *)x[b].qs);
+     2096:  123:            const float dy = _cvtsh_ss(x[b].d);
+        -:  124:
+     2096:  125:            const __m256i q0 = nibbles_q4_avx2(w0[b].qs);
+     2046:  126:            const __m256i q1 = nibbles_q4_avx2(w1[b].qs);
+     2062:  127:            const __m256i q2 = nibbles_q4_avx2(w2[b].qs);
+     2035:  128:            const __m256i q3 = nibbles_q4_avx2(w3[b].qs);
+        -:  129:
+        -:  130:            // VNNI: unsigned 0..15 weight nibbles times signed activations.
+     2076:  131:            const __m256i p0 = _mm256_dpbusd_epi32(zero, q0, qy);
+     2076:  132:            const __m256i p1 = _mm256_dpbusd_epi32(zero, q1, qy);
+     2076:  133:            const __m256i p2 = _mm256_dpbusd_epi32(zero, q2, qy);
+     2076:  134:            const __m256i p3 = _mm256_dpbusd_epi32(zero, q3, qy);
+        -:  135:            // The stored nibble is value+8, so sum((u-8)*y) = sum(u*y) - 8*sum(y).
+     8304:  136:            const __m256i sy = _mm256_madd_epi16(_mm256_set1_epi16(1),
+        -:  137:                                                 _mm256_maddubs_epi16(_mm256_set1_epi8(1), qy));
+     2076:  138:            const __m256i corr = _mm256_slli_epi32(sy, 3);
+        -:  139:
+    10380:  140:            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(w0[b].d) * dy), _mm256_cvtepi32_ps(_mm256_sub_epi32(p0, corr)), acc0);
+    10380:  141:            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(w1[b].d) * dy), _mm256_cvtepi32_ps(_mm256_sub_epi32(p1, corr)), acc1);
+    10380:  142:            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(w2[b].d) * dy), _mm256_cvtepi32_ps(_mm256_sub_epi32(p2, corr)), acc2);
+    10380:  143:            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(w3[b].d) * dy), _mm256_cvtepi32_ps(_mm256_sub_epi32(p3, corr)), acc3);
+        -:  144:        }
+      119:  145:        out[r]     = hsum_avx2(acc0);
+      140:  146:        out[r + 1] = hsum_avx2(acc1);
+      140:  147:        out[r + 2] = hsum_avx2(acc2);
+      139:  148:        out[r + 3] = hsum_avx2(acc3);
+        -:  149:    }
+        -:  150:
+      208:  151:    for (; r < rows; ++r) {
+      124:  152:        const block_q4_0 * w0 = w + r * nb;
+      124:  153:        __m256 acc = _mm256_setzero_ps();
+      124:  154:        const __m256i zero = _mm256_setzero_si256();
+     1493:  155:        for (size_t b = 0; b < nb; ++b) {
+     1416:  156:            const __m256i qy = _mm256_loadu_si256((const __m256i *)x[b].qs);
+     1416:  157:            const __m256i q = nibbles_q4_avx2(w0[b].qs);
+     1369:  158:            const __m256i p = _mm256_dpbusd_epi32(zero, q, qy);
+     5476:  159:            const __m256i sy = _mm256_madd_epi16(_mm256_set1_epi16(1),
+        -:  160:                                                 _mm256_maddubs_epi16(_mm256_set1_epi8(1), qy));
+     1369:  161:            const __m256i corr = _mm256_slli_epi32(sy, 3);
+     8214:  162:            acc = _mm256_fmadd_ps(_mm256_set1_ps(_cvtsh_ss(w0[b].d) * _cvtsh_ss(x[b].d)),
+        -:  163:                                  _mm256_cvtepi32_ps(_mm256_sub_epi32(p, corr)), acc);
+        -:  164:        }
+       77:  165:        out[r] = hsum_avx2(acc);
+        -:  166:    }
+       84:  167:}
+        -:  168:
+        -:  169:#else
+        -:  170:void gemv_q4_0_q8_0_avx2(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+        -:  171:    gemv_q4_0_q8_0_ref(rows, cols, out, w, x);
+        -:  172:}
+        -:  173:void gemv_q4_0_q8_0_avx512(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+        -:  174:    gemv_q4_0_q8_0_ref(rows, cols, out, w, x);
+        -:  175:}
+        -:  176:#endif
+        -:  177:
+       72:  178:GemvFn gemv_q4_0_q8_0_best() {
+       72:  179:    switch (cpu_isa()) {
+       72:  180:        case Isa::Avx512Vnni: return gemv_q4_0_q8_0_avx512;
+    #####:  181:        case Isa::Avx2:       return gemv_q4_0_q8_0_avx2;
+    #####:  182:        default:              return gemv_q4_0_q8_0_ref;
+        -:  183:    }
+        -:  184:}
+        -:  185:
+        4:  186:const char * gemv_best_name() {
+        4:  187:    switch (cpu_isa()) {
+        4:  188:        case Isa::Avx512Vnni: return "q4_0_q8_0/avx512-vnni";
+    #####:  189:        case Isa::Avx2:       return "q4_0_q8_0/avx2";
+    #####:  190:        default:              return "q4_0_q8_0/ref";
+        -:  191:    }
+        -:  192:}
+        -:  193:
+        -:  194:
+       28:  195:void gemv_q4_0_q8_0_mt(size_t rows, size_t cols, float * out, const block_q4_0 * w,
+        -:  196:                       const block_q8_0 * x, ThreadPool & pool) {
+       28:  197:    const unsigned nt = pool.size();
+       28:  198:    if (nt <= 1 || rows < nt * 2) { gemv_q4_0_q8_0_best()(rows, cols, out, w, x); return; }
+        -:  199:
+       12:  200:    const size_t nb = cols / QK;
+       12:  201:    const size_t chunk = (rows + nt - 1) / nt;
+       12:  202:    pool.run([&](unsigned t) {
+       52:  203:        const size_t lo = (size_t)t * chunk;
+       52:  204:        const size_t hi = std::min(lo + chunk, rows);
+      52*:  205:        if (lo >= hi) return;
+       52:  206:        gemv_q4_0_q8_0_best()(hi - lo, cols, out + lo, w + lo * nb, x);
+        -:  207:    });
+        -:  208:}
+        -:  209:
+    #####:  210:void gemv_q4_0_q8_0_auto(size_t rows, size_t cols, float * out, const block_q4_0 * w, const block_q8_0 * x) {
+    #####:  211:    static ThreadPool pool(ThreadPool::default_threads());
+    #####:  212:    gemv_q4_0_q8_0_mt(rows, cols, out, w, x, pool);
+    #####:  213:}
+        -:  214:
+        -:  215:} // namespace kata

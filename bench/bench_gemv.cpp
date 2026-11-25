@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
     // Weight buffer is 4096*4096/32*18 = 9.4 MB, so set --mb to exceed L3 when
     // measuring DRAM-bound behaviour.
     size_t rows = 4096, cols = 4096, mb = 0;
-    int iters = 0;
+    int iters = 0, threads = 1, reps = 1;
     std::string kernel = "best";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -56,6 +56,8 @@ int main(int argc, char ** argv) {
         else if (a == "--cols") cols = strtoul(next(), nullptr, 10);
         else if (a == "--mb") mb = strtoul(next(), nullptr, 10);
         else if (a == "--iters") iters = atoi(next());
+        else if (a == "--threads") threads = atoi(next());
+        else if (a == "--reps") reps = std::max(1, atoi(next()));
         else if (a == "--kernel") kernel = next();
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
@@ -95,20 +97,45 @@ int main(int argc, char ** argv) {
 
     if (!iters) iters = (int)std::clamp(2.0e9 / std::max(bytes, 1.0), 5.0, 2000.0);
 
-    fn(rows, cols, out.data(), w.data(), x.data());   // warm up page cache + code path
+    // Threading multiplies effective bandwidth, so the iteration budget shrinks.
+    if (threads > 1) iters = std::max(3, iters * 2 / threads);
 
-    std::vector<double> secs;
-    for (int i = 0; i < iters; ++i) {
-        const double t0 = now_s();
-        fn(rows, cols, out.data(), w.data(), x.data());
-        secs.push_back(now_s() - t0);
+    ThreadPool pool((unsigned)threads);
+    auto call = [&] {
+        if (threads > 1) gemv_q4_0_q8_0_mt(rows, cols, out.data(), w.data(), x.data(), pool);
+        else fn(rows, cols, out.data(), w.data(), x.data());
+    };
+    if (threads > 1) kname += "/mt" + std::to_string(threads);
+
+    call();   // warm up page cache + code path
+
+    // Whole-run repetitions matter: per-iteration medians hide the run-to-run
+    // swings this chip shows at high thread counts.
+    std::vector<double> secs, run_best;
+    for (int r = 0; r < reps; ++r) {
+        std::vector<double> cur;
+        for (int i = 0; i < iters; ++i) {
+            const double t0 = now_s();
+            call();
+            cur.push_back(now_s() - t0);
+        }
+        std::sort(cur.begin(), cur.end());
+        run_best.push_back(cur[cur.size() / 2]);
+        secs.insert(secs.end(), cur.begin(), cur.end());
     }
+    std::sort(run_best.begin(), run_best.end());
+    const double rep_med = run_best[run_best.size() / 2];
+    const double rep_best = run_best.front();
     std::sort(secs.begin(), secs.end());
     const double med = secs[secs.size() / 2];
     const double p10 = secs[secs.size() / 10];
     const double p90 = secs[secs.size() * 9 / 10];
 
-    printf("kernel=%s isa=%s rows=%zu cols=%zu iters=%d\n", kname.c_str(), isa_name(cpu_isa()), rows, cols, iters);
+    printf("kernel=%s isa=%s rows=%zu cols=%zu iters=%d reps=%d\n", kname.c_str(), isa_name(cpu_isa()), rows, cols, iters, reps);
+    if (reps > 1) {
+        printf("reps: median_GB_per_s=%.3f best_GB_per_s=%.3f  run_spread=%.1f%%\n",
+               bytes / rep_med / 1e9, bytes / rep_best / 1e9, (reps > 1 ? (run_best.back() - rep_best) / rep_med * 100.0 : 0.0));
+    }
     printf("weights_mb=%.2f l3_mb=%.2f workout_of_l3=%s\n",
            (double)w.size() * sizeof(block_q4_0) / 1048576.0, l3_bytes() / 1048576.0,
            (double)w.size() * sizeof(block_q4_0) > (double)l3_bytes() ? "yes" : "no");

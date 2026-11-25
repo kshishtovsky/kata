@@ -13,6 +13,7 @@ option(KATA_COVERAGE "Build with gcov instrumentation" OFF)
 add_library(kata_core
   src/cpu.cpp
   src/gemv.cpp
+  src/pool.cpp
   src/quant.cpp
 )
 target_include_directories(kata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -41,12 +42,12 @@ if(NOT GTest_FOUND)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(GTEST REQUIRED gtest_main)
   add_executable(kata_tests EXCLUDE_FROM_ALL)
-  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp)
+  target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp)
   target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
   target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
 else()
   enable_testing()
-  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp)
+  add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_pool.cpp)
   target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
 endif()
 
