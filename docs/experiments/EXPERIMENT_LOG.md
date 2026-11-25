@@ -18,6 +18,7 @@
 | EXP-0014 | Batched score pass (4 positions/iter) | PASSED | 16k 4206 -> 3863 us (1.09x); 32k flat; N=8/16/32 all worse |
 | EXP-0015 | Grouped decode (one kv walk per GQA group) | PASSED | 32k 13.3 -> 8.0 ms (1.66x); 16k 3.81 -> 2.05 ms (1.86x) |
 | EXP-0016 | Tiled score pass (8x8 transpose) | PASSED | 32k 8.0 -> 7.2 ms (1.11x); 16k 2.05 -> 1.78 ms (1.15x) |
+| EXP-0017 | More positions per score tile (MLP) | FAILED | NP=2 7.17 ms, NP=3 9.15, NP=4 8.13 ms at 32k -- reverted |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1092,4 +1093,43 @@ the v pass is still instruction-bound, not memory-bound.
 `v_group` (a `_mm512_set1_ps` of a 4-float load instead of four separate ones)
 and check whether the 16 zmm accumulators are spilling; if they are, the v pass
 splits into two halves of head_dim 32 rather than four.
+
+## EXP-0017 — More positions per score tile
+
+**Status:** FAILED. Reverted.
+
+**Hypothesis.** After EXP-0016 the honest phase split put the score pass at
+4087 us for 64 MiB of K, i.e. **16 GB/s**, while a strided read of the same
+128 MiB KV had measured 59.4 GB/s. With NP=2 there are only two outstanding
+256-byte streams, so the guess was that memory-level parallelism, not
+instruction count, set the rate: NP=4 would give four streams.
+
+**Implementation.** `scores_tile<NP>` with `4*NP` accumulators indexed
+`p*4 + h`, a `scores_dispatch()` switch on NP to keep the count compile-time,
+and the caller loop advanced by `np` with a scalar remainder loop. Reused
+`transpose8` two positions at a time.
+
+**Measured** (32k, 1 thread pinned, 3 runs each, best of run-set):
+
+| positions/tile | us |
+|---|---|
+| 2 (EXP-0016) | 7183 / 7173 / 7160 |
+| 3 | 9152 |
+| 4 | 8135 / 8318 / 8288 |
+
+**Conclusion.** More streams make it strictly worse. The MLP hypothesis is
+falsified: at 4*NP accumulators plus NP live k vectors the register file is
+exceeded and GCC spills, and the extra streams do not pay for the spill traffic.
+The score pass is not latency-bound on memory either.
+
+**Arithmetic that fits the measurement better.** Per 8 floats of head dim the
+NP=2 kernel issues 2 k loads + 4 q loads + 8 FMAs = 48 loads per 64 FMAs. Across
+32k positions x 32 heads that is ~1.2e8 instructions, which at 4-5 IPC lands at
+5-6 ms — the same order as the 4.1 ms measured. So the pass is **load-issue
+bound**, and the fix would be to keep q in registers across many positions,
+which needs more accumulator registers than exist.
+
+**Next.** Stop tuning this kernel. The remaining leverage is the one identified
+earlier and not yet built: quantise the KV cache to q8, which halves the bytes
+of the only truly irreducible resource (128 MiB per token at 32k).
 

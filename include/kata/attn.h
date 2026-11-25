@@ -30,6 +30,8 @@ size_t attention_scratch_floats(const AttnArgs & a);
 
 // Diagnostic only: same decode as attention_decode, but reports the elapsed
 // microseconds of the score, softmax and weighted-v passes separately.
+// Requires grouped scratch (attention_scratch_floats_grouped), because it
+// follows whichever kernel attention_decode_grouped would pick.
 void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[3]);
 
 // Variant that walks the kv cache once per group of query heads instead of once

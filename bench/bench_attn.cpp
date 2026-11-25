@@ -87,7 +87,8 @@ int main(int argc, char ** argv) {
         if (phases) {
             // Same three passes, timed separately, so the remaining time can be
             // attributed before choosing what to optimise next.
-            std::vector<float> sc(kata::attention_scratch_floats(a));
+            // phases follows the grouped kernel, which needs grouped scratch
+            std::vector<float> sc(kata::attention_scratch_floats_grouped(a));
             double best[3] = {1e30, 1e30, 1e30};
             for (int r = 0; r < 5; ++r) {
                 double t[3];
