@@ -19,6 +19,7 @@
 | EXP-0015 | Grouped decode (one kv walk per GQA group) | PASSED | 32k 13.3 -> 8.0 ms (1.66x); 16k 3.81 -> 2.05 ms (1.86x) |
 | EXP-0016 | Tiled score pass (8x8 transpose) | PASSED | 32k 8.0 -> 7.2 ms (1.11x); 16k 2.05 -> 1.78 ms (1.15x) |
 | EXP-0017 | More positions per score tile (MLP) | FAILED | NP=2 7.17 ms, NP=3 9.15, NP=4 8.13 ms at 32k -- reverted |
+| EXP-0018 | Transposed K cache for the score pass | PASSED | 32k 8478 -> 6199 us (1.37x); 16k 1803 -> 1535 (1.17x); 4k 439 -> 384 (1.14x) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1132,4 +1133,74 @@ which needs more accumulator registers than exist.
 **Next.** Stop tuning this kernel. The remaining leverage is the one identified
 earlier and not yet built: quantise the KV cache to q8, which halves the bytes
 of the only truly irreducible resource (128 MiB per token at 32k).
+
+## EXP-0018 — Transposed K cache for the score pass
+
+**Status:** PASSED (opt-in kernel, not the default yet).
+
+**Hypothesis.** EXP-0017 showed the score pass is load-issue bound, not
+latency bound: 4*NP accumulators are spent holding head_dim partial sums, so the
+number of positions per tile is capped by the register file at 8-16 ymm. Store K
+transposed — `[kv_head][pos_block][dim][pos_in_block]` — and the lanes become
+positions while the accumulators become the four query heads of a kv group.
+Then the count is 4 zmm regardless of tile width, there is no reduction step at
+all, and K is read contiguously by position.
+
+**Implementation.**
+- `include/kata/attn.h`: `KT_BLK = 64`, `kt_floats()`, `kt_slot()`, `kt_write()`.
+  A dim row inside a block is contiguous over positions, so writing a new token
+  is 64 consecutive floats per kv head rather than 512 strided ones.
+- `src/attn.cpp`: `scores_kt<NP>()` — outer loop over d, inner over the four
+  heads, `acc[h] += broadcast(q[h][d]) * loadu(kt_row + d*64 + off)`; a lane is
+  the finished dot product, so no `transpose8`.
+  `attention_decode_avx2_grouped_kt()` walks blocks of 64 positions, 16 at a
+  time, with a scalar path for the partial last block, then reuses the existing
+  `softmax_exp_inplace` and `v_group<4,4>` unchanged.
+  Guarded to `g == 4 && head_dim == 64` and AVX-512; everything else falls back.
+- `// slack:` not needed — the tail block fallback keeps correctness for any n_kv.
+
+**Bug found (mine).** First run gave `maxdiff 3.4e-02` with relative error 3.5.
+`tile[16]` was being filled with 64 values (16 positions x 4 heads), writing
+over `mxv`/`inv` on the stack. After `tile[4*16]` the two kernels agree to
+`1.58e-08` relative `1.6e-06`.
+
+**Verification.** `Attn.KtWriteRoundTripsThroughTheTransposedLayout` and
+`Attn.KtDecodeMatchesPositionMajorDecode` (n_kv = 1, 63, 64, 65, 129, 200 —
+boundary of KT_BLK and both partial-block shapes). 51/51 tests.
+
+**Measured** (32 heads / 8 kv heads x 64 dim, 1 thread pinned, median of 20):
+
+| n_kv | position-major | transposed | gain |
+|---|---|---|---|
+| 128 | 16.1 us | 13.6 us | 1.18x |
+| 4096 | 438.5 us | 384.0 us | 1.14x |
+| 16384 | 1803.2 us | 1535.2 us | 1.17x |
+| 32768 | 8477.5 us | 6198.7 us | **1.37x** |
+
+The gain grows with depth, which is what the hypothesis predicted: at 128
+positions everything is in L1 and the extra store traffic of the transposed
+layout cancels the win.
+
+**Cost of the transposed write**, measured separately:
+- building the whole 32k cache: position-major 989 us, transposed 7929 us
+  (8.0x — a strided store per dim, and a cache-line miss on every one)
+- **one token, which is what decode actually pays: 0.024 us -> 0.126 us**,
+  i.e. +0.1 us against a 6.2 ms token. Irrelevant.
+
+**Analysis.** A pure read of the transposed K through the same access shape ran
+at 101 GB/s (663 us for 67 MB), so the buffer itself is not the limit; the
+kernel spends the rest on one broadcast per dim per head. That is the price of
+giving up q reuse across head_dim, and it is what caps the gain at 1.37x
+instead of the 2.5-3x the bandwidth comparison suggested.
+
+**Conclusion.** Keep as an opt-in kernel and record the trade. The win is real
+at 16k-32k, marginal below 4k, and it needs a second K buffer (64 MiB at 32k)
+plus AVX-512. Making it the default requires deciding whether that memory is
+worth it, which belongs with the KV-quantisation work that changes the buffer
+layout anyway.
+
+**Next.** Quantise KV to q8. That halves the bytes of the only irreducible
+resource, and it must be designed together with this layout because a
+transposed q8 cache wants positions packed differently than a q8 position-major
+one.
 

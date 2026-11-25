@@ -425,6 +425,31 @@ void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const 
     }
 }
 
+
+// Score pass over the transposed k cache: the vector lanes are positions, the
+// accumulators are the four query heads of one kv group. No reduction step and
+// no transpose at the end -- a lane already holds the finished dot product.
+// Downsides recorded in EXP-0018: no q reuse across head_dim (a broadcast per
+// dim per head) and the k write in decode is head_dim strided stores.
+template <int NP>
+__attribute__((target("avx512f,avx512vl,fma")))
+void scores_kt(const float * q, const float * kt_row0, size_t hd, size_t n_kv, size_t stride_d,
+               float scale, float * out) {
+    __m512 acc[4];
+    for (int h = 0; h < 4; ++h) acc[h] = _mm512_setzero_ps();
+    const float * col = kt_row0;
+    for (size_t d = 0; d < hd; ++d, col += stride_d) {
+        const __m512 kv = _mm512_loadu_ps(col);
+        for (int h = 0; h < 4; ++h)
+            acc[h] = _mm512_fmadd_ps(_mm512_set1_ps(q[h * hd + d]), kv, acc[h]);
+    }
+    for (int h = 0; h < 4; ++h) {
+        alignas(64) float lane[16];
+        _mm512_store_ps(lane, _mm512_mul_ps(acc[h], _mm512_set1_ps(scale)));
+        for (int j = 0; j < NP; ++j) out[j * 4 + h] = lane[j];
+    }
+}
+
 } // namespace
 
 __attribute__((target("avx2,fma")))
@@ -514,11 +539,69 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
     }
 }
 
-#else
-void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
-    attention_decode_avx2(a, scratch);
+
+__attribute__((target("avx512f,avx512vl,avx2,fma")))
+void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
+    const size_t hd = a.head_dim;
+    const size_t g = a.n_heads / a.n_kv_heads;
+    if (g != 4 || hd != 64) { attention_decode_avx2_grouped(a, scratch); return; }
+
+    alignas(64) float mxv[4], inv[4];
+    for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
+    const size_t blocks = (a.n_kv + KT_BLK - 1) / KT_BLK;
+
+    for (size_t gb = 0; gb < a.n_kv_heads; ++gb) {
+        const size_t base = gb * hd;
+        const float * q = a.q + gb * 4 * hd;
+        float * p = scratch;
+
+        for (size_t blk = 0; blk < blocks; ++blk) {
+            const size_t t0 = blk * KT_BLK;
+            const size_t n = std::min(KT_BLK, a.n_kv - t0);
+            const float * row = kt + ((gb * blocks + blk) * hd) * KT_BLK;
+            if (n == KT_BLK) {
+                alignas(64) float tile[4 * 16];
+                for (size_t off = 0; off < KT_BLK; off += 16) {
+                    scores_kt<16>(q, row + off, hd, a.n_kv, KT_BLK, a.scale, tile);
+                    for (size_t j = 0; j < 16; ++j)
+                        for (int h = 0; h < 4; ++h) {
+                            const float sc = tile[j * 4 + h];
+                            p[h * a.n_kv + t0 + off + j] = sc;
+                            mxv[h] = std::max(mxv[h], sc);
+                        }
+                }
+            } else {
+                for (size_t j = 0; j < n; ++j)
+                    for (int h = 0; h < 4; ++h) {
+                        const size_t hi = gb * 4 + h;
+                        const float * k = a.k_cache + (t0 + j) * a.n_kv_heads * hd + base;
+                        const float sc = dot_avx2(a.q + hi * hd, k, hd) * a.scale;
+                        p[h * a.n_kv + t0 + j] = sc;
+                        mxv[h] = std::max(mxv[h], sc);
+                    }
+            }
+        }
+
+        for (size_t h = 0; h < 4; ++h) inv[h] = 1.0f / softmax_exp_inplace(p + h * a.n_kv, a.n_kv, mxv[h]);
+        switch (hd / 16) {
+        case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        case 2: v_group<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        }
+    }
 }
 
+void attention_decode_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpu_isa() == Isa::Avx512Vnni) { attention_decode_avx2_grouped_kt(a, scratch, kt); return; }
+#else
+    (void)kt;
+#endif
+    attention_decode_avx2_grouped(a, scratch);
+}
+
+#else
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
     attention_decode_ref(a, scratch);
 }

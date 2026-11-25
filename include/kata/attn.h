@@ -38,12 +38,39 @@ void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[
 // per head. Needs its own, larger scratch: see attention_scratch_floats_grouped.
 size_t attention_scratch_floats_grouped(const AttnArgs & a);
 void attention_decode_grouped(const AttnArgs & a, float * scratch);
+// Same decode, but the score pass reads k from the transposed cache built by
+// kt_write. Needs at least kt_floats() and the grouped scratch.
+void attention_decode_grouped_kt(const AttnArgs & a, float * scratch, const float * kt);
 void attention_decode(const AttnArgs & a, float * scratch);
 
 // Writes k and v for one token into the cache slot at a->n_kv - 1, applying
 // nothing else. Separated so the caller can RoPE k first.
 inline float * kv_slot(float * cache, size_t pos, size_t n_kv_heads, size_t head_dim) {
     return cache + pos * n_kv_heads * head_dim;
+}
+
+// Transposed K cache, used only by the score pass: it keeps positions in the
+// vector lanes instead of head_dim, so the accumulator count stops depending on
+// how many positions a tile covers and K is read contiguously by position.
+// Layout [kv_head][pos_block][dim][pos_in_block], KT_BLK positions per block.
+inline constexpr size_t KT_BLK = 64;
+
+inline size_t kt_floats(size_t n_kv, size_t n_kv_heads, size_t head_dim) {
+    const size_t blocks = (n_kv + KT_BLK - 1) / KT_BLK;
+    return blocks * n_kv_heads * head_dim * KT_BLK;
+}
+
+inline float * kt_slot(float * kt, size_t pos, size_t kv_head, size_t n_kv, size_t head_dim) {
+    const size_t blocks = (n_kv + KT_BLK - 1) / KT_BLK;
+    return kt + ((kv_head * blocks + pos / KT_BLK) * head_dim) * KT_BLK + (pos % KT_BLK);
+}
+
+// Writes one position's k row (head_dim floats, this kv head only) transposed.
+inline void kt_write(float * kt, size_t pos, size_t kv_head, size_t n_kv, size_t head_dim,
+                     const float * k_row) {
+    const size_t blocks = (n_kv + KT_BLK - 1) / KT_BLK;
+    float * base = kt + ((kv_head * blocks + pos / KT_BLK) * head_dim) * KT_BLK + (pos % KT_BLK);
+    for (size_t d = 0; d < head_dim; ++d) base[d * KT_BLK] = k_row[d];
 }
 
 } // namespace kata

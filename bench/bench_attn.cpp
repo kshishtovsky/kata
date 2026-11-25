@@ -19,6 +19,7 @@ int main(int argc, char ** argv) {
     bool vector_only = false;
     bool phases = false;
     bool grouped = false;
+    bool kt = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--heads")) n_heads = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--kv-heads")) n_kv_heads = std::strtoul(argv[++i], nullptr, 10);
@@ -27,6 +28,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--vector-only")) vector_only = true;
         else if (!std::strcmp(argv[i], "--phases")) phases = true;
         else if (!std::strcmp(argv[i], "--grouped")) grouped = true;
+        else if (!std::strcmp(argv[i], "--kt")) kt = true;
     }
 
     std::mt19937 g(42);
@@ -80,6 +82,27 @@ int main(int argc, char ** argv) {
                 return t[t.size() / 2];
             };
             const double tg = time_grouped();
+
+            double tk = 0.0;
+            if (kt) {
+                std::vector<float> ktbuf(kata::kt_floats(n_kv, n_kv_heads, head_dim));
+                for (size_t t = 0; t < n_kv; ++t)
+                    for (size_t h = 0; h < n_kv_heads; ++h)
+                        kata::kt_write(ktbuf.data(), t, h, n_kv, head_dim, &k[t * n_kv_heads * head_dim + h * head_dim]);
+                std::vector<double> t;
+                for (int i = 0; i < iters; ++i) {
+                    const auto t0 = Clock::now();
+                    kata::attention_decode_grouped_kt(a, sg.data(), ktbuf.data());
+                    const auto t1 = Clock::now();
+                    t.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                std::sort(t.begin(), t.end());
+                tk = t[t.size() / 2];
+                std::printf("%8zu %10.1f %10.1f %9.2fx %10.1f   kt %10.1f %9.2fx\n",
+                            n_kv, tv2, tg, tv2 / tg, kv_mib, tk, tv2 / tk);
+                std::printf("CSV,attn_kt,%zu,%.3f,%.3f\n", n_kv, tv2, tk);
+                continue;
+            }
             std::printf("%8zu %10.1f %10.1f %9.2fx %10.1f\n", n_kv, tv2, tg, tv2 / tg, kv_mib);
             std::printf("CSV,attn_grouped,%zu,%.3f,%.3f\n", n_kv, tv2, tg);
             continue;

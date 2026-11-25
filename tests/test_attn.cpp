@@ -175,3 +175,53 @@ TEST(Attn, ExtremeScoresMatchRefAfterClamp) {
         }
     }
 }
+
+TEST(Attn, KtWriteRoundTripsThroughTheTransposedLayout) {
+    const size_t n_kv = 200, n_kv_heads = 8, hd = 64;
+    std::vector<float> k(n_kv * n_kv_heads * hd);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = (float)(i % 97) - 40.0f;
+    std::vector<float> kt(kata::kt_floats(n_kv, n_kv_heads, hd));
+    for (size_t t = 0; t < n_kv; ++t)
+        for (size_t h = 0; h < n_kv_heads; ++h)
+            kata::kt_write(kt.data(), t, h, n_kv, hd, &k[t * n_kv_heads * hd + h * hd]);
+    // Every element must be reachable from the transposed cache at its own slot.
+    for (size_t t = 0; t < n_kv; ++t)
+        for (size_t h = 0; h < n_kv_heads; ++h) {
+            const float * slot = kata::kt_slot(kt.data(), t, h, n_kv, hd);
+            for (size_t d = 0; d < hd; ++d)
+                ASSERT_EQ(slot[d * kata::KT_BLK], k[t * n_kv_heads * hd + h * hd + d])
+                    << "t=" << t << " h=" << h << " d=" << d;
+        }
+}
+
+TEST(Attn, KtDecodeMatchesPositionMajorDecode) {
+    for (size_t n_kv : {1u, 63u, 64u, 65u, 129u, 200u}) {
+        const size_t n_heads = 32, n_kv_heads = 8, hd = 64;
+        std::mt19937 g(7);
+        std::normal_distribution<float> nd(0.0f, 0.5f);
+        std::vector<float> q(n_heads * hd), k(n_kv * n_kv_heads * hd), v(n_kv * n_kv_heads * hd);
+        for (auto & x : q) x = nd(g);
+        for (auto & x : k) x = nd(g);
+        for (auto & x : v) x = nd(g);
+        std::vector<float> kt(kata::kt_floats(n_kv, n_kv_heads, hd));
+        for (size_t t = 0; t < n_kv; ++t)
+            for (size_t h = 0; h < n_kv_heads; ++h)
+                kata::kt_write(kt.data(), t, h, n_kv, hd, &k[t * n_kv_heads * hd + h * hd]);
+
+        kata::AttnArgs a{};
+        a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
+        a.n_kv = n_kv; a.n_heads = n_heads; a.n_kv_heads = n_kv_heads; a.head_dim = hd;
+        a.scale = 1.0f / std::sqrt((float)hd);
+        std::vector<float> want(n_heads * hd), got(n_heads * hd);
+        std::vector<float> s(kata::attention_scratch_floats_grouped(a));
+        a.out = want.data();
+        kata::attention_decode_grouped(a, s.data());
+        a.out = got.data();
+        kata::attention_decode_grouped_kt(a, s.data(), kt.data());
+        for (size_t i = 0; i < want.size(); ++i) {
+            ASSERT_FALSE(std::isnan(got[i])) << "i=" << i << " n_kv=" << n_kv;
+            EXPECT_NEAR(got[i], want[i], 5e-4f * std::max(1.0f, std::fabs(want[i])))
+                << "n_kv=" << n_kv << " i=" << i;
+        }
+    }
+}
