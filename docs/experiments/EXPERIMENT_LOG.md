@@ -20,6 +20,11 @@
 | EXP-0016 | Tiled score pass (8x8 transpose) | PASSED | 32k 8.0 -> 7.2 ms (1.11x); 16k 2.05 -> 1.78 ms (1.15x) |
 | EXP-0017 | More positions per score tile (MLP) | FAILED | NP=2 7.17 ms, NP=3 9.15, NP=4 8.13 ms at 32k -- reverted |
 | EXP-0018 | Transposed K cache for the score pass | PASSED | 32k 8478 -> 6199 us (1.37x); 16k 1803 -> 1535 (1.17x); 4k 439 -> 384 (1.14x) |
+| EXP-0019 | Real forward pass: LFM2.5-24B-A2B end to end | PASSED | 16/16 greedy tokens identical to llama.cpp; 35-36 tok/s decode vs 30.5 |
+| EXP-0020 | Where the per-token time goes | PASSED | 76% in the two GEMV kernels; 503 mm calls/token, dispatch-bound |
+| EXP-0021 | Batched expert GEMV (one pool wake per layer) | PASSED | 1.40x at 8 threads, 1.72x at 16; 32.7 -> 26.4-28.8 ms/token |
+| EXP-0022 | Sampler (top_k/top_p/temp/repeat penalty/eos) | PASSED | 0.44% of a token; generation stops at EOG in 3/3 seeds |
+| EXP-0023 | Batched prefill GEMM, phase A | IN_PROGRESS | 1.7-4.4x over per-row GEMV, relerr 1e-7; ALU-bound at ~350 GMAC/s |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1480,3 +1485,74 @@ Keep. Without a sampler the engine cannot be used at all, and the cost is 0.4%.
 ### Next
 Prefill in batches: at 28.5 ms/token the first 32 prompt tokens cost 0.9 s of
 pure decode that llama.cpp does at 199 tok/s.
+
+## EXP-0023 — Batched prefill GEMM (phase A), in progress
+
+**Status:** IN_PROGRESS. The GEMM is written, tested and faster than the GEMV it
+replaces, but the prefill path itself is not wired into the model yet, so there
+is no tok/s number for prefill.
+
+**Hypothesis.** The decode kernel unpacks a weight block once per activation
+row. In prefill that means a 2048x2048 layer's 2.4 MB of weights is re-read 512
+times. Unpacking the block once and applying it to `MR` activation rows at a
+time should cut both traffic and unpack work by `MR`.
+
+**Implementation.** `include/kata/gemm.h`, `src/gemm.cpp`, `include/kata/simd.h`
+(shared f16/hsum/scale helpers, each with its own target attribute because GCC
+refuses to inline across mismatched `target` strings).
+- `gemm_q4_K_q8_K(m, n, k, out, ldc, w, a)` and the q6_K twin, plus `_ref`
+  (one GEMV per row, the test oracle) and `_mt` (rows of `n` split across
+  workers).
+- Loop order weight-row outer, activation tile inner: the activation chunk for
+  512 tokens is ~1 MB and stays in L2 while the weights stream past once.
+- `MR` is the number of activation rows sharing one unpacked block.
+- `tests/test_gemm.cpp`: 5 tests over shapes that cover `m < MR`, `m == MR`,
+  `m % MR != 0`, empty dims, and the MT driver. 70/70 tests pass overall.
+- `bench/bench_gemm.cpp`: batched GEMM vs the per-row GEMV on identical
+  buffers, printing ms, GB/s, ratio and relative error.
+
+**The spill trap.** The first q4_K kernel carried three accumulator arrays per
+row: the float value accumulator, a separate float min accumulator, and a
+per-block integer sum. At `MR=16` that is 48 live vectors against 32 ymm
+registers, and GCC spilled 666 stack moves into the inner loop. Folding the
+min term and the integer sum into the single float accumulator, per block,
+halved the register demand and restored correctness (`relerr` went 7.8e-02 →
+1.2e-07, which is how the folding bug announced itself).
+
+**Measurements** (8 threads, `KATA_DUTY=0.5`, q4_K, relerr <= 2.0e-07):
+
+| shape | m | n | k | GEMM ms | GEMV ms | ratio |
+|---|---|---|---|---|---|---|
+| attn_q 2048x2048 | 128 | 2048 | 2048 | 1.38 | 2.78 | 2.01x |
+| attn_k 512x2048 | 512 | 512 | 2048 | 1.55 | 6.53 | 4.21x |
+| attn_o 2048x2048 | 512 | 2048 | 2048 | 6.14 | 11.44 | 1.86x |
+| dense_up 11776x2048 | 512 | 2048 | 11776 | 31.59 | 37.07 | 1.17x |
+| expert_gate 2048x1536 | 256 | 2048 | 1536 | 2.02 | 4.91 | 2.43x |
+
+`MR` sweep (attn_o, m=512): 4 → 6.34 ms, 8 → 5.99, 16 → 6.14. `MR=8` wins;
+tiles above that spill more than they save.
+
+**Why the ratios are small, and the flat-token finding.** A scaling probe
+(2048x2048, 8 threads, m from 32 to 1024) gave 12.6 / 12.4 / 11.9 / 11.7 / 12.8
+/ 11.8 us per token for m = 32/64/128/256/512/1024. Time per token is FLAT
+across a 32x range of `m`, which means the GEMM is not limited by weight
+re-reads at all: the L3 absorbs them. It is limited by arithmetic, at
+~350 GMAC/s. `perf stat` on the whole benchmark reports 3.45 IPC and only 23 M
+cache misses, which agrees.
+
+So the lever is not tiling (`MR` barely matters) and not traffic — it is
+instructions per MAC. `_mm256_maddubs_epi16` + `_mm256_madd_epi16` costs two
+instructions per 32 MACs; AVX-512 VNNI `_mm256_dpbusd_epi32` does the same 32
+MACs plus the 32-bit accumulate in ONE. That is the phase-B target.
+
+**Target calibration — llama-bench overstates prefill on this machine.**
+`llama-bench -ngl 0 -t 8 -p 512` reports **4503-4513 tok/s**, but a real
+512-word prompt through `llama-cli -f /tmp/p512.txt` (994.8 t/s) runs at
+**~995 tok/s** — 4.5x slower. The synthetic bench re-evaluates the same prompt
+repeatedly and is not representative. All prefill claims in this project must
+therefore be measured with a real prompt file, and the parity bar is ~995
+tok/s, not 4500.
+
+**Next.** Use `vpdpbusd` for the q4_K value term (phase B), keep `maddubs` for
+q6_K, then wire `gemm_*_mt` into `Impl::mm` with a token-tile parameter and
+measure `kata-prefill` against `kata-decode` on the same 32k text.
