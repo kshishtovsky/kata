@@ -142,8 +142,8 @@ struct Model::Impl {
     // Per-layer attention slabs, then everything else, all float32.
     std::vector<float> k_cache, v_cache;   // [n_layer][n_ctx][n_head_kv*head_dim]
     std::vector<float> conv_state;         // [n_layer][l_cache-1][n_embd]
-    std::vector<float> x, prev, norm_out, q, k, v, attn_out, bcx;
-    std::vector<float> ffn_gate, ffn_up, ffn_down, moe_acc;
+    std::vector<float> x, norm_out, q, k, v, attn_out, bcx;
+    std::vector<float> ffn_gate, ffn_up, ffn_down;
     std::vector<float> logits;
     std::vector<float> attn_scratch;   // decode attention scratch, sized once
     std::vector<float> d_logits, d_probs, d_w, d_gu, d_down;
@@ -163,14 +163,16 @@ struct Model::Impl {
     size_t ubatch = 1;
     std::vector<float> px, pprev, pnorm, pffn, pffn2, pffn_out;
     std::vector<float> pq, pk, pv, pattn, pbcx, pexpacc;
-    std::vector<float> pconv_out, pbx, gact, ggate, gup;
-    std::vector<block_q8_K> paq, paq2;
-    // MoE scratch, sized once. These were locals inside moe_ffn_rows, so every
-    // one of the 38 MoE layers re-allocated ~100 MB at ubatch 1024: 151 ms of a
-    // 1734 ms prefill, all of it serial inside the pool's idle window.
+    std::vector<float> pconv_out, pbx;
+    std::vector<block_q8_K> paq;
+    // MoE scratch, sized once. Sized per single-expert bucket (ubatch) rather
+    // than ubatch * n_expert_used to eliminate hundreds of MB of allocation churn.
     struct ExpertPair { uint32_t expert, token; float weight; };
+    struct TokenChoice { uint32_t expert; float weight; };
     std::vector<float> mprobs;
     std::vector<ExpertPair> mpairs;
+    std::vector<TokenChoice> mchoices;
+    std::vector<uint32_t> m_counts, m_offsets, m_head;
     std::vector<std::pair<float, uint32_t>> msel;
     std::vector<block_q8_K> maq_g, maq_d;
     std::vector<float> mgout, muout, mdout;
@@ -204,7 +206,6 @@ struct Model::Impl {
         v_cache.assign(n_layer * n_ctx * kv, 0.0f);
         conv_state.assign(n_layer * (l_cache - 1) * n_embd, 0.0f);
         x.assign(n_embd, 0.0f);
-        prev.assign(n_embd, 0.0f);
         norm_out.assign(n_embd, 0.0f);
         q.assign(n_head * head_dim, 0.0f);
         k.assign(n_head_kv * head_dim, 0.0f);
@@ -214,7 +215,6 @@ struct Model::Impl {
         ffn_gate.assign(std::max(n_ff, n_ff_exp), 0.0f);
         ffn_up.assign(std::max(n_ff, n_ff_exp), 0.0f);
         ffn_down.assign(n_embd, 0.0f);
-        moe_acc.assign(n_embd, 0.0f);
         logits.assign(n_vocab, 0.0f);
         logits_ptr = logits.data();
         aq.assign(std::max({n_embd, n_ff, n_ff_exp}) / QK_K + 1, {});
@@ -244,7 +244,10 @@ struct Model::Impl {
         // penalty is paid on half as many calls.
         ubatch = std::min<size_t>(n_ctx, 1024);
         if (const char * d = std::getenv("KATA_DUMP_POS")) dump_pos = std::strtoul(d, nullptr, 10);
-        if (const char * u = std::getenv("KATA_UBATCH")) ubatch = std::max<size_t>(1, std::strtoul(u, nullptr, 10));
+        if (const char * u = std::getenv("KATA_UBATCH")) {
+            ubatch = std::max<size_t>(1, std::strtoul(u, nullptr, 10));
+            ubatch = std::min<size_t>(ubatch, n_ctx);
+        }
         const size_t pkv = n_head_kv * head_dim;
         const size_t wide = std::max(n_ff, n_ff_exp);
         px.assign(ubatch * n_embd, 0.0f);
@@ -260,23 +263,26 @@ struct Model::Impl {
         pbcx.assign(ubatch * 3 * n_embd, 0.0f);
         pexpacc.assign(ubatch * n_embd, 0.0f);
         pconv_out.assign(ubatch * n_embd, 0.0f);
-        pbx.assign((ubatch + 4) * n_embd, 0.0f);
-        gact.assign(ubatch * n_embd, 0.0f);
-        ggate.assign(ubatch * n_ff_exp, 0.0f);
-        gup.assign(ubatch * n_ff_exp, 0.0f);
+        pbx.assign((ubatch + l_cache) * n_embd, 0.0f);
         paq.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
-        paq2.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
+
         const size_t np_max = ubatch * n_expert_used;
         mprobs.assign(ubatch * n_expert, 0.0f);
         mpairs.resize(np_max);
+        mchoices.resize(np_max);
+        m_counts.assign(n_expert, 0);
+        m_offsets.assign(n_expert, 0);
+        m_head.assign(n_expert, 0);
         msel.resize(n_expert);
-        maq_g.assign(np_max * (n_embd / QK_K), {});
-        maq_d.assign(np_max * (n_ff_exp / QK_K), {});
-        mgout.assign(np_max * n_ff_exp, 0.0f);
-        muout.assign(np_max * n_ff_exp, 0.0f);
-        mdout.assign(np_max * n_embd, 0.0f);
-        mptok.resize(np_max);
-        mpw.resize(np_max);
+        // Sized per expert bucket (max ubatch) instead of np_max (ubatch * n_expert_used),
+        // saving ~160 MB of RAM while maintaining identical functionality.
+        maq_g.assign(ubatch * (n_embd / QK_K), {});
+        maq_d.assign(ubatch * (n_ff_exp / QK_K), {});
+        mgout.assign(ubatch * n_ff_exp, 0.0f);
+        muout.assign(ubatch * n_ff_exp, 0.0f);
+        mdout.assign(ubatch * n_embd, 0.0f);
+        mptok.resize(ubatch);
+        mpw.resize(ubatch);
     }
 
     // Quantises the activation block and runs one quantised matvec.
@@ -298,13 +304,15 @@ struct Model::Impl {
     // to amortise a fan-out.
     void mm_batch(uint32_t type, size_t n, size_t rows, size_t cols, float * out,
                   const void * const * w, const block_q8_K * const * x) {
+        if (n == 0) return;
+        if (n > 32) throw std::runtime_error("kata: mm_batch batch size exceeds maximum of 32");
         const auto q0 = std::chrono::steady_clock::now();
         if (type == 12) {
-            const block_q4_K * wp[8];
+            const block_q4_K * wp[32];
             for (size_t i = 0; i < n; ++i) wp[i] = static_cast<const block_q4_K *>(w[i]);
             gemv_q4_K_q8_K_mt_batch(n, rows, cols, out, wp, x, pool);
         } else {
-            const block_q6_K * wp[8];
+            const block_q6_K * wp[32];
             for (size_t i = 0; i < n; ++i) wp[i] = static_cast<const block_q6_K *>(w[i]);
             gemv_q6_K_q8_K_mt_batch(n, rows, cols, out, wp, x, pool);
         }
@@ -316,6 +324,8 @@ struct Model::Impl {
     }
 
     void embed(uint32_t token) {
+        if (token >= n_vocab)
+            throw std::runtime_error("kata: token id out of vocabulary range: " + std::to_string(token));
         if (t_tok_embd != 14) throw std::runtime_error("kata: token_embd must be q6_K");
         const size_t nb = n_embd / QK_K;
         const uint8_t * base = static_cast<const uint8_t *>(tok_embd) + token * nb * sizeof(block_q6_K);
@@ -599,11 +609,27 @@ struct Model::Impl {
 
     void embed_rows(const uint32_t * tokens, size_t m) {
         if (t_tok_embd != 14) throw std::runtime_error("kata: token_embd must be q6_K");
+        for (size_t i = 0; i < m; ++i) {
+            if (tokens[i] >= n_vocab)
+                throw std::runtime_error("kata: token id out of vocabulary range: " + std::to_string(tokens[i]));
+        }
         const size_t nb = n_embd / QK_K;
         const uint8_t * base = static_cast<const uint8_t *>(tok_embd);
-        for (size_t i = 0; i < m; ++i)
-            dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(base + tokens[i] * nb * sizeof(block_q6_K)),
-                                px.data() + i * n_embd, n_embd);
+        const size_t row_bytes = nb * sizeof(block_q6_K);
+        if (m <= 4 || pool.size() <= 1) {
+            for (size_t i = 0; i < m; ++i)
+                dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(base + tokens[i] * row_bytes),
+                                    px.data() + i * n_embd, n_embd);
+        } else {
+            const unsigned nw = std::min<unsigned>(pool.size(), m);
+            const size_t per = (m + nw - 1) / nw;
+            pool.run([&](unsigned w) {
+                const size_t lo = std::min(m, w * per), hi = std::min(m, lo + per);
+                for (size_t i = lo; i < hi; ++i)
+                    dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(base + tokens[i] * row_bytes),
+                                        px.data() + i * n_embd, n_embd);
+            });
+        }
     }
 
     // shortconv over a whole chunk. One row was the encode path; here every row
@@ -686,8 +712,8 @@ struct Model::Impl {
         for (size_t i = 0; i < m * n_expert; ++i)
             probs[i] = sigmoid_gate ? 1.0f / (1.0f + std::exp(-probs[i])) : probs[i];
 
-        ExpertPair * pairs = mpairs.data();
-        size_t np = 0;
+        std::fill(m_counts.begin(), m_counts.end(), 0);
+        TokenChoice * choices = mchoices.data();
         for (size_t t = 0; t < m; ++t) {
             const float * p = probs + t * n_expert;
             auto * sel = msel.data();
@@ -697,16 +723,33 @@ struct Model::Impl {
             float wsum = 0.0f;
             for (size_t i = 0; i < n_expert_used; ++i) wsum += p[sel[i].second];
             if (wsum < 6.103515625e-5f) wsum = 6.103515625e-5f;
-            for (size_t i = 0; i < n_expert_used; ++i)
-                pairs[np++] = {sel[i].second, static_cast<uint32_t>(t), p[sel[i].second] / wsum};
+            for (size_t i = 0; i < n_expert_used; ++i) {
+                const uint32_t e = sel[i].second;
+                choices[t * n_expert_used + i] = { e, p[e] / wsum };
+                m_counts[e]++;
+            }
             if (router_log) {
                 std::fprintf(stderr, "router serial il=%zu [", il);
                 for (size_t i = 0; i < n_expert_used; ++i) std::fprintf(stderr, " %u", sel[i].second);
                 std::fprintf(stderr, " ]\n");
             }
         }
-        std::sort(pairs, pairs + np,
-                  [](const ExpertPair & a, const ExpertPair & b) { return a.expert < b.expert; });
+
+        // Prefix sums for linear counting sort (zero comparison overhead)
+        uint32_t total = 0;
+        for (size_t e = 0; e < n_expert; ++e) {
+            m_offsets[e] = total;
+            total += m_counts[e];
+        }
+        std::memcpy(m_head.data(), m_offsets.data(), n_expert * sizeof(uint32_t));
+
+        ExpertPair * pairs = mpairs.data();
+        for (size_t t = 0; t < m; ++t) {
+            for (size_t i = 0; i < n_expert_used; ++i) {
+                const auto & choice = choices[t * n_expert_used + i];
+                pairs[m_head[choice.expert]++] = { choice.expert, static_cast<uint32_t>(t), choice.weight };
+            }
+        }
 
         block_q8_K * aq_g = maq_g.data();
         block_q8_K * aq_d = maq_d.data();
@@ -724,11 +767,10 @@ struct Model::Impl {
         const uint8_t * bu = static_cast<const uint8_t *>(L.up_exps);
         const uint8_t * bd = static_cast<const uint8_t *>(L.down_exps);
 
-        for (size_t first = 0; first < np;) {
-            size_t last = first;
-            while (last < np && pairs[last].expert == pairs[first].expert) ++last;
-            const size_t c = last - first;
-            const uint32_t e = pairs[first].expert;
+        for (size_t e = 0; e < n_expert; ++e) {
+            const size_t c = m_counts[e];
+            if (c == 0) continue;
+            const size_t first = m_offsets[e];
 
             for (size_t i = 0; i < c; ++i) ptok[i] = pairs[first + i].token;
             q8_rows_gather_mt(pnorm.data(), ptok, c, n_embd, aq_g);
@@ -739,7 +781,6 @@ struct Model::Impl {
             mmn(L.t_de, n_embd, n_ff_exp, dout, n_embd, bd + e * sb_d, aq_d, c);
             for (size_t i = 0; i < c; ++i) pw[i] = pairs[first + i].weight;
             scatter_add(dout, ptok, pw, c, n_embd, pexpacc.data());
-            first = last;
         }
         // pexpacc is the accumulator, so the copy into pffn_out is the only
         // hand-off the caller needs; it is 4.5 MB per layer at ubatch 544.
@@ -855,6 +896,15 @@ void Model::load(const std::string & path, size_t n_ctx) {
     if (f.has_key("lfm2moe.shortconv.l_cache")) m.l_cache = f.u32("lfm2moe.shortconv.l_cache");
     if (f.has_key("lfm2moe.expert_gating_func")) m.sigmoid_gate = f.u32("lfm2moe.expert_gating_func") == 2;
 
+    if (m.l_cache == 0) throw std::runtime_error("kata: l_cache must be positive");
+    if (m.n_expert_used == 0 || m.n_expert_used > m.n_expert)
+        throw std::runtime_error("kata: invalid n_expert_used: " + std::to_string(m.n_expert_used));
+    if (m.n_expert_used > 16)
+        throw std::runtime_error("kata: n_expert_used exceeds supported maximum (16): " + std::to_string(m.n_expert_used));
+    if (m.n_head == 0 || m.n_embd % m.n_head != 0)
+        throw std::runtime_error("kata: n_embd must be divisible by n_head");
+    m.head_dim = m.n_embd / m.n_head;
+
     const GgufTensor * te = f.find("token_embd.weight");
     if (!te) throw std::runtime_error("kata: missing token_embd.weight");
     m.tok_embd = f.data(*te);
@@ -864,7 +914,8 @@ void Model::load(const std::string & path, size_t n_ctx) {
     // k/v projections are the only place the kv-head count shows up as a shape.
     for (size_t il = 0; il < m.n_layer; ++il) {
         if (const GgufTensor * t = f.find("blk." + std::to_string(il) + ".attn_k.weight")) {
-            m.head_dim = m.n_embd / m.n_head;
+            if (t->dims[1] % m.head_dim != 0)
+                throw std::runtime_error("kata: attn_k dim not divisible by head_dim");
             m.n_head_kv = t->dims[1] / m.head_dim;
             break;
         }
