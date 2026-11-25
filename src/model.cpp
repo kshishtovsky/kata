@@ -680,19 +680,22 @@ struct Model::Impl {
             const size_t m = std::min(ubatch, n - done);
             const size_t pos0 = st.pos + done;
             const auto t_start = std::chrono::steady_clock::now();
-            embed_rows(tokens + done, m);
+            double t_emb_s=0,t_norm_s=0,t_mix_s=0,t_res_s=0,t_ffn_s=0;
+            auto NS=[&]{return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();};
+            double a=NS();
+            embed_rows(tokens + done, m); t_emb_s+=NS()-a;
             for (size_t il = 0; il < n_layer; ++il) {
                 const Layer & L = layers[il];
-                std::memcpy(pprev.data(), px.data(), m * n_embd * sizeof(float));
-                rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.attn_norm), eps);
-                if (L.attn) attention_rows(il, L, m, pos0);
-                else shortconv_rows(il, L, m);
-                for (size_t i = 0; i < m * n_embd; ++i) px[i] = pprev[i] + pattn[i];
+                a=NS(); std::memcpy(pprev.data(), px.data(), m * n_embd * sizeof(float));
+                rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.attn_norm), eps); t_norm_s+=NS()-a;
+                a=NS(); if (L.attn) attention_rows(il, L, m, pos0);
+                else shortconv_rows(il, L, m); t_mix_s+=NS()-a;
+                a=NS(); for (size_t i = 0; i < m * n_embd; ++i) px[i] = pprev[i] + pattn[i]; t_res_s+=NS()-a;
 
-                rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps);
-                if (L.moe) moe_ffn_rows(il, L, m);
-                else dense_ffn_rows(il, L, m);
-                for (size_t i = 0; i < m * n_embd; ++i) px[i] += pffn_out[i];
+                a=NS(); rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps); t_norm_s+=NS()-a;
+                a=NS(); if (L.moe) moe_ffn_rows(il, L, m);
+                else dense_ffn_rows(il, L, m); t_ffn_s+=NS()-a;
+                a=NS(); for (size_t i = 0; i < m * n_embd; ++i) px[i] += pffn_out[i]; t_res_s+=NS()-a;
                 if (!dump_dir.empty() && done + m == n)
                     dump(("pout" + std::to_string(il)).c_str(), px.data() + (m - 1) * n_embd, n_embd);
             }
@@ -706,6 +709,7 @@ struct Model::Impl {
                 const double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_start).count();
                 std::fprintf(stderr, "[prefill] chunk %zu tok in %.2f ms = %.1f tok/s\n", m, ms, 1000.0 * m / ms);
+                std::fprintf(stderr, "[phase] emb %.1f norm %.1f mix %.1f res %.1f ffn %.1f => sum %.1f\n", t_emb_s,t_norm_s,t_mix_s,t_res_s,t_ffn_s, t_emb_s+t_norm_s+t_mix_s+t_res_s+t_ffn_s);
             }
         }
         st.pos += n;

@@ -63,3 +63,24 @@ TEST(Throttle, PauseIsProportionalToWorkDone) {
 TEST(Throttle, PoolDefaultRespectsCap) {
     EXPECT_LE(kata::ThreadPool::default_threads(), kata::throttle::max_threads());
 }
+
+// The spin budget is adaptive: a burst keeps workers hot, a long gap parks them.
+// Both paths must produce identical results, and neither may hang.
+TEST(Pool, BurstAndParkBothWork) {
+    kata::ThreadPool pool(4);
+    std::vector<std::atomic<int>> hits(16);
+    for (auto & h : hits) h.store(0);
+    for (int rep = 0; rep < 200; ++rep) {           // burst: mostly spinning
+        pool.run([&](unsigned w) {
+            for (int i = 0; i < 16; ++i) hits[(w * 16 + i + rep) % hits.size()].fetch_add(1);
+        });
+    }
+    for (const auto & h : hits) ASSERT_EQ(h.load(), 200 * 16 * 4 / 16);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));   // gap: park
+    std::vector<int> out(64, 0);
+    pool.run([&](unsigned w) {                       // then wake again
+        const size_t per = 64 / 4, lo = w * per, hi = lo + per;
+        for (size_t i = lo; i < hi; ++i) out[i] = static_cast<int>(i) * 3;
+    });
+    for (size_t i = 0; i < out.size(); ++i) ASSERT_EQ(out[i], static_cast<int>(i) * 3);
+}

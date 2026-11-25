@@ -30,6 +30,8 @@
 | EXP-0026 | VNNI microkernel for q6_K | FAILED | prefill 145.0 -> 87.8 tok/s (0.61x); 16 sub-block epilogues per band vs q4_K's 8 |
 | EXP-0027 | Parallel prefill attention + parallel expert glue | PASSED | prefill 146.4 -> 231.9 tok/s (1.58x); attention 654 -> 196 ms, MoE glue 1032 -> 450 ms |
 | EXP-0028 | Grouped prefill attention (4 query heads share one kv head) | PASSED | long-context prefill 25070 tok 108.7 -> 137.0 tok/s (1.26x); 544 tok 253 -> 258 tok/s; argmax unchanged vs llama.cpp batched |
+| EXP-0029 | VNNI microkernel for q6_K, bias folded into the scale multiply | PASSED | 651 -> 1415 GMAC/s (2.2x); prefill 260 -> 268 tok/s, 25070 tok 137.0 -> 138.6 |
+| EXP-0030 | Spin-then-park thread pool (the CPU load "wave") | PASSED | prefill 268 -> 330 tok/s, 25070 tok 138.6 -> 154.7, decode 36.1 -> 41.6 tok/s |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1796,3 +1798,79 @@ prefill exactly on both prompts (17568 at 544 tokens, 506 at 25070).
 
 **Next bottleneck:** attention is no longer the top cost; re-profile before
 choosing the next target.
+
+---
+
+## EXP-0029 — VNNI microkernel for q6_K (the bias rides in the scale multiply)
+
+**Status:** PASSED
+**Hypothesis:** EXP-0026 failed because I added a 16-round epilogue for q6_K's
+-32 weight bias. ggml instead subtracts the bias inside the same `mullo` that
+applies the sub-block scale, so it costs one `sub` on a register that is already
+live. Copy that structure and q6_K should reach q4_K's rate.
+
+**Implementation** (`src/gemm.cpp`):
+- `VaTile6 { int32_t codes[QK_K/4][VTN]; int32_t bsum16[QK_K/16][VTN]; float d[VTN]; }`
+  and `VwBand6 { uint8_t g[VRN][QK_K]; int32_t sc[VRN][QK_K/16]; float d[VRN]; }`.
+  Codes are stored **unsigned 0..63**; the -32 is applied in the epilogue.
+- `unpack_w_band6` combines the low nibble of `ql` with the two high bits of
+  `qh` into four 32-byte runs per 128-value half.
+- `q6_K_vnni_tile`: `#pragma GCC unroll 4` over the four `dpbusd` groups per
+  16-value sub-block, then
+  `s1 += mullo(sub(a16, mullo(bsum16, 32)), sc)` — one integer pass, no `s2`.
+- `gemm_q6_K_q8_K` and `gemm_q6_K_q8_K_mt` dispatch to it on VNNI and pack the
+  activation tiles once per call.
+
+**Bug found:** the first version passed one byte to `_mm512_set1_epi32`, so only
+every fourth k value contributed (relerr 1.7-2.1). Fixed by loading the four
+codes as a `uint32_t`. The load has to stay inside the unrolled row loop.
+
+**Measured** (16 threads, `/tmp/shape6.cpp`):
+
+| shape | before | after |
+|---|---|---|
+| n=1536 m=64 | 617.3 | 1316.0 GMAC/s |
+| n=1536 m=512 | 651.6 | 1414.9 GMAC/s |
+| n=2048 m=128 | 601.4 | 1345.0 GMAC/s |
+
+End to end: prefill 544 tok 260.2 -> 266.6-268.9 tok/s; 25070 tok 137.0 ->
+138.6 tok/s; argmax unchanged and still matching llama.cpp (17568 / 506).
+
+**Conclusion:** q6_K now runs at q4_K's rate, so no quantised format in the
+shipped models is slower than any other. The remaining prefill loss is not the
+inner product.
+
+---
+
+## EXP-0030 — Spin-then-park thread pool (the "wave" in a CPU monitor)
+
+**Status:** PASSED
+**Problem:** the user pointed at btop and reported the CPU load pulsing: half a
+second of work, then idle, then work. Instrumenting `ThreadPool::run` gave
+**10112 calls for 544 tokens** (18.6 per token) and **502 ms of the 2060 ms
+prefill spent with workers parked** — 24% of the run.
+**Root cause:** every fan-out parked 15 threads on a condition variable and woke
+them again. With ~200 us of work per call the futex round trip is a large
+fraction of the call.
+**Fix** (`src/pool.cpp`): workers spin on an acquire load of an atomic
+`generation` for a bounded budget, then park. The budget is adaptive — the caller
+publishes `4x` the gap it just observed between fan-outs (floor 8 ms, ceiling
+20 ms, `KATA_SPIN` overrides), so a busy pipeline keeps cores hot and an idle
+engine still sleeps. `cv_start` is only notified when somebody is actually
+parked, and the caller spins for completion before taking `cv_done`.
+**Measured** (`KATA_SPIN` sweep, 544-token prefill): off 260.9, 1000 us 298.5,
+2000 us 310.7, 8000 us 327.9, 20000 us 335.2 tok/s.
+**Result with the adaptive budget:** prefill 544 tok **324-339 tok/s** (was
+260-267), 25070 tok **154.7 tok/s** (was 138.6), decode **41.6 tok/s** (was
+36.1, and 45.18 is llama.cpp's CPU number, so the gap is now 1.09x).
+Single-token latency is unaffected (73-89 ms total process time) because the
+budget falls back to the floor when the next call is far away.
+**Tests:** `Pool.BurstAndParkBothWork` — 200 back-to-back fan-outs (spinning
+path) plus a 20 ms gap and a wake-up (parking path), asserting exact results on
+both. 75/75 pass, coverage 78.96%.
+**Cost paid:** user CPU time for the 544-token prefill rose from 15.0 s to
+24.5 s at the largest budget. That is the spin burning cycles between calls;
+with the adaptive budget the wall-clock win is real, and the setting is capped.
+
+**Next bottleneck:** `q4_K_vnni_tile` is still ~45% of prefill and the expert
+buckets are still dispatched one pool run at a time.

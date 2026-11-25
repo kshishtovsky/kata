@@ -407,6 +407,152 @@ void q4_K_vnni_rows(const VaTile * tiles, size_t ntile, size_t m, size_t nb, siz
     }
 }
 
+// ---------------------------------------------------------------------------
+// q6_K VNNI microkernel (EXP-0029). Same 8x16 shape as q4_K, two differences:
+//  - q6_K has 16 sub-blocks of 16 values, not 8 of 32, so the scale epilogue
+//    runs twice as often for the same 64 vpdpbusd per band.
+//  - the -32 value bias must NOT be a second pass over the sub-blocks. That was
+//    EXP-0026, which lost 39%. It is folded into the scale multiply instead:
+//    raw = acc - 32*bsum, then one mullo. bsum is already in block_q8_K.bsums,
+//    one entry per 16 values, so it needs no combining.
+struct alignas(64) VaTile6 {
+    int32_t codes[QK_K / 4][VTN];
+    int32_t bsum16[QK_K / 16][VTN];
+    float d[VTN];
+};
+
+struct alignas(64) VwBand6 {
+    uint8_t g[VRN][QK_K]; // 6-bit codes widened to one byte per k value
+    int32_t sc[VRN][QK_K / 16];
+    float d[VRN];
+};
+
+void pack_a_tiles6(const block_q8_K * a, size_t m, size_t nb, std::vector<VaTile6> & tiles) {
+    const size_t ntile = (m + VTN - 1) / VTN;
+    tiles.assign(ntile * nb, VaTile6{});
+    for (size_t jt = 0; jt < ntile; ++jt) {
+        const size_t nt = std::min(VTN, m - jt * VTN);
+        for (size_t b = 0; b < nb; ++b) {
+            VaTile6 & t = tiles[jt * nb + b];
+            for (size_t j = 0; j < nt; ++j) {
+                const block_q8_K & ab = a[(jt * VTN + j) * nb + b];
+                t.d[j] = ab.d;
+                for (int s = 0; s < QK_K / 16; ++s) t.bsum16[s][j] = ab.bsums[s];
+                for (int g = 0; g < QK_K / 4; ++g) {
+                    int32_t v;
+                    std::memcpy(&v, &ab.qs[g * 4], 4);
+                    t.codes[g][j] = v;
+                }
+            }
+        }
+    }
+}
+
+__attribute__((target("avx2")))
+void unpack_w_band6(const block_q6_K * w, size_t nb, size_t nr, VwBand6 & o) {
+    for (size_t r = 0; r < VRN; ++r) {
+        if (r >= nr) {
+            std::memset(o.g[r], 0, sizeof(o.g[r]));
+            std::memset(o.sc[r], 0, sizeof(o.sc[r]));
+            o.d[r] = 0.0f;
+            continue;
+        }
+        const block_q6_K & wr = w[r * nb];
+        o.d[r] = f16_fast(wr.d);
+        for (int s = 0; s < QK_K / 16; ++s) o.sc[r][s] = (int32_t)(int8_t)wr.scales[s];
+        const __m256i m4 = _mm256_set1_epi8(0x0f);
+        const __m256i m3 = _mm256_set1_epi8(0x03);
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t * ql = wr.ql + 64 * half;
+            const uint8_t * qh = wr.qh + 32 * half;
+            const __m256i v0 = _mm256_loadu_si256((const __m256i *)ql);
+            const __m256i v1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            const __m256i h = _mm256_loadu_si256((const __m256i *)qh);
+            uint8_t * dst = o.g[r] + 128 * half;
+            _mm256_store_si256((__m256i *)dst,
+                _mm256_or_si256(_mm256_and_si256(v0, m4),
+                                _mm256_slli_epi16(_mm256_and_si256(h, m3), 4)));
+            _mm256_store_si256((__m256i *)(dst + 32),
+                _mm256_or_si256(_mm256_and_si256(v1, m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 2), m3), 4)));
+            _mm256_store_si256((__m256i *)(dst + 64),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v0, 4), m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 4), m3), 4)));
+            _mm256_store_si256((__m256i *)(dst + 96),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v1, 4), m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 6), m3), 4)));
+        }
+    }
+}
+
+__attribute__((target("avx512f,avx512vl,avx512bw,avx512vnni,avx512dq,avx2,f16c,fma")))
+void q6_K_vnni_tile(const VwBand6 * uw, const VaTile6 * tiles, size_t nb, float * out,
+                    size_t ldc, size_t nr, size_t nt) {
+    __m512 acc[VRN];
+#pragma GCC unroll 8
+    for (size_t r = 0; r < VRN; ++r) acc[r] = _mm512_setzero_ps();
+
+    for (size_t b = 0; b < nb; ++b) {
+        const VaTile6 & tb = tiles[b];
+        const VwBand6 & ub = uw[b];
+        __m512i s1[VRN];
+#pragma GCC unroll 8
+        for (size_t r = 0; r < VRN; ++r) s1[r] = _mm512_setzero_si512();
+
+        for (int s = 0; s < QK_K / 16; ++s) {
+            __m512i a16[VRN];
+#pragma GCC unroll 8
+            for (size_t r = 0; r < VRN; ++r) a16[r] = _mm512_setzero_si512();
+#pragma GCC unroll 4
+            for (int gg = 0; gg < 4; ++gg) {
+                const __m512i codes = _mm512_load_si512((const __m512i *)tb.codes[s * 4 + gg]);
+#pragma GCC unroll 8
+                for (size_t r = 0; r < VRN; ++r) {
+                    // 4 consecutive code bytes as one u32: set1_epi32 on a single
+                    // byte would replicate [x,0,0,0] and only every 4th k value
+                    // would contribute.
+                    const uint32_t w4 = *(const uint32_t *)&ub.g[r][s * 16 + gg * 4];
+                    a16[r] = _mm512_dpbusd_epi32(a16[r], _mm512_set1_epi32((int)w4), codes);
+                }
+            }
+            const __m512i bias = _mm512_mullo_epi32(
+                _mm512_load_si512((const __m512i *)tb.bsum16[s]), _mm512_set1_epi32(32));
+#pragma GCC unroll 8
+            for (size_t r = 0; r < VRN; ++r)
+                s1[r] = _mm512_add_epi32(s1[r], _mm512_mullo_epi32(
+                            _mm512_sub_epi32(a16[r], bias), _mm512_set1_epi32(ub.sc[r][s])));
+        }
+
+        const __m512 dact = _mm512_load_ps(tb.d);
+#pragma GCC unroll 8
+        for (size_t r = 0; r < VRN; ++r) {
+            const __m512 f = _mm512_mul_ps(_mm512_cvtepi32_ps(s1[r]), _mm512_set1_ps(ub.d[r]));
+            acc[r] = _mm512_fmadd_ps(f, dact, acc[r]);
+        }
+    }
+
+    for (size_t r = 0; r < nr; ++r) {
+        alignas(64) float tmp[VTN];
+        _mm512_store_ps(tmp, acc[r]);
+        for (size_t j = 0; j < nt; ++j) out[j * ldc + r] = tmp[j];
+    }
+}
+
+__attribute__((target("avx512f,avx512vl,avx512bw,avx512vnni,avx512dq,avx2,f16c,fma")))
+void q6_K_vnni_rows(const VaTile6 * tiles, size_t ntile, size_t m, size_t nb, size_t n,
+                    const block_q6_K * w, float * out, size_t ldc) {
+    thread_local std::vector<VwBand6> uw;
+    uw.resize(nb);
+    for (size_t rw = 0; rw < n; rw += VRN) {
+        const size_t nr = std::min(VRN, n - rw);
+        for (size_t b = 0; b < nb; ++b) unpack_w_band6(w + rw * nb + b, nb, nr, uw[b]);
+        for (size_t jt = 0; jt < ntile; ++jt) {
+            const size_t nt = std::min(VTN, m - jt * VTN);
+            q6_K_vnni_tile(uw.data(), tiles + jt * nb, nb, out + (jt * VTN) * ldc + rw, ldc, nr, nt);
+        }
+    }
+}
+
 } // namespace
 
 void gemm_q4_K_q8_K(size_t m, size_t n, size_t k, float * out, size_t ldc,
@@ -425,6 +571,13 @@ void gemm_q4_K_q8_K(size_t m, size_t n, size_t k, float * out, size_t ldc,
 void gemm_q6_K_q8_K(size_t m, size_t n, size_t k, float * out, size_t ldc,
                     const block_q6_K * w, const block_q8_K * a) {
     if (m == 0 || n == 0) return;
+    if (cpu_isa() == Isa::Avx512Vnni && k % QK_K == 0) {
+        const size_t nb = k / QK_K;
+        std::vector<VaTile6> tiles;
+        pack_a_tiles6(a, m, nb, tiles);
+        q6_K_vnni_rows(tiles.data(), (m + VTN - 1) / VTN, m, nb, n, w, out, ldc);
+        return;
+    }
     gemm_q6_K_q8_K_avx2(m, n, k, out, ldc, w, a);
 }
 
@@ -511,11 +664,19 @@ void gemm_q6_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
     const unsigned nt = pool.size();
     if (nt <= 1 || n < nt) { gemm_q6_K_q8_K(m, n, k, out, ldc, w, a); return; }
     const size_t nb = k / QK_K;
+    const bool vnni = cpu_isa() == Isa::Avx512Vnni && k % QK_K == 0;
+    // Activation tiles are identical for every worker, so pack them once here
+    // instead of once per chunk (the q4_K driver does the same).
+    std::vector<VaTile6> tiles;
+    if (vnni) pack_a_tiles6(a, m, nb, tiles);
+    const size_t ntile = (m + VTN - 1) / VTN;
     const size_t chunk = (n + nt - 1) / nt;
     pool.run([&](unsigned tid) {
         const size_t lo = std::min(n, (size_t)tid * chunk);
         const size_t hi = std::min(n, lo + chunk);
-        if (lo < hi) gemm_q6_K_q8_K(m, hi - lo, k, out + lo, ldc, w + lo * nb, a);
+        if (lo >= hi) return;
+        if (vnni) q6_K_vnni_rows(tiles.data(), ntile, m, nb, hi - lo, w + lo * nb, out + lo, ldc);
+        else gemm_q6_K_q8_K_avx2(m, hi - lo, k, out + lo, ldc, w + lo * nb, a);
     });
 }
 
