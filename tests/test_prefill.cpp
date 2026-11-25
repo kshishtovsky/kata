@@ -79,6 +79,7 @@ TEST(Prefill, MatchesRefAcrossShapes) {
     check({4, 5, 4, 1, 80});
     check({6, 2, 4, 2, 60});
     check({2, 9, 2, 1, 8});
+    check({8, 2048, 32, 8, 64});
 }
 
 TEST(Prefill, FirstRowOfEmptyCacheIsJustV) {

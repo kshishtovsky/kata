@@ -7,6 +7,20 @@
       "sourceType": "github",
       "skillPath": "skills/brainstorming/SKILL.md",
       "computedHash": "a7424777b7f81e3eb9b4556d29fe233553736d8255780d3e1feea190fef61fef"
+    },
+    "cpp-coding-standards": {
+      "source": "affaan-m/ECC",
+      "commit": "4adeee6732a12d1540f49a4d50a38ce8c97f9a53",
+      "sourceType": "github",
+      "skillPath": "skills/cpp-coding-standards/SKILL.md",
+      "computedHash": "324ceea2c562f3eff848d258ba84318caf1e353ccce862e85ab4275486e72f1e"
+    },
+    "logging-best-practices": {
+      "source": "boristane/agent-skills",
+      "commit": "8aa14dd16a1340a6049e6d7cd58e2ed52333a550",
+      "sourceType": "github",
+      "skillPath": "skills/logging-best-practices/SKILL.md",
+      "computedHash": "cca34d2c8b75cd9d9a2f3b4e704130e68c046a263325108a0b2740b328a39480"
     }
   }
 }

@@ -186,7 +186,10 @@ struct Model::Impl {
         spr_ao.assign(n_embd / QK_K, {});
         spr_out.assign(n_embd, 0.0f);
 
-        ubatch = std::min<size_t>(n_ctx, 512);
+        // 1024 measured 253.6 tok/s vs 231.8 at 512 on a 544-token prompt: the
+        // per-layer expert buckets get twice as many rows, so the small-m GEMM
+        // penalty is paid on half as many calls.
+        ubatch = std::min<size_t>(n_ctx, 1024);
         if (const char * d = std::getenv("KATA_DUMP_POS")) dump_pos = std::strtoul(d, nullptr, 10);
         if (const char * u = std::getenv("KATA_UBATCH")) ubatch = std::max<size_t>(1, std::strtoul(u, nullptr, 10));
         const size_t pkv = n_head_kv * head_dim;

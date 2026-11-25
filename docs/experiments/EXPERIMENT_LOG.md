@@ -29,6 +29,7 @@
 | EXP-0025 | Load-guard pool fix + honest CPU baseline | PASSED | spin 15.8% -> 5.3%; llama.cpp CPU prefill is 441 tok/s, not 4540 |
 | EXP-0026 | VNNI microkernel for q6_K | FAILED | prefill 145.0 -> 87.8 tok/s (0.61x); 16 sub-block epilogues per band vs q4_K's 8 |
 | EXP-0027 | Parallel prefill attention + parallel expert glue | PASSED | prefill 146.4 -> 231.9 tok/s (1.58x); attention 654 -> 196 ms, MoE glue 1032 -> 450 ms |
+| EXP-0028 | Grouped prefill attention (4 query heads share one kv head) | PASSED | long-context prefill 25070 tok 108.7 -> 137.0 tok/s (1.26x); 544 tok 253 -> 258 tok/s; argmax unchanged vs llama.cpp batched |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1761,3 +1762,37 @@ rows, so they cannot change results, and the test proves it.
 measured ggml ceiling of ~2029 GMAC/s. The gap is the `-8` bias correction and
 the per-band weight unpack, both of which ggml amortises by repacking weights
 once instead of per call.
+
+## EXP-0028 — Grouped prefill attention
+
+**Status:** PASSED
+**Hypothesis:** At 25k tokens `prefill_rows<8>` took 49% of prefill time and
+re-read the whole K/V prefix once per query row. Four query heads share one kv
+head, so every k and v row was read four times: ~1.6 TB of traffic for ~400 MB
+of data.
+
+**Implementation:** `prefill_group4` in `src/prefill.cpp` — `G = 4` heads per kv
+head, `__m512 acc[4][4]` (16 of 32 zmm at head_dim 64), one k load shared by the
+four heads, v loaded lazily only when the position contributes. Fast path
+`acc += e*v` with a rare rescale when the running max rises. Dispatched from
+`attention_prefill` when `head_dim == 64 && n_heads == 4 * n_kv_heads` and
+AVX-512 VNNI is present; everything else takes the old path.
+
+**Measured (16 threads, KATA_DUTY=1):**
+
+| prompt | before | after | delta |
+|---|---|---|---|
+| 544 tok | 253 tok/s | 258 tok/s | 1.02x |
+| 25070 tok | 108.7 tok/s | 137.0 tok/s | **1.26x** |
+
+Accuracy: max relative error against a double-precision scalar reference at
+20000-token context is 2.68e-03, versus 2.94e-03 for the previous kernel.
+
+**Verification trap worth recording:** `kata_run` prints its argmax *after* any
+`--gen N` tokens have been appended, so `--gen 1` reports the argmax of the
+token after the prompt. Every prefill/final-logit comparison must run without
+`--gen`. With that corrected, prefill-only argmax matches llama.cpp's batched
+prefill exactly on both prompts (17568 at 544 tokens, 506 at 25070).
+
+**Next bottleneck:** attention is no longer the top cost; re-profile before
+choosing the next target.

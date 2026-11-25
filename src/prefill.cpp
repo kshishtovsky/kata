@@ -4,6 +4,7 @@
 // produced them. This walks the kv prefix once per query row with an online
 // softmax and keeps the weighted-v accumulator in registers the whole time.
 #include "kata/prefill.h"
+#include "kata/cpu.h"
 #include "kata/pool.h"
 
 #include <algorithm>
@@ -114,17 +115,24 @@ void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const fl
             for (size_t p = 0; p < n_kv; ++p) {
                 const float * kp = k_cache + p * kv_stride + kvh * head_dim;
                 const float sc = dot_avx2(qv, kp, head_dim) * scale;
-                const float m_new = sc > m ? sc : m;
-                const float corr = std::exp(m - m_new);
-                const float e = std::exp(sc - m_new);
-                m = m_new;
-                s = s * corr + e;
-                const __m256 ev = _mm256_set1_ps(e);
-                const __m256 cv = _mm256_set1_ps(corr);
+                // The running max rises O(log n) times over a whole row, so most
+                // positions take the pure-FMA path: acc += e*v with no rescale of
+                // the 64-float accumulator. Rescaling every position was 2 mul + 1
+                // add per element instead of one fused multiply-add.
                 const float * vp = v_cache + p * kv_stride + kvh * head_dim;
-                for (int r = 0; r < NV; ++r) {
-                    const __m256 vv = _mm256_loadu_ps(vp + 8 * r);
-                    acc[r] = _mm256_add_ps(_mm256_mul_ps(acc[r], cv), _mm256_mul_ps(ev, vv));
+                if (sc > m) {
+                    const float corr = m == -INFINITY ? 0.0f : std::exp(m - sc);
+                    const __m256 cv = _mm256_set1_ps(corr);
+                    s = s * corr + 1.0f;
+                    m = sc;
+                    for (int r = 0; r < NV; ++r)
+                        acc[r] = _mm256_add_ps(_mm256_mul_ps(acc[r], cv), _mm256_loadu_ps(vp + 8 * r));
+                } else {
+                    const float e = std::exp(sc - m);
+                    s += e;
+                    const __m256 ev = _mm256_set1_ps(e);
+                    for (int r = 0; r < NV; ++r)
+                        acc[r] = _mm256_fmadd_ps(ev, _mm256_loadu_ps(vp + 8 * r), acc[r]);
                 }
             }
             const __m256 inv = _mm256_set1_ps(1.0f / s);
@@ -168,11 +176,97 @@ void prefill_rows_generic(const float * q, size_t n_tok, const float * k_cache, 
 
 } // namespace
 
+#if defined(__x86_64__) || defined(__i386__)
+
+namespace {
+
+// Four query heads share one kv head, so the naive loop reads every k and v row
+// four times: at 25k tokens that is 1.6 TB of traffic for 400 MB of data, and it
+// showed up as 49% of prefill time. This walks the kv row once per group of four
+// heads. Accumulators are 4 heads x 4 zmm (head_dim 64) = 16 of 32 zmm; q is
+// re-read from L1 each position instead, because holding it would need the other
+// 16 zmm and leave no room for accumulators.
+__attribute__((target("avx512f,avx512vl,avx512bw,avx2,fma")))
+void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
+                    const float * v_cache, size_t n_kv_begin, size_t n_heads,
+                    size_t n_kv_heads, float scale, float * out) {
+    constexpr size_t HD = 64, G = 4;
+    const size_t kv_stride = n_kv_heads * HD;
+    for (size_t t = 0; t < n_tok; ++t) {
+        const size_t n_kv = n_kv_begin + t + 1;
+        for (size_t g = 0; g < n_heads; g += G) {
+            const size_t kvh = g / G;
+            const float * qv[G];
+            for (size_t h = 0; h < G; ++h) qv[h] = q + (t * n_heads + g + h) * HD;
+            __m512 acc[G][4];
+            float m[G], s[G];
+            for (size_t h = 0; h < G; ++h) {
+                for (int r = 0; r < 4; ++r) acc[h][r] = _mm512_setzero_ps();
+                m[h] = -INFINITY;
+                s[h] = 0.0f;
+            }
+            for (size_t p = 0; p < n_kv; ++p) {
+                const float * kp = k_cache + p * kv_stride + kvh * HD;
+                const __m512 k0 = _mm512_loadu_ps(kp), k1 = _mm512_loadu_ps(kp + 16),
+                             k2 = _mm512_loadu_ps(kp + 32), k3 = _mm512_loadu_ps(kp + 48);
+                const float * vp = v_cache + p * kv_stride + kvh * HD;
+                __m512 vv[4];
+                bool v_loaded = false;
+                for (size_t h = 0; h < G; ++h) {
+                    const float * qq = qv[h];
+                    __m512 a = _mm512_mul_ps(_mm512_loadu_ps(qq), k0);
+                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 16), k1, a);
+                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 32), k2, a);
+                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 48), k3, a);
+                    const float sc = _mm512_reduce_add_ps(a) * scale;
+                    if (sc > m[h]) {
+                        if (!v_loaded) {
+                            for (int r = 0; r < 4; ++r) vv[r] = _mm512_loadu_ps(vp + 16 * r);
+                            v_loaded = true;
+                        }
+                        const float corr = m[h] == -INFINITY ? 0.0f : std::exp(m[h] - sc);
+                        const __m512 cv = _mm512_set1_ps(corr);
+                        s[h] = s[h] * corr + 1.0f;
+                        m[h] = sc;
+                        for (int r = 0; r < 4; ++r)
+                            acc[h][r] = _mm512_add_ps(_mm512_mul_ps(acc[h][r], cv), vv[r]);
+                    } else {
+                        if (!v_loaded) {
+                            for (int r = 0; r < 4; ++r) vv[r] = _mm512_loadu_ps(vp + 16 * r);
+                            v_loaded = true;
+                        }
+                        const float e = std::exp(sc - m[h]);
+                        s[h] += e;
+                        const __m512 ev = _mm512_set1_ps(e);
+                        for (int r = 0; r < 4; ++r) acc[h][r] = _mm512_fmadd_ps(ev, vv[r], acc[h][r]);
+                    }
+                }
+            }
+            for (size_t h = 0; h < G; ++h) {
+                const __m512 inv = _mm512_set1_ps(1.0f / s[h]);
+                float * o = out + (t * n_heads + g + h) * HD;
+                for (int r = 0; r < 4; ++r)
+                    _mm512_storeu_ps(o + 16 * r, _mm512_mul_ps(acc[h][r], inv));
+            }
+        }
+    }
+}
+
+} // namespace
+
+#endif
+
 void attention_prefill(const float * q, size_t n_tok,
                        const float * k_cache, const float * v_cache,
                        size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
                        size_t head_dim, float scale, float * out) {
     if (n_tok == 0) return;
+#if defined(__x86_64__) || defined(__i386__)
+    if (head_dim == 64 && n_heads == 4 * n_kv_heads && cpu_isa() == Isa::Avx512Vnni) {
+        prefill_group4(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, scale, out);
+        return;
+    }
+#endif
     if (head_dim == 0 || head_dim % 8 != 0) {
         prefill_rows_generic(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
         return;

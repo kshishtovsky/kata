@@ -390,7 +390,10 @@ void q4_K_vnni_tile(const VwBand * uw, const VaTile * tiles, size_t nb, float * 
 __attribute__((target("avx512f,avx512vl,avx512bw,avx512vnni,avx512dq,avx2,f16c,fma")))
 void q4_K_vnni_rows(const VaTile * tiles, size_t ntile, size_t m, size_t nb, size_t n,
                     const block_q4_K * w, float * out, size_t ldc) {
-    std::vector<VwBand> uw(nb);
+    // thread_local: prefill calls this 38 layers x 64 expert buckets x 3
+    // matmuls per layer, and a fresh 21 KB vector per call was pure malloc churn.
+    thread_local std::vector<VwBand> uw;
+    uw.resize(nb);
     for (size_t rw = 0; rw < n; rw += VRN) {
         const size_t nr = std::min(VRN, n - rw);
         for (size_t b = 0; b < nb; ++b) unpack_w_band(w + rw * nb + b, nb, nr, uw[b]);
