@@ -315,3 +315,30 @@ TEST(GemvF32, NonMultipleShapesAndDispatches) {
         EXPECT_NEAR(got[r], want[r], 1e-4f * std::max(1.0f, std::fabs(want[r]))) << "row " << r;
     }
 }
+
+TEST(GemvQKV, MatchesIndependentCalls) {
+    std::mt19937 g(123);
+    const size_t qw = 128, kw = 32, vw = 32, cols = 512;
+    const size_t nb = cols / kata::QK_K;
+    auto wq = random_q4_K(qw * nb, g);
+    auto wk = random_q4_K(kw * nb, g);
+    auto wv = random_q6_K(vw * nb, g);
+    auto x = random_q8_K(nb, cols, g);
+
+    std::vector<float> want_q(qw), want_k(kw), want_v(vw);
+    std::vector<float> got_q(qw), got_k(kw), got_v(vw);
+
+    kata::ThreadPool pool(4);
+    kata::gemv_q4_K_q8_K_mt(qw, cols, want_q.data(), wq.data(), x.data(), pool);
+    kata::gemv_q4_K_q8_K_mt(kw, cols, want_k.data(), wk.data(), x.data(), pool);
+    kata::gemv_q6_K_q8_K_mt(vw, cols, want_v.data(), wv.data(), x.data(), pool);
+
+    kata::gemv_qkv_mt(qw, kw, vw, cols,
+                      got_q.data(), got_k.data(), got_v.data(),
+                      wq.data(), wk.data(), wv.data(),
+                      x.data(), pool);
+
+    for (size_t r = 0; r < qw; ++r) EXPECT_FLOAT_EQ(got_q[r], want_q[r]) << "Q row " << r;
+    for (size_t r = 0; r < kw; ++r) EXPECT_FLOAT_EQ(got_k[r], want_k[r]) << "K row " << r;
+    for (size_t r = 0; r < vw; ++r) EXPECT_FLOAT_EQ(got_v[r], want_v[r]) << "V row " << r;
+}

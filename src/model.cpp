@@ -88,6 +88,39 @@ inline void silu_mul(float * g, const float * u, size_t n) {
     }
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2,fma")))
+static inline void vec_add_inplace(float * dst, const float * src, size_t n) {
+    size_t j = 0;
+    for (; j + 8 <= n; j += 8) {
+        _mm256_storeu_ps(dst + j, _mm256_add_ps(_mm256_loadu_ps(dst + j), _mm256_loadu_ps(src + j)));
+    }
+    for (; j < n; ++j) dst[j] += src[j];
+}
+
+__attribute__((target("avx2,fma")))
+static inline void moe_accumulate(float * out, const float * down, size_t nu, size_t n_embd, const float * w, float wsum) {
+    for (size_t i = 0; i < nu; ++i) {
+        const float wj = w[i] / wsum;
+        const float * d = down + i * n_embd;
+        const __m256 wv = _mm256_set1_ps(wj);
+        if (i == 0) {
+            size_t j = 0;
+            for (; j + 8 <= n_embd; j += 8) {
+                _mm256_storeu_ps(out + j, _mm256_mul_ps(wv, _mm256_loadu_ps(d + j)));
+            }
+            for (; j < n_embd; ++j) out[j] = wj * d[j];
+        } else {
+            size_t j = 0;
+            for (; j + 8 <= n_embd; j += 8) {
+                _mm256_storeu_ps(out + j, _mm256_fmadd_ps(wv, _mm256_loadu_ps(d + j), _mm256_loadu_ps(out + j)));
+            }
+            for (; j < n_embd; ++j) out[j] += wj * d[j];
+        }
+    }
+}
+#endif
+
 } // namespace
 
 struct Model::Impl {
@@ -306,9 +339,29 @@ struct Model::Impl {
     }
 
     void attention(size_t il, const Layer & L, const std::vector<float> & in, size_t pos) {
-        mm(L.tq, n_head * head_dim, n_embd, q.data(), L.wq, in.data());
-        mm(L.tk, n_head_kv * head_dim, n_embd, k.data(), L.wk, in.data());
-        mm(L.tv, n_head_kv * head_dim, n_embd, v.data(), L.wv, in.data());
+        const size_t qw = n_head * head_dim;
+        const size_t kw = n_head_kv * head_dim;
+        const size_t vw = n_head_kv * head_dim;
+        if (L.tq == 12 && L.tk == 12 && L.tv == 14) {
+            const auto q0 = std::chrono::steady_clock::now();
+            quantize_row_q8_K(in.data(), aq.data(), n_embd);
+            const auto q1 = std::chrono::steady_clock::now();
+            gemv_qkv_mt(qw, kw, vw, n_embd, q.data(), k.data(), v.data(),
+                        static_cast<const block_q4_K *>(L.wq),
+                        static_cast<const block_q4_K *>(L.wk),
+                        static_cast<const block_q6_K *>(L.wv),
+                        aq.data(), pool);
+            const auto q2 = std::chrono::steady_clock::now();
+            if (prof) {
+                t_q += std::chrono::duration<double, std::milli>(q1 - q0).count();
+                t_mm += std::chrono::duration<double, std::milli>(q2 - q1).count();
+                n_mm += 3;
+            }
+        } else {
+            mm(L.tq, qw, n_embd, q.data(), L.wq, in.data());
+            mm(L.tk, kw, n_embd, k.data(), L.wk, in.data());
+            mm(L.tv, vw, n_embd, v.data(), L.wv, in.data());
+        }
 
         rms_norm(n_head, head_dim, q.data(), q.data(), static_cast<const float *>(L.q_norm), eps);
         rms_norm(n_head_kv, head_dim, k.data(), k.data(), static_cast<const float *>(L.k_norm), eps);
@@ -343,8 +396,7 @@ struct Model::Impl {
         if (!dump_dir.empty()) dump(("dgate" + std::to_string(il)).c_str(), ffn_gate.data(), n_ff);
         mm(L.tu, n_ff, n_embd, ffn_up.data(), L.up, in.data());
         if (!dump_dir.empty()) dump(("dup" + std::to_string(il)).c_str(), ffn_up.data(), n_ff);
-        silu_inplace(ffn_gate.data(), n_ff);
-        for (size_t i = 0; i < n_ff; ++i) ffn_gate[i] *= ffn_up[i];
+        silu_mul(ffn_gate.data(), ffn_up.data(), n_ff);
         mm(L.td, n_embd, n_ff, out.data(), L.down, ffn_gate.data());
     }
 
@@ -379,7 +431,6 @@ struct Model::Impl {
             dump(("moewnorm" + std::to_string(il)).c_str(), wn.data(), n_expert_used);
         }
 
-        std::fill(out.begin(), out.end(), 0.0f);
         // One expert's matrix is a slice of the stacked tensor. The four experts
         // share one activation row, so gate and up go out as one batched call of
         // 8 matvecs instead of 8 separate pool wake-ups (EXP-0021).
@@ -422,8 +473,7 @@ struct Model::Impl {
         for (size_t i = 0; i < nu; ++i) {
             float * g = gu + (2 * i) * n_ff_exp;
             float * u = gu + (2 * i + 1) * n_ff_exp;
-            silu_inplace(g, n_ff_exp);
-            for (size_t j = 0; j < n_ff_exp; ++j) g[j] *= u[j];
+            silu_mul(g, u, n_ff_exp);
             block_q8_K * dst = aq_down + i * (n_ff_exp / QK_K);
             quantize_row_q8_K(g, dst, n_ff_exp);
             xd[i] = dst;
@@ -435,14 +485,21 @@ struct Model::Impl {
         float * down = d_down.data();
         mm_batch(L.t_de, nu, n_embd, n_ff_exp, down, wd, xd);
 
-        for (size_t i = 0; i < nu; ++i) {
-            if (!dump_dir.empty() && il == 2) {
+        if (!dump_dir.empty() && il == 2) {
+            for (size_t i = 0; i < nu; ++i) {
                 dump(("xdown" + std::to_string(i)).c_str(), down + i * n_embd, n_embd);
             }
+        }
+#if defined(__x86_64__) || defined(__i386__)
+        moe_accumulate(out.data(), down, nu, n_embd, w, wsum);
+#else
+        std::fill(out.begin(), out.end(), 0.0f);
+        for (size_t i = 0; i < nu; ++i) {
             const float wj = w[i] / wsum;
             const float * d = down + i * n_embd;
             for (size_t j = 0; j < n_embd; ++j) out[j] += wj * d[j];
         }
+#endif
     }
 
 
@@ -739,14 +796,17 @@ struct Model::Impl {
         for (size_t il = 0; il < n_layer; ++il) {
             const Layer & L = layers[il];
             if (pos == dump_pos && il == 0) dump(("emb"), x.data(), n_embd);
-            prev = x;
             { Tick tk(&t_norm, prof); rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.attn_norm), eps); }
             if (pos == dump_pos) dump(("norm" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
             { Tick tk(&t_mix, prof);
               if (L.attn) attention(il, L, norm_out, pos);
               else shortconv(il, L, norm_out, attn_out); }
             if (pos == dump_pos) dump(("mixer" + std::to_string(il)).c_str(), attn_out.data(), n_embd);
-            for (size_t j = 0; j < n_embd; ++j) x[j] = prev[j] + attn_out[j];
+#if defined(__x86_64__) || defined(__i386__)
+            vec_add_inplace(x.data(), attn_out.data(), n_embd);
+#else
+            for (size_t j = 0; j < n_embd; ++j) x[j] += attn_out[j];
+#endif
 
             rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.ffn_norm), eps);
             if (pos == dump_pos) dump(("ffnn" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
@@ -754,7 +814,11 @@ struct Model::Impl {
               if (L.moe) moe_ffn(il, L, norm_out, ffn_down);
               else dense_ffn(il, L, norm_out, ffn_down); }
             if (pos == dump_pos) dump(("ffn" + std::to_string(il)).c_str(), ffn_down.data(), n_embd);
+#if defined(__x86_64__) || defined(__i386__)
+            vec_add_inplace(x.data(), ffn_down.data(), n_embd);
+#else
             for (size_t j = 0; j < n_embd; ++j) x[j] += ffn_down[j];
+#endif
             if (pos == dump_pos) dump(("out" + std::to_string(il)).c_str(), x.data(), n_embd);
         }
         rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(out_norm), eps);

@@ -53,6 +53,14 @@ void gemv_q6_K_q8_K_mt_batch(size_t n_batch, size_t rows, size_t cols, float * o
                              const block_q6_K * const * w, const block_q8_K * const * x,
                              ThreadPool & pool);
 
+// Fused multi-threaded driver for Attention Q, K, V projections sharing one
+// activation vector. Issues a single pool dispatch covering qw (Q4_K),
+// kw (Q4_K), and vw (Q6_K) rows.
+void gemv_qkv_mt(size_t qw, size_t kw, size_t vw, size_t cols,
+                 float * q, float * k, float * v,
+                 const block_q4_K * wq, const block_q4_K * wk, const block_q6_K * wv,
+                 const block_q8_K * x, ThreadPool & pool);
+
 // ---- f32 x f32 ---------------------------------------------------------
 // Dense F32 GEMV, used for the router gate projection (e.g. 64x2048 in MoE).
 void gemv_f32_ref (size_t rows, size_t cols, float * out, const float * w, const float * x);

@@ -54,6 +54,7 @@ struct ThreadPool::Impl {
     std::atomic<unsigned> generation{0};
     std::atomic<unsigned> sleepers{0};
     std::atomic<unsigned> spin_us{200};
+    std::atomic<bool> caller_waiting{false};
     std::chrono::steady_clock::time_point last_call{};
     bool stop = false;
 
@@ -82,8 +83,10 @@ struct ThreadPool::Impl {
             }
             (*my_job)(id);
             if (waiting.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                std::lock_guard<std::mutex> lk(m);
-                cv_done.notify_one();
+                if (caller_waiting.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(m);
+                    cv_done.notify_one();
+                }
             }
         }
     }
@@ -119,14 +122,17 @@ void ThreadPool::run(const std::function<void(unsigned)> & fn) {
         impl_->spin_us.store(e ? (unsigned)std::strtoul(e, nullptr, 10) : want,
                              std::memory_order_relaxed);
     }
-    {
+    if (impl_->sleepers.load(std::memory_order_relaxed) != 0) {
         std::lock_guard<std::mutex> lk(impl_->m);
         impl_->job = &fn;
-        impl_->waiting.store(n_ - 1, std::memory_order_relaxed);
+        impl_->waiting.store(n_ - 1, std::memory_order_release);
+        impl_->generation.fetch_add(1, std::memory_order_release);
+        impl_->cv_start.notify_all();
+    } else {
+        impl_->job = &fn;
+        impl_->waiting.store(n_ - 1, std::memory_order_release);
         impl_->generation.fetch_add(1, std::memory_order_release);
     }
-    // Only wake threads that actually parked; the rest see the generation bump.
-    if (impl_->sleepers.load(std::memory_order_relaxed) != 0) impl_->cv_start.notify_all();
 
     fn(0);   // the caller participates; it is the only thread guaranteed free
 
@@ -135,7 +141,9 @@ void ThreadPool::run(const std::function<void(unsigned)> & fn) {
     for (unsigned n = 0; impl_->waiting.load(std::memory_order_acquire) != 0; ++n) {
         if (n % 32 == 0 && std::chrono::steady_clock::now() >= end) {
             std::unique_lock<std::mutex> lk(impl_->m);
+            impl_->caller_waiting.store(true, std::memory_order_release);
             impl_->cv_done.wait(lk, [&] { return impl_->waiting.load(std::memory_order_acquire) == 0; });
+            impl_->caller_waiting.store(false, std::memory_order_relaxed);
             return;
         }
         KATA_RELAX();

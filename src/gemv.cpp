@@ -579,6 +579,41 @@ void gemv_q4_K_q8_K_mt(size_t rows, size_t cols, float * out, const block_q4_K *
     });
 }
 
+void gemv_qkv_mt(size_t qw, size_t kw, size_t vw, size_t cols,
+                 float * q, float * k, float * v,
+                 const block_q4_K * wq, const block_q4_K * wk, const block_q6_K * wv,
+                 const block_q8_K * x, ThreadPool & pool) {
+    const size_t total = qw + kw + vw;
+    if (total == 0) return;
+    const GemvKNfn fn_q4 = gemv_q4_K_q8_K_best();
+    const GemvK6fn fn_q6 = gemv_q6_K_q8_K_best();
+    const unsigned nt = pool.size();
+    const size_t chunk = (total + nt - 1) / nt;
+    const size_t nb = cols / QK_K;
+
+    pool.run([&](unsigned tid) {
+        size_t r = (size_t)tid * chunk;
+        const size_t rend = std::min(total, r + chunk);
+        while (r < rend) {
+            if (r < qw) {
+                const size_t hi = std::min(rend, qw);
+                fn_q4(hi - r, cols, q + r, wq + r * nb, x);
+                r = hi;
+            } else if (r < qw + kw) {
+                const size_t ro = r - qw;
+                const size_t hi = std::min(rend - qw, kw);
+                fn_q4(hi - ro, cols, k + ro, wk + ro * nb, x);
+                r = qw + hi;
+            } else {
+                const size_t ro = r - (qw + kw);
+                const size_t hi = std::min(rend - (qw + kw), vw);
+                fn_q6(hi - ro, cols, v + ro, wv + ro * nb, x);
+                r = qw + kw + hi;
+            }
+        }
+    });
+}
+
 void gemv_f32_ref(size_t rows, size_t cols, float * out, const float * w, const float * x) {
     for (size_t r = 0; r < rows; ++r) {
         const float * wr = w + r * cols;
