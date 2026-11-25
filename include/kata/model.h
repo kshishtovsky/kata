@@ -25,6 +25,11 @@ public:
     // model and valid until the next call).
     const float * forward(uint32_t token, ModelState & st);
 
+    // A chunk of tokens in one pass. Only the logits of the LAST token are
+    // returned: a prefill of a prompt does not need the other 511 rows of a
+    // 128k-wide lm_head, and computing them would cost more than the model.
+    const float * prefill(const uint32_t * tokens, size_t n, ModelState & st);
+
     size_t n_vocab() const { return n_vocab_; }
     size_t n_embd() const { return n_embd_; }
     size_t n_layer() const { return n_layer_; }

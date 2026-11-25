@@ -26,6 +26,13 @@ void gemm_q4_K_q8_K_ref(size_t m, size_t n, size_t k, float * out, size_t ldc,
 void gemm_q6_K_q8_K_ref(size_t m, size_t n, size_t k, float * out, size_t ldc,
                         const block_q6_K * w, const block_q8_K * a);
 
+// Plain float weights, batched: the MoE router is stored as F32, so the `m`
+// tokens of one prefill chunk need their own small matmul.
+void gemm_f32(size_t m, size_t n, size_t k, float * out, size_t ldc,
+              const float * w, const float * a);
+void gemm_f32_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
+                 const float * w, const float * a, ThreadPool & pool);
+
 // Multi-threaded wrappers: rows of `n` are split into one contiguous block per
 // worker, so each worker streams a single region of the weight matrix.
 void gemm_q4_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,

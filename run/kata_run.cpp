@@ -15,12 +15,14 @@
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: kata_run <model.gguf> <tok,tok,...> [--n-ctx N] [--dump F]\n");
+        std::fprintf(stderr, "usage: kata_run <model.gguf> <tok,tok,...> [--n-ctx N] [--dump F]\n"
+                             "       kata_run <model.gguf> --tokens-file F [--n-ctx N]\n");
         return 2;
     }
     std::string model = argv[1];
     std::vector<uint32_t> toks;
-    for (const char * p = argv[2]; *p;) {
+    const int arg_start = argv[2][0] == '-' ? 2 : 3;
+    for (const char * p = arg_start == 3 ? argv[2] : ""; *p;) {
         char * end = nullptr;
         const unsigned long v = std::strtoul(p, &end, 10);
         if (end == p) break;
@@ -32,6 +34,7 @@ int main(int argc, char ** argv) {
     size_t greedy = 0;   // argmax decode in the old sense: is set by --greedy N
     size_t gen = 0;
     const char * dump = nullptr;
+    bool serial = false;   // decode the prompt one token at a time (the old path)
 
     // The GGUF itself recommends sampling parameters; use them unless overridden.
     kata::SamplerConfig cfg;
@@ -49,7 +52,7 @@ int main(int argc, char ** argv) {
         // EOG id (124895) that the vocab flags as end-of-generation.
         if (f.has_key("tokenizer.ggml.eos_token_id")) eos = f.u32("tokenizer.ggml.eos_token_id");
     }
-    for (int i = 3; i + 1 < argc; ++i) {
+    for (int i = arg_start; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--n-ctx")) n_ctx = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--greedy")) greedy = std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--gen")) gen = std::strtoul(argv[++i], nullptr, 10);
@@ -60,6 +63,14 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--seed")) cfg.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--repeat-last-n")) cfg.repeat_last_n = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--dump")) dump = argv[++i];
+        else if (!std::strcmp(argv[i], "--serial")) serial = true;
+        else if (!std::strcmp(argv[i], "--tokens-file")) {
+            FILE * f = std::fopen(argv[++i], "rb");
+            if (!f) { std::perror("tokens-file"); return 2; }
+            uint32_t v;
+            while (std::fread(&v, sizeof v, 1, f) == 1) toks.push_back(v);
+            std::fclose(f);
+        }
     }
     (void)have_tp; (void)have_pp; (void)have_tk;
     std::fprintf(stderr, "sampling: temp=%.3f top_k=%d top_p=%.3f repeat=%.3f\n",
@@ -74,7 +85,18 @@ int main(int argc, char ** argv) {
     std::vector<uint32_t> history(toks);
     const float * logits = nullptr;
     const auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t t : toks) logits = m.forward(t, st);
+    // Prefill the prompt as one chunk, then decode: a prompt token re-decoded
+    // one at a time is the same arithmetic with the weights read 512 times.
+    const auto p0 = std::chrono::steady_clock::now();
+    if (toks.size() > 1 && !serial) {
+        logits = m.prefill(toks.data(), toks.size(), st);
+    } else {
+        for (uint32_t t : toks) logits = m.forward(t, st);
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
+    if (toks.size() > 1 && !serial)
+        std::fprintf(stderr, "prefill %zu tok in %.2f ms = %.1f tok/s\n",
+                     toks.size(), prefill_ms, 1000.0 * toks.size() / prefill_ms);
     double gen_ms = 0.0;
     if (gen) {
         const auto g0 = std::chrono::steady_clock::now();

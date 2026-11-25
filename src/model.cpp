@@ -12,9 +12,11 @@
 
 #include "kata/attn.h"
 #include "kata/gguf.h"
+#include "kata/gemm.h"
 #include "kata/gemv.h"
 #include "kata/norm.h"
 #include "kata/pool.h"
+#include "kata/prefill.h"
 #include "kata/quant.h"
 #include "kata/rope.h"
 #include "kata/types.h"
@@ -112,13 +114,27 @@ struct Model::Impl {
     std::vector<float> ffn_gate, ffn_up, ffn_down, moe_acc;
     std::vector<float> logits;
     std::vector<block_q8_K> aq;
+    // Decode-path scratch that used to be allocated per call. Steady-state
+    // decode was paying a malloc/free for every one of the 30 shortconv layers.
+    std::vector<block_q8_K> spr_3, spr_ao;
+    std::vector<float> spr_out;
     float * logits_ptr = nullptr;
+
+    // Prefill works on a chunk of tokens at a time; every buffer below is
+    // [ubatch][width] and reused across chunks.
+    size_t ubatch = 1;
+    std::vector<float> px, pprev, pnorm, pffn, pffn2, pffn_out;
+    std::vector<float> pq, pk, pv, pattn, pbcx, pexpacc;
+    std::vector<float> pconv_out, gact, ggate, gup;
+    std::vector<block_q8_K> paq, paq2;
     ThreadPool pool{ThreadPool::default_threads()};
 
     // Set KATA_DUMP=<dir> to write intermediates for diffing against a reference.
     std::string dump_dir;
     // Per-phase wall clock, printed only when KATA_PROF is set.
     bool prof = std::getenv("KATA_PROF") != nullptr;
+    size_t dump_pos = 0;
+    bool router_log = std::getenv("KATA_ROUTER") != nullptr;   // KATA_DUMP_POS: which decode position the per-layer dumps capture
     double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
     size_t n_mm = 0;
     struct Tick { double * acc; std::chrono::steady_clock::time_point t0; bool on;
@@ -153,6 +169,33 @@ struct Model::Impl {
         logits.assign(n_vocab, 0.0f);
         logits_ptr = logits.data();
         aq.assign(std::max({n_embd, n_ff, n_ff_exp}) / QK_K + 1, {});
+        spr_3.assign(3 * n_embd / QK_K, {});
+        spr_ao.assign(n_embd / QK_K, {});
+        spr_out.assign(n_embd, 0.0f);
+
+        ubatch = std::min<size_t>(n_ctx, 512);
+        if (const char * d = std::getenv("KATA_DUMP_POS")) dump_pos = std::strtoul(d, nullptr, 10);
+        if (const char * u = std::getenv("KATA_UBATCH")) ubatch = std::max<size_t>(1, std::strtoul(u, nullptr, 10));
+        const size_t pkv = n_head_kv * head_dim;
+        const size_t wide = std::max(n_ff, n_ff_exp);
+        px.assign(ubatch * n_embd, 0.0f);
+        pprev.assign(ubatch * n_embd, 0.0f);
+        pnorm.assign(ubatch * n_embd, 0.0f);
+        pffn.assign(ubatch * wide, 0.0f);
+        pffn2.assign(ubatch * wide, 0.0f);
+        pffn_out.assign(ubatch * n_embd, 0.0f);
+        pq.assign(ubatch * n_head * head_dim, 0.0f);
+        pk.assign(ubatch * pkv, 0.0f);
+        pv.assign(ubatch * pkv, 0.0f);
+        pattn.assign(ubatch * n_head * head_dim, 0.0f);
+        pbcx.assign(ubatch * 3 * n_embd, 0.0f);
+        pexpacc.assign(ubatch * n_embd, 0.0f);
+        pconv_out.assign(ubatch * n_embd, 0.0f);
+        gact.assign(ubatch * n_embd, 0.0f);
+        ggate.assign(ubatch * n_ff_exp, 0.0f);
+        gup.assign(ubatch * n_ff_exp, 0.0f);
+        paq.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
+        paq2.assign(ubatch * std::max({n_embd, n_ff, n_ff_exp}) / QK_K, {});
     }
 
     // Quantises the activation block and runs one quantised matvec.
@@ -200,16 +243,14 @@ struct Model::Impl {
 
     void shortconv(size_t il, const Layer & L, const std::vector<float> & in, std::vector<float> & out) {
         // in_proj emits b, c, x as three contiguous chunks of n_embd.
-        std::vector<block_q8_K> a(3 * n_embd / QK_K);
-        quantize_row_q8_K(in.data(), a.data(), 3 * n_embd);
-        gemv_quant(L.t_in, 3 * n_embd, n_embd, bcx.data(), L.in_proj, a.data(), pool);
+        quantize_row_q8_K(in.data(), spr_3.data(), 3 * n_embd);
+        gemv_quant(L.t_in, 3 * n_embd, n_embd, bcx.data(), L.in_proj, spr_3.data(), pool);
 
         const size_t d_conv = l_cache - 1;
         float * hist = conv_state.data() + il * d_conv * n_embd;
         // conv.weight is ggml [3, n_embd]: ne[0]=3 varies fastest, so channel e
         // owns the three consecutive floats kern[e*3 .. e*3+2].
         const float * kern = static_cast<const float *>(L.conv);
-        std::vector<float> conv_out(n_embd);
         const float * b = bcx.data();
         const float * c = bcx.data() + n_embd;
         const float * xx = bcx.data() + 2 * n_embd;
@@ -219,16 +260,15 @@ struct Model::Impl {
             float s = k3[0] * hist[0 * n_embd + e]
                     + k3[1] * hist[1 * n_embd + e]
                     + k3[2] * bxe;
-            conv_out[e] = c[e] * s;
+            spr_out[e] = c[e] * s;
         }
         // Shift the history window: newest bx becomes hist[d_conv-1].
         for (size_t e = 0; e < n_embd; ++e) {
             for (size_t j = 0; j + 1 < d_conv; ++j) hist[j * n_embd + e] = hist[(j + 1) * n_embd + e];
             hist[(d_conv - 1) * n_embd + e] = b[e] * xx[e];
         }
-        std::vector<block_q8_K> ao(n_embd / QK_K);
-        quantize_row_q8_K(conv_out.data(), ao.data(), n_embd);
-        gemv_quant(L.t_out, n_embd, n_embd, out.data(), L.out_proj, ao.data(), pool);
+        quantize_row_q8_K(spr_out.data(), spr_ao.data(), n_embd);
+        gemv_quant(L.t_out, n_embd, n_embd, out.data(), L.out_proj, spr_ao.data(), pool);
     }
 
     void attention(size_t il, const Layer & L, const std::vector<float> & in, size_t pos) {
@@ -372,30 +412,247 @@ struct Model::Impl {
         }
     }
 
+
+    // ---- prefill helpers -------------------------------------------------
+
+    // One quantised matmul over m token rows. mi is the block index of a row.
+    void mmn(uint32_t type, size_t rows, size_t cols, float * out, size_t ldc,
+             const void * w, const block_q8_K * a, size_t m) {
+        switch (type) {
+            case 12: gemm_q4_K_q8_K_mt(m, rows, cols, out, ldc,
+                                       static_cast<const block_q4_K *>(w), a, pool); break;
+            case 14: gemm_q6_K_q8_K_mt(m, rows, cols, out, ldc,
+                                       static_cast<const block_q6_K *>(w), a, pool); break;
+            default: throw std::runtime_error("kata: unsupported weight type in prefill: " + std::to_string(type));
+        }
+    }
+
+    // Quantises m contiguous activation rows of `cols` floats each.
+    void q8_rows(const float * a, size_t m, size_t cols, block_q8_K * dst) {
+        const size_t nb = cols / QK_K;
+        for (size_t i = 0; i < m; ++i) quantize_row_q8_K(a + i * cols, dst + i * nb, cols);
+    }
+
+    void embed_rows(const uint32_t * tokens, size_t m) {
+        if (t_tok_embd != 14) throw std::runtime_error("kata: token_embd must be q6_K");
+        const size_t nb = n_embd / QK_K;
+        const uint8_t * base = static_cast<const uint8_t *>(tok_embd);
+        for (size_t i = 0; i < m; ++i)
+            dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(base + tokens[i] * nb * sizeof(block_q6_K)),
+                                px.data() + i * n_embd, n_embd);
+    }
+
+    // shortconv over a whole chunk. One row was the encode path; here every row
+    // has its own 2-token history, and the recurrence within the chunk is the
+    // same three-tap filter applied in order.
+    void shortconv_rows(size_t il, const Layer & L, size_t m) {
+        const size_t nc3 = 3 * n_embd;
+        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        mmn(L.t_in, nc3, n_embd, pbcx.data(), nc3, L.in_proj, paq.data(), m);
+
+        const size_t d_conv = l_cache - 1;
+        float * hist = conv_state.data() + il * d_conv * n_embd;
+        const float * kern = static_cast<const float *>(L.conv);
+        for (size_t i = 0; i < m; ++i) {
+            const float * b = pbcx.data() + i * nc3;
+            const float * c = b + n_embd;
+            const float * xx = b + 2 * n_embd;
+            float * o = pconv_out.data() + i * n_embd;
+            for (size_t e = 0; e < n_embd; ++e) {
+                const float bxe = b[e] * xx[e];
+                const float * k3 = kern + e * 3;
+                o[e] = c[e] * (k3[0] * hist[0 * n_embd + e] + k3[1] * hist[1 * n_embd + e] + k3[2] * bxe);
+            }
+            for (size_t e = 0; e < n_embd; ++e) {
+                for (size_t j = 0; j + 1 < d_conv; ++j) hist[j * n_embd + e] = hist[(j + 1) * n_embd + e];
+                hist[(d_conv - 1) * n_embd + e] = b[e] * xx[e];
+            }
+        }
+        q8_rows(pconv_out.data(), m, n_embd, paq.data());
+        mmn(L.t_out, n_embd, n_embd, pattn.data(), n_embd, L.out_proj, paq.data(), m);
+    }
+
+    void attention_rows(size_t il, const Layer & L, size_t m, size_t pos0) {
+        const size_t qw = n_head * head_dim;
+        const size_t kvw = n_head_kv * head_dim;
+        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        mmn(L.tq, qw, n_embd, pq.data(), qw, L.wq, paq.data(), m);
+        mmn(L.tk, kvw, n_embd, pk.data(), kvw, L.wk, paq.data(), m);
+        mmn(L.tv, kvw, n_embd, pv.data(), kvw, L.wv, paq.data(), m);
+
+        // Per-head norm happens before RoPE, at row granularity, so it is one
+        // call over m*n_head rows.
+        rms_norm(m * n_head, head_dim, pq.data(), pq.data(), static_cast<const float *>(L.q_norm), eps);
+        rms_norm(m * n_head_kv, head_dim, pk.data(), pk.data(), static_cast<const float *>(L.k_norm), eps);
+        for (size_t i = 0; i < m; ++i) {
+            const size_t pos = pos0 + i;
+            rope(n_head, head_dim, pq.data() + i * qw, pos, rope_base, false);
+            rope(n_head_kv, head_dim, pk.data() + i * kvw, pos, rope_base, false);
+            std::memcpy(k_cache.data() + (il * n_ctx + pos) * kvw, pk.data() + i * kvw, kvw * sizeof(float));
+            std::memcpy(v_cache.data() + (il * n_ctx + pos) * kvw, pv.data() + i * kvw, kvw * sizeof(float));
+        }
+        attention_prefill(pq.data(), m, k_cache.data() + il * n_ctx * kvw,
+                          v_cache.data() + il * n_ctx * kvw, pos0, n_head, n_head_kv,
+                          head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)),
+                          pattn.data());
+        q8_rows(pattn.data(), m, qw, paq.data());
+        mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
+    }
+
+    void dense_ffn_rows(size_t il, const Layer & L, size_t m) {
+        q8_rows(pnorm.data(), m, n_embd, paq.data());
+        mmn(L.tg, n_ff, n_embd, pffn.data(), n_ff, L.gate, paq.data(), m);
+        mmn(L.tu, n_ff, n_embd, pffn2.data(), n_ff, L.up, paq.data(), m);
+        for (size_t i = 0; i < m * n_ff; ++i) {
+            const float g = pffn[i];
+            pffn[i] = (g / (1.0f + std::exp(-g))) * pffn2[i];
+        }
+        q8_rows(pffn.data(), m, n_ff, paq.data());
+        mmn(L.td, n_embd, n_ff, pffn_out.data(), n_embd, L.down, paq.data(), m);
+    }
+
+    // MoE over m rows. Every (token, expert) pair becomes one row of a gathered
+    // matrix, pairs are grouped by expert so each expert's three matrices are
+    // touched once per chunk, and the results scatter back with the router
+    // weight. This is the shape that makes prefill worth doing: at m=1 the same
+    // expert is loaded 4 times per token, here it is loaded once for all the
+    // tokens that picked it.
+    void moe_ffn_rows(size_t il, const Layer & L, size_t m) {
+        const float * bias = static_cast<const float *>(L.exp_probs_b);
+        std::vector<float> probs(m * n_expert);
+        gemm_f32_mt(m, n_expert, n_embd, probs.data(), n_expert,
+                    static_cast<const float *>(L.gate_inp), pnorm.data(), pool);
+        for (auto & v : probs) v = sigmoid_gate ? 1.0f / (1.0f + std::exp(-v)) : v;
+
+        struct Pair { uint32_t expert, token; float weight; };
+        std::vector<Pair> pairs;
+        pairs.reserve(m * n_expert_used);
+        for (size_t t = 0; t < m; ++t) {
+            const float * p = probs.data() + t * n_expert;
+            std::vector<std::pair<float, uint32_t>> sel(n_expert);
+            for (size_t e = 0; e < n_expert; ++e) sel[e] = { p[e] + bias[e], static_cast<uint32_t>(e) };
+            std::partial_sort(sel.begin(), sel.begin() + n_expert_used, sel.end(),
+                              [](const auto & a, const auto & b) { return a.first > b.first; });
+            float wsum = 0.0f;
+            for (size_t i = 0; i < n_expert_used; ++i) wsum += p[sel[i].second];
+            if (wsum < 6.103515625e-5f) wsum = 6.103515625e-5f;
+            for (size_t i = 0; i < n_expert_used; ++i)
+                pairs.push_back({sel[i].second, static_cast<uint32_t>(t), p[sel[i].second] / wsum});
+            if (router_log) {
+                std::fprintf(stderr, "router serial il=%zu [", il);
+                for (size_t i = 0; i < n_expert_used; ++i) std::fprintf(stderr, " %u", sel[i].second);
+                std::fprintf(stderr, " ]\n");
+            }
+        }
+        std::sort(pairs.begin(), pairs.end(),
+                  [](const Pair & a, const Pair & b) { return a.expert < b.expert; });
+
+        // One row per (token, expert) pair, i.e. m*n_expert_used rows, not m.
+        const size_t np = m * n_expert_used;
+        std::vector<block_q8_K> aq_g(np * (n_ff_exp / QK_K)), aq_d(np * (n_ff_exp / QK_K));
+        std::vector<float> gout(np * n_ff_exp), uout(np * n_ff_exp), dout(np * n_embd);
+        std::fill(pexpacc.begin(), pexpacc.begin() + m * n_embd, 0.0f);
+
+        const size_t sb_g = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ge);
+        const size_t sb_u = n_ff_exp * n_embd / QK_K * ggml_type_size(L.t_ue);
+        const size_t sb_d = n_embd * n_ff_exp / QK_K * ggml_type_size(L.t_de);
+        const uint8_t * bg = static_cast<const uint8_t *>(L.gate_exps);
+        const uint8_t * bu = static_cast<const uint8_t *>(L.up_exps);
+        const uint8_t * bd = static_cast<const uint8_t *>(L.down_exps);
+
+        for (size_t first = 0; first < pairs.size();) {
+            size_t last = first;
+            while (last < pairs.size() && pairs[last].expert == pairs[first].expert) ++last;
+            const size_t c = last - first;
+            const uint32_t e = pairs[first].expert;
+
+            for (size_t i = 0; i < c; ++i)
+                std::memcpy(gact.data() + i * n_embd, pnorm.data() + pairs[first + i].token * n_embd,
+                            n_embd * sizeof(float));
+            q8_rows(gact.data(), c, n_embd, aq_g.data());
+            mmn(L.t_ge, n_ff_exp, n_embd, gout.data(), n_ff_exp, bg + e * sb_g, aq_g.data(), c);
+            mmn(L.t_ue, n_ff_exp, n_embd, uout.data(), n_ff_exp, bu + e * sb_u, aq_g.data(), c);
+            for (size_t i = 0; i < c * n_ff_exp; ++i) {
+                const float g = gout[i];
+                gout[i] = (g / (1.0f + std::exp(-g))) * uout[i];
+            }
+            q8_rows(gout.data(), c, n_ff_exp, aq_d.data());
+            mmn(L.t_de, n_embd, n_ff_exp, dout.data(), n_embd, bd + e * sb_d, aq_d.data(), c);
+            for (size_t i = 0; i < c; ++i) {
+                const float * d = dout.data() + i * n_embd;
+                float * acc = pexpacc.data() + pairs[first + i].token * n_embd;
+                const float wj = pairs[first + i].weight;
+                for (size_t j = 0; j < n_embd; ++j) acc[j] += wj * d[j];
+            }
+            first = last;
+        }
+        for (size_t i = 0; i < m; ++i)
+            std::memcpy(pffn_out.data() + i * n_embd, pexpacc.data() + i * n_embd, n_embd * sizeof(float));
+    }
+
+    const float * prefill(const uint32_t * tokens, size_t n, ModelState & st) {
+        if (n == 0) throw std::runtime_error("kata: empty prefill");
+        if (st.pos + n > n_ctx) throw std::runtime_error("kata: context full");
+        for (size_t done = 0; done < n; done += ubatch) {
+            const size_t m = std::min(ubatch, n - done);
+            const size_t pos0 = st.pos + done;
+            const auto t_start = std::chrono::steady_clock::now();
+            embed_rows(tokens + done, m);
+            for (size_t il = 0; il < n_layer; ++il) {
+                const Layer & L = layers[il];
+                std::memcpy(pprev.data(), px.data(), m * n_embd * sizeof(float));
+                rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.attn_norm), eps);
+                if (L.attn) attention_rows(il, L, m, pos0);
+                else shortconv_rows(il, L, m);
+                for (size_t i = 0; i < m * n_embd; ++i) px[i] = pprev[i] + pattn[i];
+
+                rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps);
+                if (L.moe) moe_ffn_rows(il, L, m);
+                else dense_ffn_rows(il, L, m);
+                for (size_t i = 0; i < m * n_embd; ++i) px[i] += pffn_out[i];
+                if (!dump_dir.empty() && done + m == n)
+                    dump(("pout" + std::to_string(il)).c_str(), px.data() + (m - 1) * n_embd, n_embd);
+            }
+            // Only the last row of the last chunk needs the vocabulary projection.
+            if (done + m == n) {
+                const float * last = px.data() + (m - 1) * n_embd;
+                rms_norm(1, n_embd, pnorm.data(), last, static_cast<const float *>(out_norm), eps);
+                mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd, pnorm.data());
+            }
+            if (prof) {
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                std::fprintf(stderr, "[prefill] chunk %zu tok in %.2f ms = %.1f tok/s\n", m, ms, 1000.0 * m / ms);
+            }
+        }
+        st.pos += n;
+        return logits.data();
+    }
+
     const float * forward(uint32_t token, ModelState & st) {
         if (st.pos >= n_ctx) throw std::runtime_error("kata: context full");
         const size_t pos = st.pos;
         { Tick tk(&t_emb, prof); embed(token); }
         for (size_t il = 0; il < n_layer; ++il) {
             const Layer & L = layers[il];
-            if (pos == 0 && il == 0) dump(("emb"), x.data(), n_embd);
+            if (pos == dump_pos && il == 0) dump(("emb"), x.data(), n_embd);
             prev = x;
             { Tick tk(&t_norm, prof); rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.attn_norm), eps); }
-            if (pos == 0) dump(("norm" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
+            if (pos == dump_pos) dump(("norm" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
             { Tick tk(&t_mix, prof);
               if (L.attn) attention(il, L, norm_out, pos);
               else shortconv(il, L, norm_out, attn_out); }
-            if (pos == 0) dump(("mixer" + std::to_string(il)).c_str(), attn_out.data(), n_embd);
+            if (pos == dump_pos) dump(("mixer" + std::to_string(il)).c_str(), attn_out.data(), n_embd);
             for (size_t j = 0; j < n_embd; ++j) x[j] = prev[j] + attn_out[j];
 
             rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.ffn_norm), eps);
-            if (pos == 0) dump(("ffnn" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
+            if (pos == dump_pos) dump(("ffnn" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
             { Tick tk(&t_ffn, prof);
               if (L.moe) moe_ffn(il, L, norm_out, ffn_down);
               else dense_ffn(il, L, norm_out, ffn_down); }
-            if (pos == 0) dump(("ffn" + std::to_string(il)).c_str(), ffn_down.data(), n_embd);
+            if (pos == dump_pos) dump(("ffn" + std::to_string(il)).c_str(), ffn_down.data(), n_embd);
             for (size_t j = 0; j < n_embd; ++j) x[j] += ffn_down[j];
-            if (pos == 0) dump(("out" + std::to_string(il)).c_str(), x.data(), n_embd);
+            if (pos == dump_pos) dump(("out" + std::to_string(il)).c_str(), x.data(), n_embd);
         }
         rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(out_norm), eps);
         { Tick tk(&t_lm, prof); mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd, norm_out.data()); }
@@ -494,5 +751,9 @@ void Model::reset() {
 }
 
 const float * Model::forward(uint32_t token, ModelState & st) { return p_->forward(token, st); }
+
+const float * Model::prefill(const uint32_t * tokens, size_t n, ModelState & st) {
+    return p_->prefill(tokens, n, st);
+}
 
 } // namespace kata

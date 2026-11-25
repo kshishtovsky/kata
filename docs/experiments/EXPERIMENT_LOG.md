@@ -24,7 +24,9 @@
 | EXP-0020 | Where the per-token time goes | PASSED | 76% in the two GEMV kernels; 503 mm calls/token, dispatch-bound |
 | EXP-0021 | Batched expert GEMV (one pool wake per layer) | PASSED | 1.40x at 8 threads, 1.72x at 16; 32.7 -> 26.4-28.8 ms/token |
 | EXP-0022 | Sampler (top_k/top_p/temp/repeat penalty/eos) | PASSED | 0.44% of a token; generation stops at EOG in 3/3 seeds |
-| EXP-0023 | Batched prefill GEMM, phase A | IN_PROGRESS | 1.7-4.4x over per-row GEMV, relerr 1e-7; ALU-bound at ~350 GMAC/s |
+| EXP-0023 | Batched prefill GEMM, phase A | PASSED | 1.7-7.1x over per-row GEMV, relerr 1e-7; prefill wired end to end |
+| EXP-0024 | AVX-512 VNNI microkernel for prefill GEMM | PASSED | 160.7 vs 57.5 GMAC/s (2.79x); prefill 113 -> 145.7 tok/s |
+| EXP-0025 | Load-guard pool fix + honest CPU baseline | PASSED | spin 15.8% -> 5.3%; llama.cpp CPU prefill is 441 tok/s, not 4540 |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -1486,11 +1488,10 @@ Keep. Without a sampler the engine cannot be used at all, and the cost is 0.4%.
 Prefill in batches: at 28.5 ms/token the first 32 prompt tokens cost 0.9 s of
 pure decode that llama.cpp does at 199 tok/s.
 
-## EXP-0023 — Batched prefill GEMM (phase A), in progress
+## EXP-0023 — Batched prefill GEMM (phase A)
 
-**Status:** IN_PROGRESS. The GEMM is written, tested and faster than the GEMV it
-replaces, but the prefill path itself is not wired into the model yet, so there
-is no tok/s number for prefill.
+**Status:** PASSED. Wired into `src/model.cpp` as `prefill()`; 512-token prompt
+runs at 113-127 tok/s before EXP-0024 and 145.7 after.
 
 **Hypothesis.** The decode kernel unpacks a weight block once per activation
 row. In prefill that means a 2048x2048 layer's 2.4 MB of weights is re-read 512
@@ -1556,3 +1557,90 @@ tok/s, not 4500.
 **Next.** Use `vpdpbusd` for the q4_K value term (phase B), keep `maddubs` for
 q6_K, then wire `gemm_*_mt` into `Impl::mm` with a token-tile parameter and
 measure `kata-prefill` against `kata-decode` on the same 32k text.
+
+## EXP-0024 — AVX-512 VNNI microkernel for the prefill GEMM
+
+**Status:** PASSED. 160.7 GMAC/s single thread vs 57.5 for the AVX2 path
+(2.79x); end-to-end prefill 113 -> 145.7 tok/s on a real 544-token prompt.
+
+**Hypothesis.** EXP-0023 established the prefill GEMM is instruction-bound, not
+traffic-bound: time per token is flat across m = 32..1024 because L3 absorbs the
+weight re-reads. `perf stat` gave 350 GMAC/s ceiling for the maddubs path. AVX-512
+VNNI does 64 int8 MACs per instruction, so the instruction count per MAC is the
+lever, and nothing else.
+
+**Design.** 8 weight rows x 16 tokens per register tile (`VRN`, `VTN`).
+`vpdpbusd` needs one weight byte per k value, so q4_K's nibbles are widened to a
+byte each and the activation's q8 codes are packed 4-per-u32 so one zmm load
+covers 16 tokens x 4 k values.
+
+**Two register-allocation traps, both load-bearing:**
+- Every loop over the 8 rows needs `#pragma GCC unroll 8`. With a runtime row
+  index GCC keeps the accumulators in memory and emits
+  `load zmm / vpdpbusd / store zmm` -- the objdump showed `sub $0x880,%rsp` and
+  exactly **1** `vpdpbusd` in the whole binary. Throughput was 74 GMAC/s.
+- The min term must be summed in its own pass over sub-blocks. Folded into the
+  dpbusd loop it costs 8 more live zmm and spills.
+
+After both fixes: 64 `vpdpbusd` in the binary, 4.74 MAC/instruction (AVX2 path:
+1.8; ggml's tiled kernel: 6.6), relerr 3.656e-07, bad 0/1048576.
+
+**Second win, found by perf.** After the kernel was correct the profile put 43%
+in `q4_K_vnni_rows` -- the weight unpack, not the math. It was widening nibbles
+byte by byte (512 scalar ops per block). Replaced with one `_mm256_loadu_si256`
++ `srli`/`and` + `_mm256_store_si256` per sub-block pair: prefill 113 -> 143 tok/s
+on its own. `q4_K_scale_min` is still 3.7% and is the next target there.
+
+**Measurements** (16 threads, `KATA_DUTY=1.0`, real 544-token prompt via
+`--tokens-file`, `kata_run ... --n-ctx 1024 --gen 1`):
+
+| stage | prefill tok/s |
+|---|---|
+| per-token decode loop (no batching) | 21 |
+| EXP-0023 AVX2 batched GEMM | 113-127 |
+| + VNNI microkernel | 130.5 |
+| + vectorised weight unpack | 143.0-145.7 |
+
+ubatch sweep at 544 tokens: 128 -> 74.8, 256 -> 130.5, 512 -> 142.0 tok/s.
+Thread sweep: 4 -> 106.4, 8 -> 137.5, 12 -> 134.6, 16 -> 145.7 tok/s.
+
+**Remaining profile** (39.6% `q4_K_vnni_tile`, 15.0% `gemm_q6_K_row_mr` -- q6_K
+has no VNNI path at all, 10.6% weight unpack, 4.5% `quantize_row_q8_K`, 4.5%
+`pack_a_tiles`, 3.7% `q4_K_scale_min`). q6_K is the largest single remaining
+item and is next.
+
+**Next.** VNNI for q6_K (15% of prefill plus all of `down_exps`, `attn_v` and
+`token_embd`), then hoist `q4_K_scale_min` out of the hot loop.
+
+## EXP-0025 — Honest CPU baseline: `-ngl 0` is not CPU on this fork
+
+**Status:** PASSED (measurement correction). The prefill bar is 441 tok/s, not
+4540; decode parity is 45 tok/s, not 30.5.
+
+**What was wrong.** Every llama.cpp reference number in EXP-0019 through EXP-0024
+was taken with `-ngl 0`, which on upstream llama.cpp means "no GPU layers" but on
+this fork does **not**: the fork keeps MoE experts in a host table and caches
+them on the GPU regardless of `-ngl`, announcing itself as
+`moe_cache_preflight: auto cache preflight: device 0 projected arena 19390.0 MiB
+(free 20414.0 - reserve 1024.0 - aux 0.0) >= floor 2376.5 MiB (host experts
+13203.0 MiB); cache stays on`. So pp512 = 4539.68 was a CPU+GPU number.
+
+**Correct baseline.** `HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES=""` (the
+devices must be hidden from the backend, not just unused) gives, on the same
+model, 16 threads:
+
+| metric | llama.cpp CPU | kata | ratio |
+|---|---|---|---|
+| pp512 (`llama-bench`) | 441.36 +/- 11.76 tok/s | 145.7 | 3.03x slower |
+| pp4096 | 419.35 tok/s | not measured | -- |
+| tg128 (`llama-bench`) | 44.97 tok/s | 34.9 | 1.29x slower |
+| pp512 (`llama-cli -f`) | 390.3 tok/s | 145.7 | 2.68x slower |
+
+`llama-cli -f` and `llama-bench` agree to 12% once the GPU is hidden, so the
+earlier claim in EXP-0023 that `llama-bench` "overstates prefill 4.5x" was an
+artifact of the same GPU cache, not of the benchmark method.
+
+**Consequence for the roadmap.** kata is behind llama.cpp on both prefill (3.0x)
+and decode (1.3x). The measured kernel throughput ceiling for the ggml tiled
+kernels is 2029 GMAC/s at 16 threads, which for 512 tokens corresponds to ~900
+tok/s, so 441 is implementation, not silicon.
