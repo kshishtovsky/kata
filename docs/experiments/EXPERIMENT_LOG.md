@@ -1628,6 +1628,7 @@ on its own. `q4_K_scale_min` is still 3.7% and is the next target there.
 | EXP-0061 | Instruction audit of the q4_K VNNI tile (55% of peak) | PASSED | broadcast per `vpdpbusd` caps the shape at 50% of peak; VRN 16/4, float epilogue and broadcast forms all measured worse |
 | EXP-0062 | `{1to16}` weight broadcast in the VNNI tile | FAILED | compiles to 64 zero-broadcast products but broadcasts src2 (activations) not src1 (weights); rel err 11-32; neutral speed even when wrong |
 | EXP-0063 | Repack weights once per layer; float epilogue | REJECTED | repack removes nothing (0.7% at m=512, reviewer verified); broadcast is worth 2.0% not 50% (270.3 vs 275.6 GMAC/s); float epilogue 52.7-53.6% vs 54.6-54.0% |
+| EXP-0064 | Fold the q4_K min pass into the main loop | REJECTED | int accs spill 18→46 refs (49.9% vs 54.6%); float accs spill 18→29 (53.5% vs 54.6%); the second sweep is what keeps 24 live zmm out of 32 |
 | + VNNI microkernel | 130.5 |
 | + vectorised weight unpack | 143.0-145.7 |
 
