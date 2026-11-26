@@ -485,8 +485,12 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
     const size_t g = a.n_heads / a.n_kv_heads;
 
     // Only the G=4, head_dim%16==0 shape has a register-resident v pass.
+    // The per-head fallback ignores gb0/gb1 and writes every head, so a sliced
+    // call must NOT fall back: two workers doing it would race on a.out. The MT
+    // driver already keeps nw == 1 for these shapes; this makes that a property
+    // of the kernel instead of a property of its caller.
     if (g != 4 || hd % 16 != 0 || hd > 64) {
-        attention_decode_avx2(a, scratch);
+        if (gb0 == 0 && gb1 == a.n_kv_heads) attention_decode_avx2(a, scratch);
         return;
     }
 
