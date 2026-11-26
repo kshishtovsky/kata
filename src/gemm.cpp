@@ -268,10 +268,21 @@ struct alignas(64) VwBand {
     float d[VRN], dmin[VRN];
 };
 
+void pack_a_tiles(const block_q8_K * a, size_t m, size_t nb, std::vector<VaTile> & tiles);
+void pack_a_tiles(const block_q8_K * a, size_t m, size_t nb, size_t jt0, size_t jt1,
+                  std::vector<VaTile> & tiles);
+
 void pack_a_tiles(const block_q8_K * a, size_t m, size_t nb, std::vector<VaTile> & tiles) {
     const size_t ntile = (m + VTN - 1) / VTN;
     tiles.assign(ntile * nb, VaTile{});
-    for (size_t jt = 0; jt < ntile; ++jt) {
+    pack_a_tiles(a, m, nb, 0, ntile, tiles);
+}
+
+// Tile range form, so the mt driver can spread the pack across the pool. Tiles
+// are independent (each reads its own 16 rows), so this needs no locking.
+void pack_a_tiles(const block_q8_K * a, size_t m, size_t nb, size_t jt0, size_t jt1,
+                  std::vector<VaTile> & tiles) {
+    for (size_t jt = jt0; jt < jt1; ++jt) {
         const size_t nt = std::min(VTN, m - jt * VTN);
         for (size_t b = 0; b < nb; ++b) {
             VaTile & t = tiles[jt * nb + b];
@@ -647,10 +658,17 @@ void gemm_q4_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
     }
     // The activation tiles depend only on `a`, not on the weight chunk, so pack
     // them once here. Packing inside each worker packed n/nt copies of the same
-    // bytes and showed up as 4.4% of prefill.
-    std::vector<VaTile> tiles;
-    pack_a_tiles(a, m, nb, tiles);
+    // bytes and showed up as 4.4% of prefill. The pack itself is parallel over
+    // tiles: at n=1536 it was 0.10 ms of a 0.72 ms call, i.e. 30% of a bucket
+    // that the engine runs 1852 times per 1024-token chunk.
     const size_t ntile = (m + VTN - 1) / VTN;
+    std::vector<VaTile> tiles(ntile * nb);
+    const size_t pchunk = (ntile + nt - 1) / nt;
+    pool.run([&](unsigned tid) {
+        const size_t j0 = std::min(ntile, (size_t)tid * pchunk);
+        const size_t j1 = std::min(ntile, j0 + pchunk);
+        if (j0 < j1) pack_a_tiles(a, m, nb, j0, j1, tiles);
+    });
     const size_t chunk = (n + nt - 1) / nt;
     pool.run([&](unsigned tid) {
         const size_t lo = std::min(n, (size_t)tid * chunk);
