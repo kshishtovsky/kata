@@ -46,6 +46,7 @@
 | EXP-0043 | Parallel decode attention by kv head | PASSED | 16k decode 79.6 -> 37.2 ms/token (12.6 -> 26.9 tok/s, 2.14x); 8k 51.2 -> 29.6; 2k 29.5 -> 24.3; exact split by construction (kv heads share nothing) |
 | EXP-0044 | Phase profiler measured inside the real grouped kernel | PASSED | profiler covered code the kernel no longer ran; corrected split at 8k is FFN 49%, attention core 24%, shortconv 14%, lm_head 10%; KV walk at 49.2 GB/s of 78 |
 | EXP-0045 | Head-major KV cache `[kv_head][position][head_dim]` | PASSED | KV walk 45.0 -> 73.3 GB/s at 8k (1.63x) and 44.4 -> 74.1 at 32k; decode 8k 26.9 -> 37.2 tok/s, 16k 32.0, 512 unchanged 44.6; prefill 25k 336 tok/s; layouts agree bit-exactly |
+| EXP-0046 | Prompt-lookup draft acceptance for speculative decoding | FAILED | greedy acceptance 0.08-0.13 tok/cycle on code, 0.10-0.18 on dialogue, 0.49-1.52 on a copy-heavy prompt; best case 1.49x, typical 0.30-0.80x vs no speculation |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2918,3 +2919,73 @@ touched". 97/97 tests, coverage 80.39%. End to end the 522-token argmax is 440
 **Conclusion.** Keep. The stride was the whole problem and the fix costs nothing
 in precision. Next: INT8 KV on top of a walk that is now already at the ceiling --
 there the win is exactly the byte ratio, with quality to be measured.
+
+## EXP-0046 — Prompt-lookup draft acceptance
+
+**Status:** FAILED for prompt-lookup as a draft source. The *cost* half of the
+measurement is a keeper: it is the number any future speculative decoder must
+beat.
+
+### 1. Problem
+Speculative decoding was proposed as the largest remaining win. The argument:
+decode is weight-traffic bound (1529 MB/token, measured 66.7 GB/s of the 78 GB/s
+ceiling), so verifying n candidates should cost about what verifying one costs,
+giving up to ~3x at high acceptance. That reasoning is sound; the open question
+was whether a draft expensive enough to be free (an n-gram / prompt-lookup
+matcher, no second model, no extra forward pass) can predict real model output.
+
+### 2. Hypothesis
+Prompt lookup with a 2-4 token suffix match predicts at least 40% of a greedy
+continuation on code and dialogue, and 4 candidates per cycle would therefore
+return ~1.6-2.5 tokens per verification pass.
+
+### 3. Implementation
+`bench/bench_spec.cpp` (target `bench_spec`): generates a greedy continuation
+with the real engine, then walks it exactly as the speculative loop would --
+draft a block of `block` candidates via the most recent earlier occurrence of the
+last 2-4 tokens, keep the matching prefix, take one token from the target,
+repeat. Verification cost is measured separately as a real `Model::prefill` of
+`block` tokens at a real context depth, median of 5, and the two are combined
+into accepted-tokens-per-second.
+
+### 4. Results
+Three prompts, 16 threads, LFM2.5-24B-A2B-Q4_K_M (all tokens from `/tmp/*.tok`):
+
+| prompt | block | acc/cycle | hit% | tok/pass | ms/pass | tok/s | vs baseline |
+|---|---|---|---|---|---|---|---|
+| code (118 tok) | 1 | 0.08 | 15 | 1.08 | 30.48 | 35.5 | 1.08x |
+| code | 2 | 0.10 | 13 | 1.10 | 42.33 | 26.1 | 0.80x |
+| code | 4 | 0.12 | 12 | 1.12 | 70.47 | 15.9 | 0.49x |
+| code | 8 | 0.13 | 11 | 1.13 | 115.15 | 9.8 | 0.30x |
+| dialogue (224 tok) | 1 | 0.10 | 20 | 1.10 | 31.01 | 35.5 | 1.10x |
+| dialogue | 4 | 0.18 | 15 | 1.18 | 69.35 | 17.0 | 0.55x |
+| dialogue | 8 | 0.18 | 15 | 1.18 | 106.79 | 11.0 | 0.36x |
+| copy-heavy (158 tok) | 1 | 0.49 | 67 | 1.49 | 30.66 | 48.4 | **1.49x** |
+| copy-heavy | 2 | 0.91 | 58 | 1.91 | 47.81 | 40.0 | **1.23x** |
+| copy-heavy | 4 | 1.19 | 52 | 2.19 | 71.85 | 30.5 | 0.93x |
+| copy-heavy | 8 | 1.52 | 45 | 2.52 | 101.12 | 24.9 | 0.76x |
+
+Verification cost per candidate is *not* flat, which is where the hypothesis
+broke: 1 token 30.5 ms, 2 42.3 (1.39x), 4 70.5 (2.31x), 8 115.2 (3.78x). The
+marginal candidate costs 11-12 ms because attention, the shortconv glue and the
+KV writes all scale with rows, and only the MoE weight traffic is shared. So the
+real ceiling for a block of 8 is 115.15 / 30.48 = 3.78x, not the ~1.0x the
+weight-traffic argument implied, and the block must return more than ~2.1 tokens
+to beat no speculation at block 8, or exceed 1.0 tok/cycle at block 4.
+
+### 5. Conclusion
+REJECTED as a default: on code and dialogue the draft predicts 0.08-0.18
+tokens/cycle, i.e. 5-18% acceptance, and every block size above 1 is *slower*
+than plain decode (0.30-0.80x). Prompt lookup only pays where the output is a
+copy of the input -- 1.49x at block 1, 1.23x at block 2 on the signature-listing
+prompt -- which is a narrow, predictable class (quoting, reformatting,
+renaming), not general generation.
+
+What survives from this experiment and is reused elsewhere: the per-block
+verification cost curve (30.5 / 42.3 / 58.5 / 70.5 / 86.5 / 96.8 / 105.8 /
+115.2 ms at 159 tokens of context), which is the bar any draft mechanism must
+clear. A draft source with materially better acceptance would need to be a real
+model or a trained head; that is a separate, much larger experiment, and at 5-18%
+acceptance it is not justified by the current numbers.
+
+**Files changed:** `bench/bench_spec.cpp` (new), `CMakeLists.txt`.

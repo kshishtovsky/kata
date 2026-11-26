@@ -60,6 +60,10 @@ target_link_libraries(bench_real_weights PRIVATE kata_core ${CMAKE_DL_LIBS})
 target_link_libraries(bench_k4 PRIVATE kata_core ${CMAKE_DL_LIBS})
 target_link_libraries(bench_gemm PRIVATE kata_core)
 
+# EXP-0046: draft acceptance and verification cost for speculative decoding.
+add_executable(bench_spec bench/bench_spec.cpp)
+target_link_libraries(bench_spec PRIVATE kata_core)
+
 # Optional : compares our kernels against a local llama.cpp build.
 add_executable(bench_vs_ggml bench/bench_vs_ggml.cpp)
 target_link_libraries(bench_vs_ggml PRIVATE kata_core ${CMAKE_DL_LIBS})
