@@ -54,6 +54,7 @@
 | EXP-0051 | MoE experts to q3_K: per-tensor quality probe | FAILED (down) / NEEDS_RESEARCH (gate+up) | `ffn_down_exps` → q3_K costs **+6.20% PPL** on 24 chunks (all 24 worse), 12x the 0.5% gate — not adopted; ~0.5% of token time anyway, so it was never a speed lever. `gate/up` → q3_K measured **-5.24%** (better on 24/24, reproduced on upstream llama.cpp -4.09%), q5_K +0.79%, q4_K +0.00%; sign contradicts bit count, so not adopted |
 
 | EXP-0052 | Prefill: is there really a gap to llama.cpp? (length sweep) | PASSED | kata is FASTER at every length: 512 483 vs 443 (1.09x), 2048 551 vs 439 (1.26x), 8192 482 vs 398 (1.21x), 16384 400 vs 355 (1.13x), 32768 286 vs 277 (1.03x); the gap the plan assumed does not exist, TTFT is absolute and still 114 s at 32k |
+| EXP-0053 | Expert routing heat, measured in-engine | PASSED (measurement) / REJECTED (residency) | router is strongly skewed: hottest 8 of 64 hold 20.4% prefill / 19.6% decode vs 12.5% uniform, chi-square 19841 (df 63), same hot set in both phases. Residency still dies on arithmetic: one expert slab is 5.84 MB, the hot 8 x 38 MoE layers is 1.7 GB, L3 is 96 MB = 0.43 experts per layer |
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
 **Status:** PASSED for the compute-bound regime, NEEDS_RESEARCH for DRAM-bound.
@@ -3366,3 +3367,74 @@ bytes are speculative decoding (needs a draft that is actually trained for this
 model — the prompt-lookup draft in EXP-0046 managed 0.08-0.18 tokens per cycle)
 and expert residency (needs the routing heatmap, which has never been measured
 by our own code).
+
+## EXP-0053 — Expert routing heat, measured by our own code
+
+**Status:** PASSED as a measurement; the residency lever it was meant to justify
+is **rejected by arithmetic**, not by a missing effect.
+
+**Hypothesis under test.** A plan item claimed that pinning the hottest 2-3
+experts in L3 would cut expert traffic 20-40%, and that "the routing heatmap
+has never been measured by our own code" (true: an earlier artifact
+`~/models/qwen36-heretic-mtp/*.moe-heatmap` came from llama.cpp, and loading a
+model through that binary rewrote `LFM2.5-24B-A2B-Q4_K_M.moe-heatmap`). So
+measure it in kata itself, at the point where the router already counts pairs.
+
+**Implementation.** `src/model.cpp` gained `std::vector<uint64_t> heat`, filled
+with one increment where `m_counts[e]++` already happens (prefill) and in the
+decode `moe_ffn` selection loop; API `Model::heatmap_start()` /
+`Model::heatmap_take()` / `Model::n_expert()` in `include/kata/model.h`, so the
+telemetry is off unless armed and costs nothing when it is. New tool
+`tools/kata_heat.cpp` (target `kata_heat`) runs a prefill then optionally N
+sampled decode steps and prints per-expert selection shares, the share held by
+the hottest `n_expert/8`, and a chi-square against uniform.
+
+**Results** (`LFM2.5-24B-A2B-Q4_K_M`, 1000-token prompt, 64 decode steps):
+
+| | prefill | decode |
+|---|---|---|
+| selections | 152000 over 38 MoE layers | 9728 |
+| hottest 8 of 64 hold | **20.4%** (uniform 12.5%) | 19.6% |
+| chi-square vs uniform (df 63) | **19841** | 862 |
+| coldest expert | 0.555% (e12) | 0.761% (e34) |
+| uniform would give each | 1.56% | 1.56% |
+
+So the router is heavily skewed in both phases — chi-square 19841 against a
+99.9% point near 105 — and the two phases agree on the hot set (e28, e2, e49,
+e43, e5, e37 in both). The claimed skew is real.
+
+**Why the lever still dies: L3 cannot hold a per-layer hot set.**
+
+| quantity | value |
+|---|---|
+| one expert (gate 1.69 MB + up 1.69 MB + down 2.46 MB) | **5.84 MB** |
+| one MoE layer's 64 experts | 373.5 MB |
+| all 38 MoE layers | 13.9 GB |
+| hottest 8 experts x 38 layers | **1.7 GB** |
+| L3 on this part (CCD0 3D V-cache) | **96 MB** |
+
+96 MB holds 16.4 expert slabs, i.e. **0.43 experts per MoE layer**. Residency is
+a per-layer decision — layer 5's hot expert does not help layer 6 — so the
+hottest 8 globally cost 1.7 GB, about 18x the entire L3. There is no subset of
+"2-3 pinned experts" that fits: pinning 2 experts in ONE layer would cost 11.7 MB
+and save 2/64 of that layer's traffic, and there are 38 layers competing for the
+same 96 MB.
+
+**Conclusion.** Routing skew is confirmed (20% of selections on 12.5% of
+experts), and it is still not exploitable on this machine, because the unit of
+residency (an expert slab, 5.84 MB) is large relative to L3 (96 MB) multiplied
+by the number of layers that each want their own hot set. This lever needs a
+machine with a cache an order of magnitude larger, or expert slabs an order of
+magnitude smaller — neither is available. Recorded as REJECTED for
+`kata` on this hardware, with the numbers that would have to change.
+
+**What survives.** The heatmap API stays: it is the input to expert-aware
+quantisation (spend bits on the 20% that run often) and it is a cheap regression
+signal for the router if anyone touches MoE code. The `kata_heat` tool costs one
+command.
+
+**Next iteration.** Decode is where the engines are level (44.6 vs 44.58 tok/s),
+so wins there are real relative wins. The remaining structural option is
+speculative decoding with a draft that is actually trained for this model — the
+prompt-lookup draft reached 0.08-0.18 tokens per cycle (EXP-0046), so only a
+real draft changes the arithmetic.

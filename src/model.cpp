@@ -256,6 +256,10 @@ struct Model::Impl {
     double moe_router = 0, moe_pack = 0, moe_q8 = 0, moe_gemm = 0, moe_silu = 0, moe_scat = 0;
     size_t moe_buckets = 0, moe_pairs = 0, moe_dispatch = 0;
     double t_attn = 0, t_conv = 0, t_core = 0;
+    // Expert routing heat: how many (token, expert) selections land on each
+    // expert, per MoE layer. This is the input to any residency decision, and
+    // it costs one increment where the pair is already counted (m_counts).
+    std::vector<uint64_t> heat;
     size_t n_mm = 0;
     struct Tick { double * acc; bool on; std::chrono::steady_clock::time_point t0;
         Tick(double * a, bool o) : acc(a), on(o), t0(std::chrono::steady_clock::now()) {}
@@ -536,6 +540,10 @@ struct Model::Impl {
                           [](const auto & a, const auto & b) { return a.first > b.first; });
 
         const size_t nu = n_expert_used;
+        if (!heat.empty()) {
+            uint64_t * hrow = heat.data() + il * n_expert;
+            for (size_t i = 0; i < nu; ++i) ++hrow[sel[i].second];
+        }
         float * w = d_w.data();
         float wsum = 0.0f;
         for (size_t i = 0; i < nu; ++i) { w[i] = probs[sel[i].second]; wsum += w[i]; }
@@ -858,6 +866,10 @@ struct Model::Impl {
             }
         }
 
+        if (!heat.empty()) {
+            uint64_t * hrow = heat.data() + il * n_expert;
+            for (size_t e = 0; e < n_expert; ++e) hrow[e] += m_counts[e];
+        }
         const auto m1 = mclk::now();
         // Prefix sums for linear counting sort (zero comparison overhead)
         uint32_t total = 0;
@@ -1114,6 +1126,7 @@ void Model::load(const std::string & path, size_t n_ctx) {
     n_vocab_ = m.n_vocab;
     n_embd_ = m.n_embd;
     n_layer_ = m.n_layer;
+    n_expert_ = m.n_expert;
 }
 
 void Model::reset() {
@@ -1126,6 +1139,20 @@ void Model::reset() {
 }
 
 const float * Model::forward(uint32_t token, ModelState & st) { return p_->forward(token, st); }
+
+void Model::heatmap_start() {
+    Impl & m = *p_;
+    m.heat.assign(m.n_layer * m.n_expert, 0);
+}
+
+std::vector<uint64_t> Model::heatmap_take() {
+    Impl & m = *p_;
+    std::vector<uint64_t> out = m.heat;
+    m.heat.clear();
+    return out;
+}
+
+
 
 double Model::perplexity(const uint32_t * tokens, size_t n, size_t n_ctx_chunk, size_t * counted) {
     if (n < 2) return 0.0;

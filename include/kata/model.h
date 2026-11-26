@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace kata {
 
@@ -40,10 +41,17 @@ public:
     size_t n_embd() const { return n_embd_; }
     size_t n_layer() const { return n_layer_; }
 
+    // Expert routing telemetry (EXP-0053). Call heatmap_start(), run whatever
+    // mix of forward/prefill you care about, then heatmap_take() to collect
+    // per-[layer][expert] selection counts and disarm the collection.
+    void heatmap_start();
+    std::vector<uint64_t> heatmap_take();
+    size_t n_expert() const { return n_expert_; }
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;
-    size_t n_vocab_ = 0, n_embd_ = 0, n_layer_ = 0;
+    size_t n_vocab_ = 0, n_embd_ = 0, n_layer_ = 0, n_expert_ = 0;
 };
 
 } // namespace kata
