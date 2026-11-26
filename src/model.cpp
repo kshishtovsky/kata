@@ -438,15 +438,25 @@ struct Model::Impl {
         rope(n_head_kv, head_dim, k.data(), pos, rope_base, false);
 
         const size_t kv = n_head_kv * head_dim;
-        float * kc = k_cache.data() + (il * n_ctx + pos) * kv;
-        float * vc = v_cache.data() + (il * n_ctx + pos) * kv;
-        std::memcpy(kc, k.data(), kv * sizeof(float));
-        std::memcpy(vc, v.data(), kv * sizeof(float));
+        // Head-major cache: [layer][kv_head][position][head_dim]. A decode
+        // worker owns one kv head, so it then streams one contiguous history
+        // instead of touching one 256-byte slice per 2048-byte position row
+        // (EXP-0045: 45 -> 75 GB/s on the same walk).
+        float * kbase = k_cache.data() + il * n_ctx * kv;
+        float * vbase = v_cache.data() + il * n_ctx * kv;
+        for (size_t h = 0; h < n_head_kv; ++h) {
+            std::memcpy(kbase + (h * n_ctx + pos) * head_dim, k.data() + h * head_dim,
+                        head_dim * sizeof(float));
+            std::memcpy(vbase + (h * n_ctx + pos) * head_dim, v.data() + h * head_dim,
+                        head_dim * sizeof(float));
+        }
 
         AttnArgs a{};
         a.q = q.data();
-        a.k_cache = k_cache.data() + il * n_ctx * kv;
-        a.v_cache = v_cache.data() + il * n_ctx * kv;
+        a.k_cache = kbase;
+        a.v_cache = vbase;
+        a.stride_pos = head_dim;
+        a.stride_head = n_ctx * head_dim;
         a.n_kv = pos + 1;
         a.n_heads = n_head;
         a.n_kv_heads = n_head_kv;
@@ -738,17 +748,18 @@ struct Model::Impl {
         // call over m*n_head rows.
         rms_norm(m * n_head, head_dim, pq.data(), pq.data(), static_cast<const float *>(L.q_norm), eps);
         rms_norm(m * n_head_kv, head_dim, pk.data(), pk.data(), static_cast<const float *>(L.k_norm), eps);
+        float * kbase = k_cache.data() + il * n_ctx * kvw;
+        float * vbase = v_cache.data() + il * n_ctx * kvw;
         for (size_t i = 0; i < m; ++i) {
             const size_t pos = pos0 + i;
             rope(n_head, head_dim, pq.data() + i * qw, pos, rope_base, false);
             rope(n_head_kv, head_dim, pk.data() + i * kvw, pos, rope_base, false);
-            std::memcpy(k_cache.data() + (il * n_ctx + pos) * kvw, pk.data() + i * kvw, kvw * sizeof(float));
-            std::memcpy(v_cache.data() + (il * n_ctx + pos) * kvw, pv.data() + i * kvw, kvw * sizeof(float));
+            write_kv_head_major(kbase, vbase, pos, n_ctx, n_head_kv, head_dim,
+                                pk.data() + i * kvw, pv.data() + i * kvw);
         }
-        attention_prefill_mt(pq.data(), m, k_cache.data() + il * n_ctx * kvw,
-                          v_cache.data() + il * n_ctx * kvw, pos0, n_head, n_head_kv,
+        attention_prefill_mt(pq.data(), m, kbase, vbase, pos0, n_head, n_head_kv,
                           head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)),
-                          pattn.data(), pool);
+                          pattn.data(), pool, head_dim, n_ctx * head_dim);
         q8_rows_mt(pattn.data(), m, qw, paq.data());
         mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
     }

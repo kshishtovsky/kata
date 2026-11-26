@@ -20,6 +20,13 @@ struct AttnArgs {
     // Offset of this head's kv slice inside one position's row. Set by the
     // decode loop; callers of attention_decode leave it at 0.
     size_t base = 0;
+    // Element stride between consecutive positions and between consecutive kv
+    // heads. The default pair describes the position-major cache
+    // [position][kv_head][head_dim]; the engine runs head-major
+    // [kv_head][position][head_dim], which is what a decode worker streams
+    // contiguously (EXP-0045: 45 -> 75 GB/s).
+    size_t stride_pos = 0;   // 0 means n_kv_heads * head_dim
+    size_t stride_head = 0;  // 0 means head_dim
 };
 
 void attention_decode_ref(const AttnArgs & a, float * scratch);
@@ -55,6 +62,21 @@ void attention_decode(const AttnArgs & a, float * scratch);
 // nothing else. Separated so the caller can RoPE k first.
 inline float * kv_slot(float * cache, size_t pos, size_t n_kv_heads, size_t head_dim) {
     return cache + pos * n_kv_heads * head_dim;
+}
+
+// Writes one token's k and v rows into a head-major cache
+// [kv_head][position][head_dim]. src_k/src_v are laid out [kv_head][head_dim].
+inline void write_kv_head_major(float * k_cache, float * v_cache, size_t pos, size_t n_ctx,
+                               size_t n_kv_heads, size_t head_dim, const float * src_k,
+                               const float * src_v) {
+    for (size_t h = 0; h < n_kv_heads; ++h) {
+        float * kd = k_cache + (h * n_ctx + pos) * head_dim;
+        float * vd = v_cache + (h * n_ctx + pos) * head_dim;
+        for (size_t d = 0; d < head_dim; ++d) {
+            kd[d] = src_k[h * head_dim + d];
+            vd[d] = src_v[h * head_dim + d];
+        }
+    }
 }
 
 // Transposed K cache, used only by the score pass: it keeps positions in the

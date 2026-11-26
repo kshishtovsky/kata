@@ -43,6 +43,9 @@
 | EXP-0040 | MoE scratch reduction (-220 MB), counting buckets for expert pairs, parallel embed_rows, and mm_batch safety | PASSED | 2048-tok prefill 521.2 -> 535.8 tok/s (-108 ms faster); freed >220 MB scratch RAM; replaced std::sort with linear counting buckets; parallel embed_rows; bitwise exact logits |
 | EXP-0041 | Vectorised AVX-512 and AVX2 SiLU in SwiGLU FFN with 1.45 ULP Cody-Waite exp | PASSED | silu_mul microbenchmark 4.52 -> 0.22 ms (20.5x speedup); 2048-tok prefill 535.8 -> 545.4 tok/s (-67 ms faster); 544-tok 429.1 -> 461.2 tok/s (-88 ms faster); decode 43.12 tok/s; 93/93 tests pass (coverage 79.36%) |
 | EXP-0042 | Vectorised exp in the prefill group4 attention fast path | PASSED | 25070-tok prefill 202.5-206.1 -> 234.2-239.6 tok/s (1.16x, attn chunk 7747 -> 5615 ms); ppl 195.58 -> 193.23 / 174.45 -> 175.59 / 150.70 -> 153.41 vs llama.cpp 206.90 / 175.08 / 147.84 |
+| EXP-0043 | Parallel decode attention by kv head | PASSED | 16k decode 79.6 -> 37.2 ms/token (12.6 -> 26.9 tok/s, 2.14x); 8k 51.2 -> 29.6; 2k 29.5 -> 24.3; exact split by construction (kv heads share nothing) |
+| EXP-0044 | Phase profiler measured inside the real grouped kernel | PASSED | profiler covered code the kernel no longer ran; corrected split at 8k is FFN 49%, attention core 24%, shortconv 14%, lm_head 10%; KV walk at 49.2 GB/s of 78 |
+| EXP-0045 | Head-major KV cache `[kv_head][position][head_dim]` | PASSED | KV walk 45.0 -> 73.3 GB/s at 8k (1.63x) and 44.4 -> 74.1 at 32k; decode 8k 26.9 -> 37.2 tok/s, 16k 32.0, 512 unchanged 44.6; prefill 25k 336 tok/s; layouts agree bit-exactly |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2848,3 +2851,70 @@ estimated. Making the walk contiguous is lossless and worth up to 1.6x on the sa
 7.0 ms, so it must come first.
 
 **Conclusion:** keep the profiler fix. Next lever is the KV layout, then INT8 on top.
+
+## EXP-0045 — Head-major KV cache
+
+**Status:** PASSED.
+
+**Problem.** EXP-0044 measured the decode KV walk at 49.2 GB/s where the machine
+does 78 GB/s: attention core was 7.0 ms of a 29.1 ms token at 8k. The cache was
+`[layer][position][kv_head][head_dim]`, so a worker that owns one kv head reads
+256 B out of every 2048 B. The bytes are not wasted inside a cache line -- 256 B
+is four whole lines -- but eight workers each stream a stride of 1/8, which is the
+worst case for the hardware prefetcher and for memory-level parallelism.
+
+**Hypothesis.** If `[layer][kv_head][position][head_dim]` makes one worker's
+stream contiguous, the walk should approach the machine peak (78 GB/s), and that
+would be lossless -- unlike INT8, which halves the bytes of a walk that was only
+63% efficient.
+
+**Probe first** (`/tmp/lay/lay.cpp`, `/tmp/lay/par.cpp`, one worker per kv head,
+8 workers, 10 layers so the set leaves L3):
+
+| n_kv | score pos->head | v pos->head | both |
+|---|---|---|---|
+| 8192 | 40.2 -> 72.6 GB/s (1.81x) | 51.2 -> 74.0 (1.45x) | 45.0 -> 73.3 (**1.63x**) |
+| 16384 | 42.2 -> 75.9 (1.80x) | 50.1 -> 73.5 (1.47x) | 45.8 -> 74.7 (**1.63x**) |
+| 32768 | 39.4 -> 72.9 (1.85x) | 51.0 -> 75.3 (1.48x) | 44.4 -> 74.1 (**1.67x**) |
+
+Head-major lands at 74-76 GB/s, i.e. the DRAM ceiling. Two bugs in my first probe
+inflated the effect and had to be fixed before believing it: the score loops were
+dead-code-eliminated (reported 6.4 million GB/s), and in the v probe GCC deleted
+30 of 32 accumulators because only two were consumed.
+
+The transposed K cache (`scores_kt`, EXP-0018) is NOT needed: it also buys a
+second buffer and AVX-512, and head-major is already at the ceiling. Note
+`bench/bench_attn --kt` compares against the per-head path, not the grouped one,
+so its ratios must not be quoted.
+
+**Implementation.** Strides became explicit instead of implied:
+`AttnArgs::stride_pos` / `stride_head` (0 = the old position-major meaning, so
+every existing caller is unchanged) and the same two optional arguments appended
+to `attention_prefill`, `attention_prefill_ref`, `attention_prefill_mt`. The
+engine now passes `stride_pos = head_dim`, `stride_head = n_ctx * head_dim` and
+writes slots with `write_kv_head_major()`, which copies one row per kv head so a
+token's write touches n_kv_heads separate lines -- measured at +0.1 us/token, i.e.
+0.4% of a token against a 12 ms attention saving at 8k.
+
+**Results** (LFM2.5-24B-A2B-Q4_K_M, 16 threads, CPU only):
+
+| metric | before | after |
+|---|---|---|
+| decode 512 ctx | 22.8 ms/tok (43.8 t/s) | 22.4 (44.6) |
+| decode 2048 | 24.3 ms/tok | 23.6 (42.4) |
+| decode 8192 | 29.6 ms/tok (33.8 t/s) | **26.9 ms (37.2 t/s)** |
+| decode 16384 | 37.2 ms/tok (26.9 t/s) | **31.3 ms (32.0 t/s)** |
+| prefill 25k tok | ~234-240 t/s | **336.1** |
+| prefill 8k tok | — | 481.2 |
+| prefill 522 tok | 465.4 | 465.4 |
+
+**Quality.** Layout only: `Attn.HeadMajorCacheMatchesPositionMajor` and
+`Prefill.HeadMajorCacheMatchesPositionMajor` assert bit-exact agreement with the
+position-major path across six shapes (including hd 96 and hd 32), and
+`Attn.WriteKvHeadMajorRoundTrips` pins the slot writer plus "no other slot
+touched". 97/97 tests, coverage 80.39%. End to end the 522-token argmax is 440
+(logit 16.12790) before and after; the 25000-token argmax is 296 (26.58048).
+
+**Conclusion.** Keep. The stride was the whole problem and the fix costs nothing
+in precision. Next: INT8 KV on top of a walk that is now already at the ceiling --
+there the win is exactly the byte ratio, with quality to be measured.

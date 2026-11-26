@@ -18,12 +18,27 @@
 
 namespace kata {
 
+// Cache strides, in elements. Zero means the position-major default
+// [position][kv_head][head_dim]; the engine runs head-major
+// [kv_head][position][head_dim], where one kv head is a contiguous stream
+// (EXP-0045: 45 -> 75 GB/s on the same walk).
+namespace {
+inline size_t pos_stride_of(size_t stride_pos, size_t n_kv_heads, size_t head_dim) {
+    return stride_pos ? stride_pos : n_kv_heads * head_dim;
+}
+inline size_t head_stride_of(size_t stride_head, size_t head_dim) {
+    return stride_head ? stride_head : head_dim;
+}
+} // namespace
+
 void attention_prefill_ref(const float * q, size_t n_tok,
                            const float * k_cache, const float * v_cache,
                            size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                           size_t head_dim, float scale, float * out) {
+                           size_t head_dim, float scale, float * out,
+                           size_t stride_pos, size_t stride_head) {
     const size_t group = n_heads / n_kv_heads;
-    const size_t kv_stride = n_kv_heads * head_dim;
+    const size_t kv_stride = pos_stride_of(stride_pos, n_kv_heads, head_dim);
+    const size_t hstride = head_stride_of(stride_head, head_dim);
     for (size_t t = 0; t < n_tok; ++t) {
         const size_t n_kv = n_kv_begin + t + 1;
         for (size_t h = 0; h < n_heads; ++h) {
@@ -32,7 +47,7 @@ void attention_prefill_ref(const float * q, size_t n_tok,
             float m = -INFINITY, s = 0.0f;
             for (size_t d = 0; d < head_dim; ++d) out[(t * n_heads + h) * head_dim + d] = 0.0f;
             for (size_t p = 0; p < n_kv; ++p) {
-                const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                const float * kp = k_cache + p * kv_stride + kvh * hstride;
                 float sc = 0.0f;
                 for (size_t d = 0; d < head_dim; ++d) sc += qv[d] * kp[d];
                 sc *= scale;
@@ -42,7 +57,7 @@ void attention_prefill_ref(const float * q, size_t n_tok,
                 m = m_new;
                 s = s * corr + e;
                 float * o = out + (t * n_heads + h) * head_dim;
-                const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+                const float * vp = v_cache + p * kv_stride + kvh * hstride;
                 for (size_t d = 0; d < head_dim; ++d) o[d] = o[d] * corr + e * vp[d];
             }
             float * o = out + (t * n_heads + h) * head_dim;
@@ -146,9 +161,10 @@ template <int NV>
 __attribute__((target("avx2,fma")))
 void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const float * v_cache,
                   size_t n_kv_begin, size_t n_heads, size_t n_kv_heads, size_t head_dim,
-                  float scale, float * out) {
+                  float scale, float * out, size_t stride_pos, size_t stride_head) {
     const size_t group = n_heads / n_kv_heads;
-    const size_t kv_stride = n_kv_heads * head_dim;
+    const size_t kv_stride = pos_stride_of(stride_pos, n_kv_heads, head_dim);
+    const size_t hstride = head_stride_of(stride_head, head_dim);
     for (size_t t = 0; t < n_tok; ++t) {
         const size_t n_kv = n_kv_begin + t + 1;
         for (size_t kvh = 0; kvh < n_kv_heads; ++kvh) {
@@ -170,10 +186,10 @@ void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const fl
                 float m1 = -INFINITY, s1 = 0.0f;
 
                 for (size_t p = 0; p < n_kv; ++p) {
-                    const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                    const float * kp = k_cache + p * kv_stride + kvh * hstride;
                     const float sc0 = dot_avx2(qv0, kp, head_dim) * scale;
                     const float sc1 = dot_avx2(qv1, kp, head_dim) * scale;
-                    const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+                    const float * vp = v_cache + p * kv_stride + kvh * hstride;
 
                     if (sc0 > m0) {
                         const float corr0 = m0 == -INFINITY ? 0.0f : exp_fast(m0 - sc0);
@@ -222,9 +238,9 @@ void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const fl
                 for (int r = 0; r < NV; ++r) acc[r] = _mm256_setzero_ps();
                 float m = -INFINITY, s = 0.0f;
                 for (size_t p = 0; p < n_kv; ++p) {
-                    const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                    const float * kp = k_cache + p * kv_stride + kvh * hstride;
                     const float sc = dot_avx2(qv, kp, head_dim) * scale;
-                    const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+                    const float * vp = v_cache + p * kv_stride + kvh * hstride;
                     if (sc > m) {
                         const float corr = m == -INFINITY ? 0.0f : exp_fast(m - sc);
                         const __m256 cv = _mm256_set1_ps(corr);
@@ -252,9 +268,10 @@ void prefill_rows(const float * q, size_t n_tok, const float * k_cache, const fl
 __attribute__((target("avx2,fma")))
 void prefill_rows_generic(const float * q, size_t n_tok, const float * k_cache, const float * v_cache,
                           size_t n_kv_begin, size_t n_heads, size_t n_kv_heads, size_t head_dim,
-                          float scale, float * out) {
+                          float scale, float * out, size_t stride_pos, size_t stride_head) {
     const size_t group = n_heads / n_kv_heads;
-    const size_t kv_stride = n_kv_heads * head_dim;
+    const size_t kv_stride = pos_stride_of(stride_pos, n_kv_heads, head_dim);
+    const size_t hstride = head_stride_of(stride_head, head_dim);
     std::vector<float> acc_vec;
     float acc_stack[256];
     float * acc = head_dim <= 256 ? acc_stack : (acc_vec.resize(head_dim), acc_vec.data());
@@ -267,9 +284,9 @@ void prefill_rows_generic(const float * q, size_t n_tok, const float * k_cache, 
             for (size_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
             float m = -INFINITY, s = 0.0f;
             for (size_t p = 0; p < n_kv; ++p) {
-                const float * kp = k_cache + p * kv_stride + kvh * head_dim;
+                const float * kp = k_cache + p * kv_stride + kvh * hstride;
                 const float sc = dot_avx2(qv, kp, head_dim) * scale;
-                const float * vp = v_cache + p * kv_stride + kvh * head_dim;
+                const float * vp = v_cache + p * kv_stride + kvh * hstride;
                 if (sc > m) {
                     const float corr = m == -INFINITY ? 0.0f : exp_fast(m - sc);
                     const __m256 cv = _mm256_set1_ps(corr);
@@ -321,9 +338,11 @@ namespace {
 __attribute__((target("avx512f,avx512vl,avx512bw,avx2,fma")))
 void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                     const float * v_cache, size_t n_kv_begin, size_t n_heads,
-                    size_t n_kv_heads, float scale, float * out) {
+                    size_t n_kv_heads, float scale, float * out,
+                    size_t stride_pos, size_t stride_head) {
     constexpr size_t HD = 64, G = 4;
-    const size_t kv_stride = n_kv_heads * HD;
+    const size_t kv_stride = pos_stride_of(stride_pos, n_kv_heads, HD);
+    const size_t hstride = head_stride_of(stride_head, HD);
     for (size_t t = 0; t < n_tok; ++t) {
         const size_t n_kv = n_kv_begin + t + 1;
         for (size_t g = 0; g < n_heads; g += G) {
@@ -338,11 +357,11 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                 s[h] = 0.0f;
             }
             for (size_t p = 0; p < n_kv; ++p) {
-                const float * kp = k_cache + p * kv_stride + kvh * HD;
+                const float * kp = k_cache + p * kv_stride + kvh * hstride;
                 _mm_prefetch(reinterpret_cast<const char *>(kp + 4 * kv_stride), _MM_HINT_T0);
                 const __m512 k0 = _mm512_loadu_ps(kp), k1 = _mm512_loadu_ps(kp + 16),
                              k2 = _mm512_loadu_ps(kp + 32), k3 = _mm512_loadu_ps(kp + 48);
-                const float * vp = v_cache + p * kv_stride + kvh * HD;
+                const float * vp = v_cache + p * kv_stride + kvh * hstride;
                 _mm_prefetch(reinterpret_cast<const char *>(vp + 4 * kv_stride), _MM_HINT_T0);
 
                 float sc[4];
@@ -408,30 +427,42 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
 void attention_prefill(const float * q, size_t n_tok,
                        const float * k_cache, const float * v_cache,
                        size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                       size_t head_dim, float scale, float * out) {
+                       size_t head_dim, float scale, float * out,
+                       size_t stride_pos, size_t stride_head) {
     if (n_tok == 0) return;
 #if defined(__x86_64__) || defined(__i386__)
     const Isa isa = cpu_isa();
     if (head_dim == 64 && n_heads == 4 * n_kv_heads && (isa == Isa::Avx512 || isa == Isa::Avx512Vnni)) {
-        prefill_group4(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, scale, out);
+        prefill_group4(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, scale, out,
+                       stride_pos, stride_head);
         return;
     }
 #endif
     if (head_dim == 0 || head_dim % 8 != 0) {
-        prefill_rows_generic(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
+        prefill_rows_generic(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale,
+                             out, stride_pos, stride_head);
         return;
     }
     switch (head_dim / 8) {
-        case 1: prefill_rows<1>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break;
-        case 2: prefill_rows<2>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break;
-        case 4: prefill_rows<4>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break;
-        case 8: prefill_rows<8>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break;
-        case 10: prefill_rows<10>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break; // 80
-        case 12: prefill_rows<12>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break; // 96
-        case 16: prefill_rows<16>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break; // 128
-        case 32: prefill_rows<32>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out); break; // 256
+        case 1: prefill_rows<1>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break;
+        case 2: prefill_rows<2>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break;
+        case 4: prefill_rows<4>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break;
+        case 8: prefill_rows<8>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break;
+        case 10: prefill_rows<10>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break; // 80
+        case 12: prefill_rows<12>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break; // 96
+        case 16: prefill_rows<16>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break; // 128
+        case 32: prefill_rows<32>(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim,
+                        scale, out, stride_pos, stride_head); break; // 256
         default:
-            prefill_rows_generic(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
+            prefill_rows_generic(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale,
+                                 out, stride_pos, stride_head);
             break;
     }
 }
@@ -460,11 +491,13 @@ std::vector<size_t> prefill_weighted_partition_bounds(size_t n_tok, size_t n_kv_
 void attention_prefill_mt(const float * q, size_t n_tok,
                           const float * k_cache, const float * v_cache,
                           size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                          size_t head_dim, float scale, float * out, ThreadPool & pool) {
+                          size_t head_dim, float scale, float * out, ThreadPool & pool,
+                          size_t stride_pos, size_t stride_head) {
     if (n_tok == 0) return;
     const unsigned nw = pool.size();
     if (nw <= 1) {
-        attention_prefill(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
+        attention_prefill(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale,
+                          out, stride_pos, stride_head);
         return;
     }
 
@@ -480,7 +513,7 @@ void attention_prefill_mt(const float * q, size_t n_tok,
         if (lo >= hi) return;
         attention_prefill(q + lo * qw, hi - lo,
                           k_cache, v_cache, n_kv_begin + lo, n_heads, n_kv_heads,
-                          head_dim, scale, out + lo * qw);
+                          head_dim, scale, out + lo * qw, stride_pos, stride_head);
     });
 }
 
@@ -490,7 +523,8 @@ void attention_prefill(const float * q, size_t n_tok,
                        const float * k_cache, const float * v_cache,
                        size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
                        size_t head_dim, float scale, float * out) {
-    attention_prefill_ref(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale, out);
+    attention_prefill_ref(q, n_tok, k_cache, v_cache, n_kv_begin, n_heads, n_kv_heads, head_dim, scale,
+                          out, stride_pos, stride_head);
 }
 
 #endif

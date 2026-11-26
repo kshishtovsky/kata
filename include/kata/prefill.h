@@ -14,12 +14,14 @@ namespace kata {
 void attention_prefill_ref(const float * q, size_t n_tok,
                            const float * k_cache, const float * v_cache,
                            size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                           size_t head_dim, float scale, float * out);
+                           size_t head_dim, float scale, float * out,
+                           size_t stride_pos = 0, size_t stride_head = 0);
 
 void attention_prefill(const float * q, size_t n_tok,
                        const float * k_cache, const float * v_cache,
                        size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                       size_t head_dim, float scale, float * out);
+                       size_t head_dim, float scale, float * out,
+                       size_t stride_pos = 0, size_t stride_head = 0);
 
 // Same, with the query rows split across threads. Every row is independent, so
 // the split is exact: row t always reads the same kv prefix regardless of who
@@ -28,7 +30,8 @@ struct ThreadPool;
 void attention_prefill_mt(const float * q, size_t n_tok,
                           const float * k_cache, const float * v_cache,
                           size_t n_kv_begin, size_t n_heads, size_t n_kv_heads,
-                          size_t head_dim, float scale, float * out, ThreadPool & pool);
+                          size_t head_dim, float scale, float * out, ThreadPool & pool,
+                          size_t stride_pos = 0, size_t stride_head = 0);
 
 // Returns worker token boundaries [0 = b[0] <= b[1] <= ... <= b[nw] = n_tok]
 // such that the cumulative causal attention cost W = sum(n_kv_begin + t + 1)

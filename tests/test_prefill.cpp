@@ -193,3 +193,38 @@ TEST(Prefill, WeightedPartitionMonotonicityAndBounds) {
         }
     }
 }
+
+TEST(Prefill, HeadMajorCacheMatchesPositionMajor) {
+    // Same layout contract as the decode test: head-major is a layout, not maths.
+    struct C { size_t n_tok, n_kv_begin, n_heads, n_kv_heads, head_dim; };
+    const C cases[] = {
+        {8, 0, 32, 8, 64}, {7, 5, 32, 8, 64}, {3, 40, 8, 2, 96}, {5, 3, 8, 2, 32},
+    };
+    std::mt19937 rng(77);
+    std::normal_distribution<float> nd(0.0f, 0.7f);
+    for (const auto & c : cases) {
+        const size_t kv = c.n_kv_heads * c.head_dim;
+        const size_t n_kv = c.n_kv_begin + c.n_tok;
+        std::vector<float> k(n_kv * kv), v(n_kv * kv), q(c.n_tok * c.n_heads * c.head_dim);
+        for (auto & x : k) x = nd(rng);
+        for (auto & x : v) x = nd(rng);
+        for (auto & x : q) x = nd(rng);
+        std::vector<float> kh(n_kv * kv), vh(n_kv * kv);
+        for (size_t t = 0; t < n_kv; ++t)
+            for (size_t h = 0; h < c.n_kv_heads; ++h)
+                for (size_t d = 0; d < c.head_dim; ++d) {
+                    kh[(h * n_kv + t) * c.head_dim + d] = k[(t * c.n_kv_heads + h) * c.head_dim + d];
+                    vh[(h * n_kv + t) * c.head_dim + d] = v[(t * c.n_kv_heads + h) * c.head_dim + d];
+                }
+        const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+        std::vector<float> want(q.size()), got(q.size());
+        attention_prefill(q.data(), c.n_tok, k.data(), v.data(), c.n_kv_begin, c.n_heads,
+                          c.n_kv_heads, c.head_dim, scale, want.data());
+        attention_prefill(q.data(), c.n_tok, kh.data(), vh.data(), c.n_kv_begin, c.n_heads,
+                          c.n_kv_heads, c.head_dim, scale, got.data(), c.head_dim,
+                          n_kv * c.head_dim);
+        for (size_t i = 0; i < want.size(); ++i)
+            ASSERT_EQ(got[i], want[i]) << "n_tok=" << c.n_tok << " n_kv_begin=" << c.n_kv_begin
+                                      << " hd=" << c.head_dim << " i=" << i;
+    }
+}

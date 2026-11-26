@@ -11,6 +11,17 @@
 #include <vector>
 
 namespace {
+// Position-major [position][kv_head][head_dim] -> head-major
+// [kv_head][position][head_dim], the layout the engine runs.
+std::vector<float> to_head_major(const std::vector<float> & pm, size_t n_kv, size_t n_kv_heads,
+                                 size_t hd) {
+    std::vector<float> hm(pm.size());
+    for (size_t t = 0; t < n_kv; ++t)
+        for (size_t h = 0; h < n_kv_heads; ++h)
+            for (size_t d = 0; d < hd; ++d)
+                hm[(h * n_kv + t) * hd + d] = pm[(t * n_kv_heads + h) * hd + d];
+    return hm;
+}
 std::vector<float> rnd(size_t n, unsigned seed) {
     std::mt19937 g(seed);
     std::normal_distribution<float> nd(0.0f, 0.8f);
@@ -341,4 +352,65 @@ TEST(Attn, PhaseProfilerCoversTheWholeKernel) {
     // Phases exclude only the loop overhead, so they should be close to the call.
     EXPECT_LT(sum, whole * 1.5);
     EXPECT_GT(sum, whole * 0.5);
+}
+
+TEST(Attn, HeadMajorCacheMatchesPositionMajor) {
+    // The engine keeps kv as [kv_head][position][head_dim] so one worker streams
+    // one contiguous history. Strides must not change a single number: this is a
+    // layout change, not a maths change.
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    const Case cases[] = {
+        {32, 8, 64, 1}, {32, 8, 64, 37}, {32, 8, 64, 256}, {32, 8, 64, 4097},
+        {8, 2, 96, 200}, {8, 2, 32, 63},
+    };
+    for (const auto & c : cases) {
+        auto q = rnd(c.n_heads * c.head_dim, 21);
+        auto k_pm = rnd(c.n_kv * c.n_kv_heads * c.head_dim, 22);
+        auto v_pm = rnd(c.n_kv * c.n_kv_heads * c.head_dim, 23);
+        auto k_hm = to_head_major(k_pm, c.n_kv, c.n_kv_heads, c.head_dim);
+        auto v_hm = to_head_major(v_pm, c.n_kv, c.n_kv_heads, c.head_dim);
+
+        kata::AttnArgs a{};
+        a.q = q.data();
+        a.n_kv = c.n_kv; a.n_heads = c.n_heads; a.n_kv_heads = c.n_kv_heads;
+        a.head_dim = c.head_dim; a.scale = 1.0f / std::sqrt((float)c.head_dim);
+        std::vector<float> want(c.n_heads * c.head_dim), got(c.n_heads * c.head_dim);
+
+        a.k_cache = k_pm.data(); a.v_cache = v_pm.data(); a.out = want.data();
+        std::vector<float> s1(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s1.data());
+
+        a.k_cache = k_hm.data(); a.v_cache = v_hm.data(); a.out = got.data();
+        a.stride_pos = c.head_dim;
+        a.stride_head = c.n_kv * c.head_dim;
+        std::vector<float> s2(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s2.data());
+
+        for (size_t i = 0; i < want.size(); ++i)
+            ASSERT_EQ(got[i], want[i]) << "heads=" << c.n_heads << "/" << c.n_kv_heads
+                                      << " hd=" << c.head_dim << " n_kv=" << c.n_kv << " i=" << i;
+    }
+}
+
+TEST(Attn, WriteKvHeadMajorRoundTrips) {
+    const size_t n_kv_heads = 4, hd = 8, n_ctx = 6;
+    for (size_t pos : {size_t(0), size_t(1), size_t(5)}) {
+        std::vector<float> k(n_kv_heads * hd), v(n_kv_heads * hd);
+        for (size_t i = 0; i < k.size(); ++i) {
+            k[i] = (float)(pos * 100 + i + 1);   // never 0, so "untouched" is testable
+            v[i] = -(float)(pos * 100 + i + 1);
+        }
+        std::vector<float> km(n_kv_heads * n_ctx * hd, 0.0f), vm(n_kv_heads * n_ctx * hd, 0.0f);
+        kata::write_kv_head_major(km.data(), vm.data(), pos, n_ctx, n_kv_heads, hd, k.data(), v.data());
+        for (size_t h = 0; h < n_kv_heads; ++h)
+            for (size_t d = 0; d < hd; ++d) {
+                const size_t at = (h * n_ctx + pos) * hd + d;
+                EXPECT_EQ(km[at], k[h * hd + d]);
+                EXPECT_EQ(vm[at], v[h * hd + d]);
+            }
+        // Every other slot must be untouched, or decode would read stale tokens.
+        size_t touched = 0;
+        for (float x : km) touched += x != 0.0f ? 1 : 0;
+        EXPECT_EQ(touched, n_kv_heads * hd);
+    }
 }

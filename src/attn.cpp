@@ -24,18 +24,30 @@ inline size_t head_of(size_t h, size_t n_heads, size_t n_kv_heads) {
     return h / group;
 }
 
+// Element stride between consecutive positions and between consecutive kv
+// heads. A zero field means the position-major default
+// [position][kv_head][head_dim]; the engine passes head-major
+// [kv_head][position][head_dim], where a decode worker streams one head's whole
+// history contiguously (EXP-0045: 45 -> 75 GB/s).
+inline size_t pos_stride(const AttnArgs & a) {
+    return a.stride_pos ? a.stride_pos : a.n_kv_heads * a.head_dim;
+}
+inline size_t head_stride(const AttnArgs & a) {
+    return a.stride_head ? a.stride_head : a.head_dim;
+}
+
 } // namespace
 
 void attention_decode_ref(const AttnArgs & a, float * scratch) {
     const size_t hd = a.head_dim;
     for (size_t h = 0; h < a.n_heads; ++h) {
         const float * q = a.q + h * hd;
-        const size_t base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
+        const size_t base = head_of(h, a.n_heads, a.n_kv_heads) * head_stride(a);
 
         // Pass 1: scores, with a running max so a long context cannot overflow.
         float mx = -INFINITY;
         for (size_t t = 0; t < a.n_kv; ++t) {
-            const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
+            const float * k = a.k_cache + t * pos_stride(a) + base;
             float s = 0.0f;
             for (size_t i = 0; i < hd; ++i) s += q[i] * k[i];
             s *= a.scale;
@@ -54,7 +66,7 @@ void attention_decode_ref(const AttnArgs & a, float * scratch) {
         const float inv = 1.0f / sum;
         for (size_t t = 0; t < a.n_kv; ++t) {
             const float p = scratch[t] * inv;
-            const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
+            const float * v = a.v_cache + t * pos_stride(a) + base;
             for (size_t i = 0; i < hd; ++i) o[i] += p * v[i];
         }
     }
@@ -167,14 +179,14 @@ void v_accum(const AttnArgs & a, float * o, const float * p, size_t hd, size_t b
     for (int j = 0; j < NV; ++j) acc[j] = _mm256_setzero_ps();
     for (size_t t = 0; t < a.n_kv; ++t) {
         const __m256 pv = _mm256_set1_ps(p[t]);
-        const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
+        const float * v = a.v_cache + t * pos_stride(a) + base;
         for (int j = 0; j < NV; ++j) acc[j] = _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + 8 * j), acc[j]);
     }
     const __m256 iv = _mm256_set1_ps(inv);
     for (int j = 0; j < NV; ++j) _mm256_storeu_ps(o + 8 * j, _mm256_mul_ps(acc[j], iv));
     for (size_t i = size_t(NV) * 8; i < hd; ++i) {
         float s = 0.0f;
-        for (size_t t = 0; t < a.n_kv; ++t) s += p[t] * a.v_cache[t * a.n_kv_heads * hd + base + i];
+        for (size_t t = 0; t < a.n_kv; ++t) s += p[t] * a.v_cache[t * pos_stride(a) + base + i];
         o[i] = s * inv;
     }
 }
@@ -187,7 +199,7 @@ void v_accum_generic(const AttnArgs & a, float * o, const float * p, size_t hd, 
     for (size_t i = nv; i < hd; ++i) o[i] = 0.0f;
     for (size_t t = 0; t < a.n_kv; ++t) {
         const __m256 pv = _mm256_set1_ps(p[t]);
-        const float * v = a.v_cache + t * a.n_kv_heads * hd + base;
+        const float * v = a.v_cache + t * pos_stride(a) + base;
         for (size_t i = 0; i < nv; i += 8)
             _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + i), _mm256_loadu_ps(o + i)));
         for (size_t i = nv; i < hd; ++i) o[i] += p[t] * v[i];
@@ -214,7 +226,7 @@ __attribute__((target("avx2,fma")))
 void scores_n(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd, float scale,
               float * out) {
     static_assert(N % 2 == 0, "N must be even");
-    const size_t stride = a.n_kv_heads * hd;
+    const size_t stride = pos_stride(a);
     const float * k0 = a.k_cache + t0 * stride + base;
     __m256 r[N];
     for (int j = 0; j < N; ++j) r[j] = _mm256_setzero_ps();
@@ -254,7 +266,7 @@ float attn_head_scores(const AttnArgs & a, float * scratch) {
         for (int j = 0; j < SCORE_N; ++j) mx = std::max(mx, scratch[t + j]);
     }
     for (; t < a.n_kv; ++t) {
-        const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
+        const float * k = a.k_cache + t * pos_stride(a) + base;
         const float s = dot_avx2(q, k, hd) * a.scale;
         scratch[t] = s;
         mx = std::max(mx, s);
@@ -317,7 +329,7 @@ void transpose8(__m256 * a) {
 __attribute__((target("avx2,fma")))
 void scores_8x(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd,
                float scale, float * out) {
-    const size_t stride = a.n_kv_heads * hd;
+    const size_t stride = pos_stride(a);
     const float * k0 = a.k_cache + t0 * stride + base;
     const float * k1 = k0 + stride;
     __m256 r[8];
@@ -362,7 +374,7 @@ template <int G, int NT>
 __attribute__((target("avx2,fma")))
 void scores_group(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd,
                   const float * scale, float * out, float * mx) {
-    const size_t stride = a.n_kv_heads * hd;
+    const size_t stride = pos_stride(a);
     const float * k0 = a.k_cache + t0 * stride + base;
     __m256 acc[NT][G];
     for (int j = 0; j < NT; ++j)
@@ -399,7 +411,7 @@ template <int G, int NZ>
 __attribute__((target("avx512f,avx512vl,avx512bw,fma")))
 void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const float * inv,
              float * out) {
-    const size_t stride = a.n_kv_heads * hd;
+    const size_t stride = pos_stride(a);
     __m512 acc[G][NZ];
     for (int h = 0; h < G; ++h)
         for (int j = 0; j < NZ; ++j) acc[h][j] = _mm512_setzero_ps();
@@ -434,7 +446,7 @@ void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const 
 // dim per head) and the k write in decode is head_dim strided stores.
 template <int NP>
 __attribute__((target("avx512f,avx512vl,fma")))
-void scores_kt(const float * q, const float * kt_row0, size_t hd, size_t n_kv, size_t stride_d,
+void scores_kt(const float * q, const float * kt_row0, size_t hd, size_t /*n_kv*/, size_t stride_d,
                float scale, float * out) {
     __m512 acc[4];
     for (int h = 0; h < 4; ++h) acc[h] = _mm512_setzero_ps();
@@ -461,7 +473,7 @@ void attention_decode_avx2(const AttnArgs & a, float * scratch) {
         one.n_heads = 1;
         one.q = a.q + h * hd;
         one.out = a.out + h * hd;
-        one.base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
+        one.base = head_of(h, a.n_heads, a.n_kv_heads) * head_stride(a);
 
         const float mx = attn_head_scores(one, scratch);
         const float sum = softmax_exp_inplace(scratch, a.n_kv, mx);
@@ -505,7 +517,7 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
         // loop keeps a valid shift but leaks a larger max from earlier groups,
         // which costs a few ULP and makes a bit-identical split impossible.
         for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
-        const size_t base = gb * hd;
+        const size_t base = gb * head_stride(a);
         const float * q = a.q + gb * 4 * hd;
 
         float * p = scratch;  // 4 heads x n_kv probabilities, head-major
@@ -527,7 +539,7 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
         // cache, so score it per head.
         if (t < a.n_kv) {
             for (size_t h = 0; h < 4; ++h) {
-                const float * k = a.k_cache + t * a.n_kv_heads * hd + base;
+                const float * k = a.k_cache + t * pos_stride(a) + base;
                 const size_t hi = gb * 4 + h;
                 const float sc = dot_avx2(a.q + hi * hd, k, hd) * a.scale;
                 p[h * a.n_kv + t] = sc;
@@ -579,7 +591,7 @@ void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const
     const size_t blocks = (a.n_kv + KT_BLK - 1) / KT_BLK;
 
     for (size_t gb = 0; gb < a.n_kv_heads; ++gb) {
-        const size_t base = gb * hd;
+        const size_t base = gb * head_stride(a);
         const float * q = a.q + gb * 4 * hd;
         float * p = scratch;
 
@@ -602,7 +614,7 @@ void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const
                 for (size_t j = 0; j < n; ++j)
                     for (int h = 0; h < 4; ++h) {
                         const size_t hi = gb * 4 + h;
-                        const float * k = a.k_cache + (t0 + j) * a.n_kv_heads * hd + base;
+                        const float * k = a.k_cache + (t0 + j) * pos_stride(a) + base;
                         const float sc = dot_avx2(a.q + hi * hd, k, hd) * a.scale;
                         p[h * a.n_kv + t0 + j] = sc;
                         mxv[h] = std::max(mxv[h], sc);
