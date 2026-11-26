@@ -3531,7 +3531,10 @@ everywhere" is a utopian figure and must be read as such.
    flat in m and loses to n. The remaining half of the FFN time is glue.
 
 **What this changes.** The two largest absolute targets on 32k prefill are the
-attention score pass (45.6 s, 18% of fp32 peak, quadratic) and the MoE glue
-(586 ms per 1024 tokens = 18.7 s per 32k run, of which scatter is 11.7 s and is a
-pure engineering fix). Kernel tiling is third: 47% at n=2048 means at most a 2x
-there, and it is the hardest of the three.
+attention score pass (45.6 s, 18% of fp32 peak as recorded here -- see EXP-0057,
+this figure compared GMAC/s against GFLOP/s and the real share is 62%, so the
+lossless ceiling on the score pass is 1.6x, not 5.5x, quadratic) and the MoE glue
+(586 ms per 1024 tokens = 18.7 s per 32k run; the scatter share originally listed
+here as "a pure engineering fix" was disproven in EXP-0055 -- it runs at 63 of a
+77 GB/s replicated ceiling, so it is already at the memory wall). Kernel tiling is
+third: 47% at n=2048 means at most a 2x there, and it is the hardest of the three.
