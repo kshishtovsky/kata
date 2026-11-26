@@ -228,6 +228,9 @@ struct Model::Impl {
     size_t ubatch = 1;
     std::vector<float> px, pprev, pnorm, pffn, pffn2, pffn_out;
     std::vector<float> pq, pk, pv, pattn, pbcx, pexpacc;
+    // RoPE tables for one prefill chunk; depend on position only, so they are
+    // shared by all 10 attention layers instead of rebuilt per row per layer.
+    std::vector<float> rope_cos, rope_sin;
     std::vector<float> pconv_out, pbx;
     std::vector<block_q8_K> paq;
     // MoE scratch, sized once. Sized per single-expert bucket (ubatch) rather
@@ -325,6 +328,8 @@ struct Model::Impl {
         d_xgu.resize(2 * nu);
         // grouped decode attention wants n_heads/n_kv_heads floats per cached
         // position plus 8 for the tail.
+        rope_cos.assign(ubatch * (head_dim / 2), 0.0f);
+        rope_sin.assign(ubatch * (head_dim / 2), 0.0f);
         attn_scratch.assign(attention_scratch_floats_grouped_mt(
                                 AttnArgs{nullptr, nullptr, nullptr, n_ctx, n_head, n_head_kv, head_dim,
                                          0.0f, nullptr}, pool.size()),
@@ -827,12 +832,33 @@ struct Model::Impl {
         rms_norm(m * n_head_kv, head_dim, pk.data(), pk.data(), static_cast<const float *>(L.k_norm), eps);
         float * kbase = k_cache.data() + il * n_ctx * kvw;
         float * vbase = v_cache.data() + il * n_ctx * kvw;
-        for (size_t i = 0; i < m; ++i) {
-            const size_t pos = pos0 + i;
-            rope(n_head, head_dim, pq.data() + i * qw, pos, rope_base, false);
-            rope(n_head_kv, head_dim, pk.data() + i * kvw, pos, rope_base, false);
-            write_kv_head_major(kbase, vbase, pos, n_ctx, n_head_kv, head_dim,
-                                pk.data() + i * kvw, pv.data() + i * kvw);
+        // cos/sin depend only on (pos, head_dim, rope_base), so build them once
+        // for all m positions instead of recomputing 64 std::sin/std::cos per
+        // row per layer, and rotate rows in parallel. This stage was 614 ms of
+        // a 16k prefill almost entirely because it was serial and re-derived
+        // the same tables in every one of the 10 attention layers.
+        const size_t half = head_dim / 2;
+        rope_cos.resize(m * half);
+        rope_sin.resize(m * half);
+        rope_table_range(head_dim, pos0, m, rope_base, rope_cos.data(), rope_sin.data());
+        const unsigned nw = std::min<unsigned>(pool.size(), band(m, 64));
+        auto prep_rows = [&](size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; ++i) {
+                rope_tab(n_head, head_dim, pq.data() + i * qw, rope_cos.data() + i * half,
+                         rope_sin.data() + i * half, false);
+                rope_tab(n_head_kv, head_dim, pk.data() + i * kvw, rope_cos.data() + i * half,
+                         rope_sin.data() + i * half, false);
+                write_kv_head_major(kbase, vbase, pos0 + i, n_ctx, n_head_kv, head_dim,
+                                    pk.data() + i * kvw, pv.data() + i * kvw);
+            }
+        };
+        if (nw <= 1) {
+            prep_rows(0, m);
+        } else {
+            pool.run([&](unsigned w) {
+                if (w >= nw) return;
+                prep_rows(m * w / nw, m * (w + 1) / nw);
+            });
         }
         if (prof) {
             a_prep += std::chrono::duration<double, std::milli>(
