@@ -48,6 +48,7 @@
 | EXP-0045 | Head-major KV cache `[kv_head][position][head_dim]` | PASSED | KV walk 45.0 -> 73.3 GB/s at 8k (1.63x) and 44.4 -> 74.1 at 32k; decode 8k 26.9 -> 37.2 tok/s, 16k 32.0, 512 unchanged 44.6; prefill 25k 336 tok/s; layouts agree bit-exactly |
 | EXP-0046 | Prompt-lookup draft acceptance for speculative decoding | FAILED | greedy acceptance 0.08-0.13 tok/cycle on code, 0.10-0.18 on dialogue, 0.49-1.52 on a copy-heavy prompt; best case 1.49x, typical 0.30-0.80x vs no speculation |
 | EXP-0047 | int8 V cache with per-block fp16 scales | FAILED | decode attention 0.68-0.70x at every depth from 512 to 131072 (8192: 0.880 -> 1.270 ms, 32768: 3.187 -> 4.693 ms); accuracy fine (maxerr 1.4e-03 on max\|out\| 0.29); f32 v already runs 75.5 of 78 GB/s so the 3x dequant ALU is pure loss |
+| EXP-0048 | int4 V cache prototype, and why the prototype disagreed with the engine | NEEDS_RESEARCH | prototype gives i4 1.5-1.6x on the v pass, but the same prototype overstated int8 (1.6x vs the shipped kernel's 0.72x), so only an engine A/B can decide |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -3035,3 +3036,41 @@ same-binary A/B counts.
 **Files changed:** `include/kata/attn.h`, `include/kata/quant.h`,
 `src/quant.cpp`, `src/attn.cpp`, `src/model.cpp`, `tests/test_attn.cpp`.
 
+## EXP-0048 — int4 V prototype (not engine-verified)
+
+**Hypothesis.** int8 V lost (EXP-0047) because the dequant ALU is paid per 16
+values regardless of width, so int4 gets the same ALU bill for half the bytes.
+
+**Prototype** (`/tmp/vq4.cpp`, `/tmp/vq5.cpp`, single thread and 8 workers,
+working set pushed past L3). int4 uses `vpmovzxbw` -> `vpsrlw`/`vpand` ->
+`vpackuswb` -> `vpmovsxwd` -> `vpsubd 8` -> `vcvtdq2ps`, one nibble pair per 16
+values:
+
+| n_kv | f32 | i8 | i4 |
+|---|---|---|---|
+| 8192 | 3.20 ms | 1.96 (1.63x) | 1.99 (1.61x) |
+| 16384 | 5.67 | 3.50 (1.62x) | 3.71 (1.53x) |
+| 32768 | 10.14 | 7.67 (1.32x) | 6.66 (1.52x) |
+
+**Why this cannot be trusted yet.** The same prototype claimed int8 was 1.6x,
+while a direct A/B of the two kernels the engine actually ships
+(`/tmp/vq6.cpp`, one kv head, 4 query heads, G=4) gives the opposite:
+
+| n_kv | f32 | i8 | ratio |
+|---|---|---|---|
+| 4096 | 0.061 ms | 0.083 ms | 0.74x |
+| 16384 | 0.236 | 0.323 | 0.73x |
+| 32768 | 0.469 | 0.649 | 0.72x |
+
+The prototype kept one accumulator chain alive across all ten layers with a
+contiguous per-head stream, which is a friendlier memory pattern than one
+decode step performs; it measured a different program. Engine-level A/B
+(`KATA_KVQ` 0 vs 4096, 16384 context, same binary) also showed no win:
+`attn_core 9.54 -> 10.13 ms`, `30.70 vs 31.23 tok/s`.
+
+**Status.** Not adopted. The int4 kernel shape is worth keeping in mind because
+`vpmovzxbw`+`vpackuswb` costs roughly the same as `vpmovsxbd` while halving
+bytes, but it must be measured inside the engine, in the real per-head walk,
+before it can be called a win.
+
+**Files changed:** none in the repo.
