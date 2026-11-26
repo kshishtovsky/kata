@@ -412,3 +412,35 @@ TEST(Attn, Int8VCacheMatchesFloatCache) {
                 << " i=" << i;
     }
 }
+
+TEST(Attn, Int8VCacheIsActuallySelected) {
+    // Regression for EXP-0050: the gate used to read a.n_kv before it was set,
+    // so KATA_KVQ never engaged and two engine-level A/Bs compared float with
+    // float. The gate must derive n_kv from pos and switch on the threshold.
+    std::vector<int8_t> q(1 << 20, 0);
+    std::vector<uint16_t> sc(1 << 15, 0);
+    kata::AttnArgs off{};
+    kata::kvq_gate(off, 5000, 0, q.data(), sc.data(), 0);      // disabled
+    ASSERT_EQ(off.n_kv, 5001u);
+    EXPECT_EQ(off.v_q, nullptr);
+
+    kata::AttnArgs below{};
+    kata::kvq_gate(below, 10, 4096, q.data(), sc.data(), 0);   // under threshold
+    ASSERT_EQ(below.n_kv, 11u);
+    EXPECT_EQ(below.v_q, nullptr);
+
+    kata::AttnArgs on{};
+    kata::kvq_gate(on, 5000, 4096, q.data(), sc.data(), 0);    // above threshold
+    ASSERT_EQ(on.n_kv, 5001u);
+    ASSERT_NE(on.v_q, nullptr);
+    ASSERT_NE(on.v_scale, nullptr);
+
+    // The offset must follow the [layer][kv_head][position] slab, not the
+    // position count: a layer offset of L*VQ_BLK*8 scales has to land on the
+    // same scale as the base pointer plus that many blocks.
+    kata::AttnArgs slab{};
+    const size_t base_off = 64 * 3 * 2;                        // 3 kv heads, 2 pos
+    kata::kvq_gate(slab, 7000, 4096, q.data(), sc.data(), base_off);
+    EXPECT_EQ(slab.v_q, q.data() + base_off);
+    EXPECT_EQ(slab.v_scale, sc.data() + base_off / kata::VQ_BLK);
+}

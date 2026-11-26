@@ -486,15 +486,10 @@ struct Model::Impl {
         a.q = q.data();
         a.k_cache = kbase;
         a.v_cache = vbase;
-        a.n_kv = pos + 1;          // must precede the int8 gate below, which reads it
-        // int8 v is OFF by default (v_int8_min_kv = 0): EXP-0047 measured the
-        // shipped kernel at 0.72-0.74x and a 1.5% whole-token regression at 4-8k.
-        // KATA_KVQ=<n> opts in from n cached positions so an int4 experiment can
-        // reuse the plumbing without anyone inheriting the loss by accident.
-        if (v_int8_min_kv > 0 && a.n_kv >= v_int8_min_kv) {
-            a.v_q = v_q.data() + base_off;
-            a.v_scale = v_scale.data() + base_off / VQ_BLK;
-        }
+        // int8 v is OFF by default (v_int8_min_kv = 0): the kernel alone is
+        // 0.72-0.74x (EXP-0047) but the whole token is not (EXP-0050b: 16k
+        // 31.5 -> 28.8 ms/token), so the switch is left to the caller.
+        kvq_gate(a, pos, v_int8_min_kv, v_q.data(), v_scale.data(), base_off);
         a.stride_pos = head_dim;
         a.stride_head = n_ctx * head_dim;
         a.n_heads = n_head;

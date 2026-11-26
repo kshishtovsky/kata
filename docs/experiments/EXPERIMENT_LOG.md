@@ -51,6 +51,7 @@
 | EXP-0048 | int4 V cache prototype, and why the prototype disagreed with the engine | NEEDS_RESEARCH | prototype gives i4 1.5-1.6x on the v pass, but the same prototype overstated int8 (1.6x vs the shipped kernel's 0.72x), so only an engine A/B can decide |
 | EXP-0049 | int8 V shipped ON by default at a 1.5% loss; dead-code removal | PASSED | int8 V off by default (`KATA_KVQ` opts in): 4k 24.86 -> 24.45 ms/token, 8k 27.03 -> 26.61. MADV_HUGEPAGE on KV measured 1.6% WORSE and was dropped. Deleted `scores_group`/`scores_kt`/`attention_decode_avx2_grouped_kt`/`kt_*` (183 lines, dead since head-major KV made them unnecessary) |
 | EXP-0050 | Perplexity stand (teacher-forced NLL) | PASSED | baseline PPL 11.8221 (2048 tok) / 18.5469 (8192 tok); int8 V 11.6715 / 18.2293, i.e. no quality loss |
+| EXP-0051 | MoE experts to q3_K: per-tensor quality probe | FAILED (down) / NEEDS_RESEARCH (gate+up) | `ffn_down_exps` → q3_K costs **+6.20% PPL** on 24 chunks (all 24 worse), 12x the 0.5% gate — not adopted; ~0.5% of token time anyway, so it was never a speed lever. `gate/up` → q3_K measured **-5.24%** (better on 24/24, reproduced on upstream llama.cpp -4.09%), q5_K +0.79%, q4_K +0.00%; sign contradicts bit count, so not adopted |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -3169,6 +3170,136 @@ The gate exists. int8 V passes it, so its rejection stands on speed alone
 (EXP-0047), which is the correct reason. Keep, and use it before every future
 lossy change.
 
+### Correction after the gate fix (m07010)
+
+EXP-0047/0048 concluded "int8 V is dead" from a **kernel** measurement
+(0.72-0.74x). Once the gate actually fired, the **engine** A/B disagrees:
+16384 ctx, `--gen 32`, four paired runs, `KATA_KVQ=0` 31.29/31.76/31.17/31.17
+vs `KATA_KVQ=4096` 29.89/29.17/28.93/29.52 ms/token, i.e. **int8 V is 5-7%
+faster on the whole token** at 16k and neutral below 4k (1024: 22.66 vs 22.95,
+2048: 23.72 vs 23.74, 4096: 24.58 vs 24.42). So the standing verdict for int8 V
+is: **kernel 0.72x, engine 1.06x faster at 16k, neutral below 4k**. It stays OFF
+by default only because the win is long-context-only and unmeasured for quality
+beyond PPL (see the task-metric note below).
+
 ### Next iteration
 
-EXP-0051: q3_K on `ffn_down_exps` only, judged by this stand (accept ≤1% PPL).
+EXP-0051: q3_K on `ffn_down_exps` only, judged by this stand.
+
+### Acceptance criterion (set before the run, m07010)
+
+Both windows must pass, neither may be substituted for the other:
+`ΔPPL(2048 tok) ≤ 0.5%` **and** `ΔPPL(8192 tok) ≤ 1.0%`.
+
+Task metrics (GSM8K-40, a coding prompt, needle-in-haystack at 8k) are NOT run
+here. Recorded as a standing obligation: **next check when ΔPPL > 0.5%** on
+either window. This line exists so a later review does not discover an untested
+quality claim.
+
+## EXP-0051 — Quantising the MoE experts to q3_K: a per-tensor quality probe
+
+**Status:** FAILED for `ffn_down_exps` (the planned target). Needs research for
+`ffn_gate_exps`/`ffn_up_exps`, where q3_K measured *better* than the incumbent
+and the mechanism is not yet explained.
+
+**Hypothesis.** The MoE experts are 63% of the model's bytes (930 MB of 1490 MB)
+and `ffn_down_exps` is the q6_K third of them, so dropping it to q3_K should buy
+bytes at a tolerable quality cost, and the perplexity stand from EXP-0050 is now
+sharp enough to say whether that is true.
+
+**Why this experiment is a quality probe, not a speed win.** Per token,
+`ffn_down_exps` moves 47 MB of the 865 MB of active expert weights = 5.4%.
+A q6_K→q5_K step is -25% on that tensor = -12 MB = -0.16 ms; q3_K is -30% =
+-14 MB = -0.19 ms. Both sit below the resolution of the timing (0.97 gives "no
+effect", see EXP-0032/0049). **So the down experiments cannot produce 1.05x and
+are not expected to.** They exist to establish how the error decomposes before
+touching `ffn_gate_exps`/`ffn_up_exps` (481 MB, 56% of per-token expert traffic),
+where q3_K is -101 MB = -1.4 ms = 1.05x and q2_K is -190 MB = -2.6 ms = 1.09x,
+and where the quality risk is an order of magnitude higher.
+
+**Method.** `llama-quantize --allow-requantize --tensor-type "<name>=<type>"`
+from `/home/medovarov/models/gguf/LFM2.5-24B-A2B-Q4_K_M.gguf`, all artefacts in
+`/home/medovarov/kata-work/` (`/tmp` is a 32 GB tmpfs and a truncated write there
+produced `basic_ios::clear: iostream error`). Quality via
+`llama-perplexity -f wiki.test.raw -t 16 -c 2048 --chunks 24`. kata cannot yet
+load q3_K/q5_K (`kata: unsupported weight type in prefill: 11`), so the oracle is
+llama.cpp on identical files; that is legitimate for a quantisation question
+because both engines read the same bytes.
+
+**Measurement trap #1 (protocol).** `--chunks 1` gave base 11.3497, down-q3_K
+13.1964, all-q3K **11.0877** — 3-bit weights appearing to beat 4-bit. One
+2048-token chunk is a single unrepresentative sample: across 24 chunks the
+baseline spreads 11.35 to 17.66. All numbers below are 24-chunk means.
+
+**Measurement trap #2 (the control that mattered).** `--allow-requantize`
+runs every tensor through dequantise→quantise even when its type does not
+change, so each variant differs from the baseline by one extra round trip as
+well as by the intended edit. Control: the same command with no
+`--tensor-type` override (`LFM-requant-Q4KM.gguf`, 13845.45 MiB, 4.85 BPW) gave
+**13.859 vs 13.859 baseline, 24 of 24 chunks bit-identical** — requantise is
+idempotent here, so the only variable is the intended change. Same control with
+`--tensor-type "ffn_gate_exps=q4_K"` (a no-op edit) also gave +0.00%.
+
+**Results** (24 chunks, `-c 2048`, mean PPL):
+
+| config | mean PPL | vs base |
+|---|---|---|
+| base Q4_K_M (dynamic, imatrix-style recipe) | 13.859 | — |
+| requant control, same recipe | 13.859 | +0.00% |
+| gate/up → plain q4_K (no-op edit) | 13.859 | +0.00% |
+| **`ffn_down_exps` → q3_K** | **14.719** | **+6.20%** |
+| gate/up → q5_K | 13.969 | +0.79% |
+| gate/up → q3_K | 13.133 | **-5.24%** |
+
+Per-chunk shape: `down → q3_K` is worse on 24 of 24 chunks (min +3.87%, max
++16.27%, median +5.88%). `gate/up → q3_K` is better on **24 of 24**, monotone
+(-4.0% to -10.0%), which is what makes it suspicious rather than noise.
+
+**Result against the gate: FAILED.** `down → q3_K` costs +6.20% at 2048 tokens,
+12x the 0.5% allowance. It is not adopted and `ffn_down_exps` stays q6_K/q4_K.
+The 8192 window was not needed, since the 2048 window already fails by an order
+of magnitude.
+
+**The unexplained one.** `gate/up → q3_K` improving PPL by 5% on every chunk is
+not plausible as "fewer bits are better", so it was probed before being written
+down:
+
+1. Not a fork artefact: reproduced on a second, independent engine
+   (`/home/medovarov/llamacpp/llama-b12721`), 12.6242 → 12.1074 = -4.09% over 8
+   chunks.
+2. Not the requantise path (controls above, both +0.00%).
+3. Not simply bit count: gate/up at **q5_K is +0.79%** (worse), at q4_K +0.00%,
+   at q3_K -5.24%. Monotonicity in bits is broken.
+4. Not the embedding (unchanged q6_K, tied lm_head) — verified per tensor: the
+   gate/up file differs from the baseline in exactly 76 tensors, all
+   `ffn_gate_exps`/`ffn_up_exps`, all q4_K→q3_K.
+
+Remaining hypothesis, unproven: q3_K uses **16-value sub-blocks** (six-bit
+scales at 1 per 16) while q4_K and q5_K use 32, so q3_K is not strictly coarser
+— it can represent a step at twice the resolution with two fewer mantissa bits.
+If the incumbent q4_K scales are the limiting factor on these particular
+tensors, q3_K can genuinely be the better fit. **This needs a mechanism check
+before anything is adopted**: compare per-tensor quantisation error (not PPL)
+for q4_K vs q3_K on the same dequantised weights, and measure a task metric on
+the gate/up file, because a 5% PPL improvement that comes from a different
+quasi-random direction is still a change in the model's distribution.
+
+**Conclusion.** The planned lever is dead: quantising `ffn_down_exps` to q3_K
+costs 6.2% perplexity and buys ~0.5% of token time, i.e. nothing measurable.
+The interesting finding is the opposite direction — gate/up at q3_K measured
+5% better on two engines — and it is explicitly NOT adopted: it contradicts
+the expected sign, so it is a research target, not a win.
+
+**Lessons recorded.** (a) One chunk is not a sample; 24 chunks minimum for this
+corpus. (b) Always run a no-override requantise control before attributing a
+delta to an override — it cost one command and eliminated an entire hypothesis.
+(c) A PPL delta larger than the bit-count story allows is evidence of an
+unmodelled mechanism, not of a free lunch. (d) `llama-perplexity` needs
+`grep -oE "\[[0-9]+\][0-9.]+" | sed 's/\[[0-9]*\]//'`; `llama-quantize` needs
+`--allow-requantize` to touch already-quantised tensors.
+
+**Next iteration.** q3_K on `ffn_gate_exps`/`ffn_up_exps` is the real lever
+(481 MB, 56% of expert traffic, -101 MB = -1.4 ms = 1.05x) but is blocked by the
+anomaly above: measure per-tensor error and a task metric first. Independently,
+implement q3_K (type 11) and q5_K (type 13) in kata so quality probes do not
+need a second engine.

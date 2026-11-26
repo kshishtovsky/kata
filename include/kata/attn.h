@@ -35,7 +35,21 @@ struct AttnArgs {
     const int8_t * v_q = nullptr;
     const uint16_t * v_scale = nullptr;
 };
+
+// Decides whether a decode step reads the int8 V cache. Extracted so a test can
+// prove the gate sees a real position count: EXP-0050 found it reading a.n_kv
+// before that field was assigned, so int8 never engaged and two experiments
+// silently compared float against float.
 inline constexpr size_t VQ_BLK = 32;  // values per int8 scale
+
+inline void kvq_gate(AttnArgs & a, size_t pos, size_t min_kv,
+                     const int8_t * v_q, const uint16_t * v_scale, size_t base_off) {
+    a.n_kv = pos + 1;
+    if (min_kv > 0 && a.n_kv >= min_kv) {
+        a.v_q = v_q + base_off;
+        a.v_scale = v_scale + base_off / VQ_BLK;
+    }
+}
 
 void attention_decode_ref(const AttnArgs & a, float * scratch);
 void attention_decode_avx2(const AttnArgs & a, float * scratch);
