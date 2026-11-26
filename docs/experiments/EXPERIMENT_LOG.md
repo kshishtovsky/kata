@@ -2745,3 +2745,59 @@ q-vectors from L1 on every kv position even though 16 of 32 zmm registers are fr
 
 Keep. 1.16x on long-context prefill for a one-line change plus a correct polynomial, and
 the precision is measurably better than the degree-5 predecessor.
+
+## EXP-0043 — Parallel decode attention by kv head, AVX-512 ISA guard
+
+**Status:** PASSED
+**Hypothesis:** decode attention is single-threaded (`attention_decode_grouped` is
+called with no pool from `src/model.cpp`), so at long context one core does all the
+score and v work. Kv heads are fully independent — each owns its own query heads,
+score vector, softmax max and `out` slice — so splitting by kv head should be
+bit-identical and scale with cores. Secondary: `attention_decode_avx2_grouped` is
+compiled `target("avx2,fma")` but calls `v_group`, which is AVX-512 only; GCC emits
+it out-of-line so no zmm leaks into this TU and the call is a latent SIGILL on an
+AVX2-only host.
+
+**Implementation:**
+- `attention_decode_avx2_grouped_range(a, scratch, gb0, gb1, mx_out, sum_out)` —
+  the old body with a group range instead of `0 .. n_kv_heads`; the old name stays
+  as a thin wrapper.
+- `attention_decode_grouped_mt(a, scratch, pool)` and
+  `attention_scratch_floats_grouped_mt(a, n_threads)` (scratch is per-worker).
+- `src/model.cpp` sizes one workspace and passes the pool.
+- `attention_decode_grouped` falls back to per-head `attention_decode_avx2` on
+  AVX2-only hosts instead of calling into AVX-512 code.
+- `attention_decode_grouped_kt` gated on `Isa::Avx512*` rather than `Avx512Vnni`:
+  the kt score pass uses no VNNI instruction at all.
+- Test `Attn.MtSplitMatchesSingleThreaded`, 8 shapes x 3 worker counts, `ASSERT_EQ`.
+
+**Two bugs found while validating:**
+1. Pre-existing in the grouped kernel: `mxv[4]` was reset once before the kv-group
+   loop, so groups 1..7 inherited a larger max from group 0. A shared max is a
+   mathematically valid softmax shift, so single-threaded results were right to
+   within rounding, but the leftover max cost 1-2 ULP and made any bit-identical
+   split impossible. Reset moved inside the loop.
+2. Mine: the worker lambda indexed scratch and the group range by worker id `w`
+   while the number of groups `nw` can be smaller than the pool size, so extra
+   workers wrote past their scratch slice (caught by ASan as a heap-buffer-overflow
+   in `scores_8x`). Added `if (w >= nw) return;`.
+
+**Benchmark** (LFM2.5-24B-A2B-Q4_K_M, 16 threads, 12 steady-state decode calls
+after a prefill, `KATA_MAX_THREADS=16`):
+
+| context | before | after | gain |
+| --- | --- | --- | --- |
+| 512 | 22.8 ms/tok (43.8 t/s) | 22.8 ms/tok (43.8 t/s) | 1.00x |
+| 2048 | 29.5 ms/tok (33.9 t/s) | 24.3 ms/tok (41.1 t/s) | 1.21x |
+| 8192 | 51.2 ms/tok (19.6 t/s) | 29.6 ms/tok (33.8 t/s) | 1.73x |
+| 16384 | 79.6 ms/tok (12.6 t/s) | 37.2 ms/tok (26.9 t/s) | **2.14x** |
+
+**Quality:** argmax=440 on the 522-token prompt at 1, 8 and 16 threads (logit
+16.11124 / 16.16950 / 16.12790 — the spread is float32 reassociation across
+thread counts, already documented as this engine's noise floor). 94/94 tests.
+
+**Bottleneck after:** at 16k the remaining 37 ms is 22.8 ms of linear work
+(MoE + lm_head at ~67 GB/s) plus ~14 ms of attention. The next lever is INT8 KV,
+worth ~2x on the attention part only.
+
+**Conclusion:** keep. Decode at 16k went from 3.5x behind llama.cpp to near par.

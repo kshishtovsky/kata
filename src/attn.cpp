@@ -1,6 +1,7 @@
 #include "kata/attn.h"
 
 #include "kata/cpu.h"
+#include "kata/pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -476,7 +477,11 @@ size_t attention_scratch_floats_grouped(const AttnArgs & a) {
 }
 
 __attribute__((target("avx2,fma")))
-void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
+// Walks kv heads [gb0, gb1). Each kv head owns its query heads' scores and its
+// own output slice, so a caller may hand disjoint ranges to different workers
+// and get a bit-identical result with no merge step.
+void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, size_t gb0,
+                                         size_t gb1, float * mx_out, float * sum_out) {
     const size_t hd = a.head_dim;
     const size_t g = a.n_heads / a.n_kv_heads;
 
@@ -486,13 +491,13 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
         return;
     }
 
-    alignas(64) float scale[4], mxv[4], inv[4];
-    for (size_t h = 0; h < 4; ++h) {
-        scale[h] = a.scale;
-        mxv[h] = -INFINITY;
-    }
+    alignas(64) float mxv[4], inv[4];
 
-    for (size_t gb = 0; gb < a.n_kv_heads; ++gb) {
+    for (size_t gb = gb0; gb < gb1; ++gb) {
+        // Each kv group carries its own softmax max. Resetting once outside the
+        // loop keeps a valid shift but leaks a larger max from earlier groups,
+        // which costs a few ULP and makes a bit-identical split impossible.
+        for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
         const size_t base = gb * hd;
         const float * q = a.q + gb * 4 * hd;
 
@@ -527,6 +532,8 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
             float * ph = p + h * a.n_kv;
             const float sum = softmax_exp_inplace(ph, a.n_kv, mxv[h]);
             inv[h] = 1.0f / sum;
+            if (mx_out) mx_out[gb * 4 + h] = mxv[h];
+            if (sum_out) sum_out[gb * 4 + h] = sum;
         }
 
         // head_dim / 16 is compile-time per case so the accumulators stay in zmm.
@@ -540,11 +547,16 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch) {
 }
 
 
+void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch, float * mx_out,
+                                  float * sum_out) {
+    attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, mx_out, sum_out);
+}
+
 __attribute__((target("avx512f,avx512vl,avx2,fma")))
 void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
     const size_t hd = a.head_dim;
     const size_t g = a.n_heads / a.n_kv_heads;
-    if (g != 4 || hd != 64) { attention_decode_avx2_grouped(a, scratch); return; }
+    if (g != 4 || hd != 64) { attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, nullptr, nullptr); return; }
 
     alignas(64) float mxv[4], inv[4];
     for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
@@ -594,11 +606,16 @@ void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const
 
 void attention_decode_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
 #if defined(__x86_64__) || defined(__i386__)
-    if (cpu_isa() == Isa::Avx512Vnni) { attention_decode_avx2_grouped_kt(a, scratch, kt); return; }
+    // The kt score pass needs zmm (positions are the lanes), so it is gated on
+    // real AVX-512, not on VNNI, which it never uses.
+    if (cpu_isa() == Isa::Avx512Vnni || cpu_isa() == Isa::Avx512) {
+        attention_decode_avx2_grouped_kt(a, scratch, kt);
+        return;
+    }
 #else
     (void)kt;
 #endif
-    attention_decode_avx2_grouped(a, scratch);
+    attention_decode_grouped(a, scratch);
 }
 
 #else
@@ -652,7 +669,44 @@ void attention_decode_grouped(const AttnArgs & a, float * scratch) {
         attention_decode_ref(a, scratch);
         return;
     }
-    attention_decode_avx2_grouped(a, scratch);
+    // The G=4 fast path calls v_group, which is compiled for AVX-512 only. GCC
+    // emits it out-of-line (no zmm leaks into this TU's avx2 function), so an
+    // AVX2-only host would take SIGILL at the call instead of here.
+    // shortcut: AVX2-only hosts lose the grouped kernel and run per-head, ~2x
+    // slower at long context; add an AVX2 v_group if such a host becomes a target.
+    if (cpu_isa() != Isa::Avx2) {
+        attention_decode_avx2_grouped(a, scratch, nullptr, nullptr);
+        return;
+    }
+    attention_decode_avx2(a, scratch);
+}
+
+size_t attention_scratch_floats_grouped_mt(const AttnArgs & a, unsigned n_threads) {
+    const size_t per = attention_scratch_floats_grouped(a);
+    const size_t nw = std::max<size_t>(1, std::min<size_t>(n_threads, a.n_kv_heads));
+    return per * nw;
+}
+
+void attention_decode_grouped_mt(const AttnArgs & a, float * scratch, ThreadPool & pool) {
+    const size_t g = a.n_heads / a.n_kv_heads;
+    const size_t hd = a.head_dim;
+    const bool fast = g == 4 && hd % 16 == 0 && hd <= 64 && cpu_isa() != Isa::Avx2 &&
+                      cpu_isa() != Isa::Scalar;
+    const size_t nw = fast ? std::min<size_t>(pool.size(), a.n_kv_heads) : 1;
+    if (nw <= 1) {
+        attention_decode_grouped(a, scratch);
+        return;
+    }
+    const size_t per = attention_scratch_floats_grouped(a);
+    pool.run([&](unsigned w) {
+        // The pool may have more workers than we have kv-head groups: w is the
+        // worker id, not the group index, so anything past nw must return here.
+        if (w >= nw) return;
+        const size_t gb0 = a.n_kv_heads * w / nw;
+        const size_t gb1 = a.n_kv_heads * (w + 1) / nw;
+        if (gb0 >= gb1) return;
+        attention_decode_avx2_grouped_range(a, scratch + w * per, gb0, gb1, nullptr, nullptr);
+    });
 }
 
 void attention_decode(const AttnArgs & a, float * scratch) {

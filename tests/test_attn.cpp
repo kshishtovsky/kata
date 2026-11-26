@@ -2,6 +2,7 @@
 
 #include "kata/attn.h"
 #include "kata/cpu.h"
+#include "kata/pool.h"
 #include "kata/simd.h"
 
 #include <cmath>
@@ -272,3 +273,38 @@ TEST(SimdExp, Exp512MatchesStdExp) {
 }
 #endif
 
+TEST(Attn, MtSplitMatchesSingleThreaded) {
+    // Kv heads own disjoint query heads and output slices, so splitting them
+    // across workers must be bit-identical, not merely close.
+    if (kata::cpu_isa() == kata::Isa::Scalar) GTEST_SKIP() << "no AVX2 on this host";
+    struct C { size_t nh, nkv, hd, n_kv; };
+    const C cases[] = {
+        {32, 8, 64, 1}, {32, 8, 64, 37}, {32, 8, 64, 256}, {32, 8, 64, 4097},
+        {32, 8, 32, 63}, {16, 4, 16, 511}, {8, 2, 96, 200}, {8, 8, 64, 129},
+    };
+    for (const auto & c : cases) {
+        auto q = rnd(c.nh * c.hd, 31);
+        auto k = rnd(c.n_kv * c.nkv * c.hd, 32);
+        auto v = rnd(c.n_kv * c.nkv * c.hd, 33);
+        kata::AttnArgs a{};
+        a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
+        a.n_kv = c.n_kv; a.n_heads = c.nh; a.n_kv_heads = c.nkv;
+        a.head_dim = c.hd; a.scale = 1.0f / std::sqrt((float)c.hd);
+        std::vector<float> want(c.nh * c.hd), got(c.nh * c.hd);
+
+        a.out = want.data();
+        std::vector<float> s0(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s0.data());
+
+        for (unsigned nt : {2u, 3u, 8u}) {
+            kata::ThreadPool pool(nt);
+            a.out = got.data();
+            std::vector<float> s1(kata::attention_scratch_floats_grouped_mt(a, nt));
+            kata::attention_decode_grouped_mt(a, s1.data(), pool);
+            for (size_t i = 0; i < want.size(); ++i)
+                ASSERT_EQ(got[i], want[i])
+                    << "nt=" << nt << " heads=" << c.nh << "/" << c.nkv << " hd=" << c.hd
+                    << " n_kv=" << c.n_kv << " i=" << i;
+        }
+    }
+}

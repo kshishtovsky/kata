@@ -38,6 +38,14 @@ void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[
 // per head. Needs its own, larger scratch: see attention_scratch_floats_grouped.
 size_t attention_scratch_floats_grouped(const AttnArgs & a);
 void attention_decode_grouped(const AttnArgs & a, float * scratch);
+
+// Kv heads are independent: each owns its query heads' scores and its own
+// output slice. So the pooled path splits them across workers and produces a
+// bit-identical result, no online-softmax merge and no extra precision loss.
+// scratch must hold attention_scratch_floats_grouped_mt(a, n_threads).
+struct ThreadPool;
+size_t attention_scratch_floats_grouped_mt(const AttnArgs & a, unsigned n_threads);
+void attention_decode_grouped_mt(const AttnArgs & a, float * scratch, ThreadPool & pool);
 // Same decode, but the score pass reads k from the transposed cache built by
 // kt_write. Needs at least kt_floats() and the grouped scratch.
 void attention_decode_grouped_kt(const AttnArgs & a, float * scratch, const float * kt);

@@ -287,7 +287,10 @@ struct Model::Impl {
         d_xgu.resize(2 * nu);
         // grouped decode attention wants n_heads/n_kv_heads floats per cached
         // position plus 8 for the tail.
-        attn_scratch.assign(n_ctx * (n_head / n_head_kv) + 8, 0.0f);
+        attn_scratch.assign(attention_scratch_floats_grouped_mt(
+                                AttnArgs{nullptr, nullptr, nullptr, n_ctx, n_head, n_head_kv, head_dim,
+                                         0.0f, nullptr}, pool.size()),
+                            0.0f);
         spr_3.assign(3 * n_embd / QK_K, {});
         spr_ao.assign(n_embd / QK_K, {});
         spr_out.assign(n_embd, 0.0f);
@@ -449,7 +452,7 @@ struct Model::Impl {
         a.head_dim = head_dim;
         a.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         a.out = attn_out.data();
-        attention_decode_grouped(a, attn_scratch.data());
+        attention_decode_grouped_mt(a, attn_scratch.data(), pool);
 
         mm(L.to, n_embd, n_head * head_dim, attn_out.data(), L.wo, attn_out.data());
     }
