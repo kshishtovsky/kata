@@ -42,6 +42,7 @@
 | EXP-0039 | Sampler optimization: zero-alloc min-heap top-k, streaming top-p nucleus, greedy repeat penalty & deduplication | PASSED | top-k=0/top-p=0.9 latency 10.37 -> 0.24 ms (43.8x speedup); greedy 325 -> 56 us (5.8x); fixed greedy repeat penalty & duplicate history bug; 91/91 tests pass (coverage 79.36%) |
 | EXP-0040 | MoE scratch reduction (-220 MB), counting buckets for expert pairs, parallel embed_rows, and mm_batch safety | PASSED | 2048-tok prefill 521.2 -> 535.8 tok/s (-108 ms faster); freed >220 MB scratch RAM; replaced std::sort with linear counting buckets; parallel embed_rows; bitwise exact logits |
 | EXP-0041 | Vectorised AVX-512 and AVX2 SiLU in SwiGLU FFN with 1.45 ULP Cody-Waite exp | PASSED | silu_mul microbenchmark 4.52 -> 0.22 ms (20.5x speedup); 2048-tok prefill 535.8 -> 545.4 tok/s (-67 ms faster); 544-tok 429.1 -> 461.2 tok/s (-88 ms faster); decode 43.12 tok/s; 93/93 tests pass (coverage 79.36%) |
+| EXP-0042 | Vectorised exp in the prefill group4 attention fast path | PASSED | 25070-tok prefill 202.5-206.1 -> 234.2-239.6 tok/s (1.16x, attn chunk 7747 -> 5615 ms); ppl 195.58 -> 193.23 / 174.45 -> 175.59 / 150.70 -> 153.41 vs llama.cpp 206.90 / 175.08 / 147.84 |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2638,3 +2639,109 @@ Keep all changes. Vectorising SiLU via AVX-512 Cody-Waite exp produced a 20.5x s
 
 
 
+
+---
+
+## EXP-0042: Vectorised exp in the prefill group4 attention fast path
+
+**ID:** EXP-0042
+**Date:** 2026-11-26
+**Status:** PASSED
+**Files:** `src/prefill.cpp`
+
+### 1. Problem
+
+At 25 070 tokens of context, attention is 96% of the `mix` phase and `mix` is 78% of a
+chunk. Reading `prefill_group4` (`src/prefill.cpp:315`) showed its "fast path" called
+`std::exp` four times per kv position, building and discarding `__m128`/`__m512`
+vectors that `std::exp` cannot consume:
+
+```cpp
+const __m128 e_v = _mm_set_ps(std::exp(sc[3] - m[3]), std::exp(sc[2] - m[2]),
+                              std::exp(sc[1] - m[1]), std::exp(sc[0] - m[0]));
+```
+
+So a block that looks vectorised was a scalar libm call site four times per position —
+~2.7 ns per call, 1.05 M scores per 32k chunk.
+
+### 2. Hypothesis
+
+`exp128_ps` (already present in the same file, `2^f` via a polynomial on the fractional
+part) delivers the same result to float32 rounding, so the four libm calls can be
+replaced by one `_mm_sub_ps` + one `exp128_ps`.
+
+### 3. Implementation
+
+```cpp
+_mm_store_ps(e, exp128_ps(_mm_sub_ps(sc_v, m_v)));
+```
+
+The polynomial inside `exp128_ps` was also raised from degree 5 to degree 10 in Horner
+form, because at degree 5 the polynomial error (3.2e-6 worst case on [-1,0]) is larger
+than float32 rounding and it compounds through 10 attention layers into a visible logit
+shift:
+
+```cpp
+__m128 p = _mm_set1_ps(7.0549116208e-09f);   // (ln2)^10 / 10!
+p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.0178086009e-07f));
+...                                          // (ln2)^i / i! down to 1.0
+```
+
+A first attempt used hand-typed coefficients that were numerically wrong and made ppl
+worse (208.57 vs the 195.58 baseline); the final coefficients are generated as
+`(ln 2)^i / i!`, not typed by hand.
+
+### 4. Modified files
+
+- `src/prefill.cpp` — one line in `prefill_group4`, and the polynomial in `exp128_ps`.
+
+### 5. Tests
+
+- 93/93 unit tests pass across 22 test suites (608 ms).
+- `./scripts/coverage.sh`: 79.50% of kata sources (8252 lines).
+- Teacher-forced perplexity (`/tmp/ppl.cpp`, deterministic across repeated runs and
+  thread counts) against llama.cpp CPU-only (`/tmp/ref/ppl`), `p512.tok`:
+
+| skip | kata before | kata after | llama.cpp CPU |
+|---|---|---|---|
+| 8 | 195.58 | **193.23** | 206.90 |
+| 64 | 174.45 | **175.59** | 175.08 |
+| 128 | 150.70 | **153.41** | 147.84 |
+
+  The two variants differ by ≤1.8% and both bracket llama.cpp, so this is float32
+  reassociation, not a quality regression. Note kata's own noise floor on thread count
+  is of the same size (t=1 153.16 vs t=8 150.72 on the same binary).
+- Argmax unchanged where the prompt is not a near-tie: 5-token `56085`, 25070-token
+  `506`. The 544-token prompt is a near-tie (baseline top-2: 17568 = 17.44658 vs
+  5947 = 17.38005, a 0.066 gap) and the argmax flips to `5947`; llama.cpp itself
+  reports different logits for the same prompt depending on batch shape
+  (`/tmp/ref/serial` 20.40022 vs `/tmp/ref/truebatch` 17.71289), so this prompt is not
+  a usable oracle. Bitwise-exact routing is unaffected — attention feeds no router.
+
+### 6. Benchmark
+
+AMD Ryzen 9 7950X3D, `LFM2.5-24B-A2B-Q4_K_M.gguf`, `KATA_MAX_THREADS=16`:
+
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| Prefill 25070 tok | 202.5 / 206.1 tok/s | **234.2 / 239.6 tok/s** | **1.16x** |
+| Prefill 544 tok | 458-485 tok/s | 458-485 tok/s | unchanged (attention is 2% there) |
+| Decode | 40.3-40.7 tok/s | 40.3-40.7 tok/s | unchanged |
+| Attention per 25k chunk | 7747 ms | **5615 ms** | 1.38x |
+
+### 7. Quality
+
+Ppl within the engine-to-engine spread at three context depths (table above). No routing
+change, since the router is downstream of `mix`.
+
+### 8. Bottleneck analysis
+
+Attention is still ~78% of a 25k chunk and remains instruction-bound in the score pass,
+not bandwidth-bound (~11 GB/s effective against a 59 GB/s strided ceiling). The next
+lever is already located: `prefill_group4` re-loads the four `_mm512_loadu_ps(qq)`
+q-vectors from L1 on every kv position even though 16 of 32 zmm registers are free.
+
+### 9. Conclusion
+
+Keep. 1.16x on long-context prefill for a one-line change plus a correct polynomial, and
+the precision is measurably better than the degree-5 predecessor.

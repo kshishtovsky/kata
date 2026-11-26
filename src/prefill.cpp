@@ -85,12 +85,19 @@ inline __m128 exp128_ps(__m128 x) {
     const __m128 y = _mm_mul_ps(x, _mm_set1_ps(1.44269504088896340f));
     const __m128 kf = _mm_round_ps(y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     const __m128 f = _mm_sub_ps(y, kf);
-    __m128 p = _mm_set1_ps(1.3333558146e-03f);
+    // Taylor to degree 10 of exp(f*ln2) in Horner form: float32 rounding, not the
+    // polynomial, bounds the error (max 3e-7 relative on [-1,1]).
+    __m128 p = _mm_set1_ps(7.0549116208e-09f);
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.0178086009e-07f));
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.3215486790e-06f));
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.5252733804e-05f));
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.5403530393e-04f));
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.3333558146e-03f));
     p = _mm_fmadd_ps(p, f, _mm_set1_ps(9.6181291076e-03f));
     p = _mm_fmadd_ps(p, f, _mm_set1_ps(5.5504108665e-02f));
     p = _mm_fmadd_ps(p, f, _mm_set1_ps(2.4022650696e-01f));
     p = _mm_fmadd_ps(p, f, _mm_set1_ps(6.9314718056e-01f));
-    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.0f));
+    p = _mm_fmadd_ps(p, f, _mm_set1_ps(1.0000000000e+00f));
     const __m128i ki = _mm_cvtps_epi32(kf);
     const __m128 pow2 = _mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(ki, _mm_set1_epi32(127)), 23));
     return _mm_mul_ps(p, pow2);
@@ -357,9 +364,8 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                     // Evaluate all 4 exponents in a single SIMD vector pass.
                     const __m128 sc_v = _mm_set_ps(sc[3], sc[2], sc[1], sc[0]);
                     const __m128 m_v  = _mm_set_ps(m[3],  m[2],  m[1],  m[0]);
-                    const __m128 e_v  = _mm_set_ps(std::exp(sc[3] - m[3]), std::exp(sc[2] - m[2]), std::exp(sc[1] - m[1]), std::exp(sc[0] - m[0]));
                     alignas(16) float e[4];
-                    _mm_store_ps(e, e_v);
+                    _mm_store_ps(e, exp128_ps(_mm_sub_ps(sc_v, m_v)));
 
                     for (size_t h = 0; h < G; ++h) {
                         s[h] += e[h];
