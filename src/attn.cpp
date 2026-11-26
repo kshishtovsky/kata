@@ -481,7 +481,8 @@ __attribute__((target("avx2,fma")))
 // own output slice, so a caller may hand disjoint ranges to different workers
 // and get a bit-identical result with no merge step.
 void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, size_t gb0,
-                                         size_t gb1, float * mx_out, float * sum_out) {
+                                         size_t gb1, float * mx_out, float * sum_out,
+                                         double * phase_us) {
     const size_t hd = a.head_dim;
     const size_t g = a.n_heads / a.n_kv_heads;
 
@@ -492,8 +493,14 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
     }
 
     alignas(64) float mxv[4], inv[4];
+    // phase_us is measured inside the kernel that actually runs, so it cannot
+    // drift away from the real work the way a re-implemented probe does.
+    using clk = std::chrono::steady_clock;
+    clk::time_point t_score{}, t_soft{}, t_v{};
+    const bool probe = phase_us != nullptr;
 
     for (size_t gb = gb0; gb < gb1; ++gb) {
+        if (probe) t_score = clk::now();
         // Each kv group carries its own softmax max. Resetting once outside the
         // loop keeps a valid shift but leaks a larger max from earlier groups,
         // which costs a few ULP and makes a bit-identical split impossible.
@@ -528,6 +535,7 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
             }
         }
 
+        if (probe) t_soft = clk::now();
         for (size_t h = 0; h < 4; ++h) {
             float * ph = p + h * a.n_kv;
             const float sum = softmax_exp_inplace(ph, a.n_kv, mxv[h]);
@@ -536,6 +544,11 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
             if (sum_out) sum_out[gb * 4 + h] = sum;
         }
 
+        if (probe) {
+            t_v = clk::now();
+            phase_us[0] += std::chrono::duration<double, std::micro>(t_soft - t_score).count();
+            phase_us[1] += std::chrono::duration<double, std::micro>(t_v - t_soft).count();
+        }
         // head_dim / 16 is compile-time per case so the accumulators stay in zmm.
         switch (hd / 16) {
         case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
@@ -543,20 +556,23 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
         case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
         default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
         }
+        if (probe) {
+            phase_us[2] += std::chrono::duration<double, std::micro>(clk::now() - t_v).count();
+        }
     }
 }
 
 
 void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch, float * mx_out,
                                   float * sum_out) {
-    attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, mx_out, sum_out);
+    attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, mx_out, sum_out, nullptr);
 }
 
 __attribute__((target("avx512f,avx512vl,avx2,fma")))
 void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
     const size_t hd = a.head_dim;
     const size_t g = a.n_heads / a.n_kv_heads;
-    if (g != 4 || hd != 64) { attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, nullptr, nullptr); return; }
+    if (g != 4 || hd != 64) { attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, nullptr, nullptr, nullptr); return; }
 
     alignas(64) float mxv[4], inv[4];
     for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
@@ -633,35 +649,21 @@ size_t attention_scratch_floats(const AttnArgs & a) {
 }
 
 void attention_decode_phases(const AttnArgs & a, float * scratch, double out_us[3]) {
-    // Mirrors attention_decode pass by pass; keep the two in step.
-    double us[3] = {0, 0, 0};
+    // Runs the real grouped kernel with its phase counters on. An earlier version
+    // re-implemented the passes per head and silently profiled code the grouped
+    // path no longer uses; never re-implement, instrument.
+    out_us[0] = out_us[1] = out_us[2] = 0.0;
+    const size_t g = a.n_heads / a.n_kv_heads;
     const size_t hd = a.head_dim;
-    if (cpu_isa() == Isa::Scalar) {
-        attention_decode(a, scratch);
-        out_us[0] = out_us[1] = out_us[2] = 0.0;
+    const bool grouped = cpu_isa() != Isa::Scalar && cpu_isa() != Isa::Avx2 && g == 4 &&
+                         hd % 16 == 0 && hd <= 64;
+    if (!grouped) {
+        attention_decode_grouped(a, scratch);
         return;
     }
 #if defined(__x86_64__) || defined(__i386__)
-    for (size_t h = 0; h < a.n_heads; ++h) {
-        AttnArgs one = a;
-        one.n_heads = 1;
-        one.q = a.q + h * hd;
-        one.out = a.out + h * hd;
-        one.base = head_of(h, a.n_heads, a.n_kv_heads) * hd;
-
-        const auto t0 = std::chrono::steady_clock::now();
-        const float mx = attn_head_scores(one, scratch);
-        const auto t1 = std::chrono::steady_clock::now();
-        const float sum = softmax_exp_inplace(scratch, a.n_kv, mx);
-        const auto t2 = std::chrono::steady_clock::now();
-        attn_head_v(one, scratch, 1.0f / sum);
-        const auto t3 = std::chrono::steady_clock::now();
-        us[0] += std::chrono::duration<double, std::micro>(t1 - t0).count();
-        us[1] += std::chrono::duration<double, std::micro>(t2 - t1).count();
-        us[2] += std::chrono::duration<double, std::micro>(t3 - t2).count();
-    }
+    attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, nullptr, nullptr, out_us);
 #endif
-    for (int i = 0; i < 3; ++i) out_us[i] = us[i];
 }
 
 void attention_decode_grouped(const AttnArgs & a, float * scratch) {
@@ -705,7 +707,7 @@ void attention_decode_grouped_mt(const AttnArgs & a, float * scratch, ThreadPool
         const size_t gb0 = a.n_kv_heads * w / nw;
         const size_t gb1 = a.n_kv_heads * (w + 1) / nw;
         if (gb0 >= gb1) return;
-        attention_decode_avx2_grouped_range(a, scratch + w * per, gb0, gb1, nullptr, nullptr);
+        attention_decode_avx2_grouped_range(a, scratch + w * per, gb0, gb1, nullptr, nullptr, nullptr);
     });
 }
 

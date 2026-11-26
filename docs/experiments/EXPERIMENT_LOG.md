@@ -2801,3 +2801,50 @@ thread counts, already documented as this engine's noise floor). 94/94 tests.
 worth ~2x on the attention part only.
 
 **Conclusion:** keep. Decode at 16k went from 3.5x behind llama.cpp to near par.
+
+## EXP-0044 — Fix the phase profiler; measure where decode attention really stands
+
+**Status:** PASSED (tooling), and it invalidated two of my own earlier claims.
+**Hypothesis:** `attention_decode_phases()` re-implemented the score/softmax/v passes
+per head (`attn_head_scores` / `attn_head_v`) while `attention_decode_grouped` runs the
+grouped kernel. So the phase numbers in EXP-0043 described code that no longer ran.
+
+**Fix:** phases are now measured inside `attention_decode_avx2_grouped_range` itself,
+behind a `double * phase_us` parameter that is null on the hot path. The profiler calls
+the real kernel with the pointer set. Test `Attn.PhaseProfilerCoversTheWholeKernel`
+asserts the phases sum to within 0.5x-1.5x of a timed whole call, so a profiler that
+drifts off the real kernel fails CI instead of lying.
+
+**Also fixed:** `KATA_PROF` had no attention breakdown at all; added `t_core` (the
+score/softmax/v kernel only) next to `t_attn` (whole attention layer, which includes
+the QKV and `wo` projections and is therefore mostly matmul).
+
+**Corrected decode profile**, LFM2.5-24B-A2B-Q4_K_M, 8192 context, 16 threads,
+steady state, total 29.1 ms/token:
+
+| part | ms | share |
+| --- | --- | --- |
+| FFN (MoE) | 14.2 | 49% |
+| attention core (score+softmax+v) | 7.0 | 24% |
+| shortconv | 4.1 | 14% |
+| lm_head | 2.8 | 10% |
+| norms + residual | 0.02 | 0% |
+
+My earlier split ("22.8 ms linear + 14 ms attention") was wrong: the 14 ms was
+attention *including* its two projections, and the true attention core is 7.0 ms.
+
+**Attention bandwidth check** (`/tmp/dbig.cpp`, 10 layers of real KV so the working
+set leaves L3, 8 workers): 8192 → 6.82 ms/token moving 336 MB = **49.2 GB/s**;
+16384 → 13.72 ms moving 671 MB = **48.9 GB/s**. The machine does ~78 GB/s, so the KV
+walk runs at 63% of peak.
+
+**Why 49, not 78:** the KV cache is `[layer][position][kv_head][head_dim]`, so one
+kv-head group reads 256 B out of every 2048 B. Each worker streams a stride of 1/8,
+which defeats the prefetcher and wastes most of each fetched line.
+
+**Consequence for INT8:** halving KV bytes on a walk that is already 63% efficient buys
+~3.5 ms of 29.1 ms at 8k (12%) and ~6.9 ms of 37 ms at 16k (19%) — not the 1.23x I
+estimated. Making the walk contiguous is lossless and worth up to 1.6x on the same
+7.0 ms, so it must come first.
+
+**Conclusion:** keep the profiler fix. Next lever is the KV layout, then INT8 on top.

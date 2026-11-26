@@ -3,6 +3,7 @@
 #include "kata/attn.h"
 #include "kata/cpu.h"
 #include "kata/pool.h"
+#include <chrono>
 #include "kata/simd.h"
 
 #include <cmath>
@@ -307,4 +308,37 @@ TEST(Attn, MtSplitMatchesSingleThreaded) {
                     << " n_kv=" << c.n_kv << " i=" << i;
         }
     }
+}
+
+TEST(Attn, PhaseProfilerCoversTheWholeKernel) {
+    // The profiler used to re-implement the passes per head, so it measured code
+    // the grouped kernel no longer ran. It must now account for the real work:
+    // phases sum to within a few percent of the whole call.
+    if (kata::cpu_isa() == kata::Isa::Scalar || kata::cpu_isa() == kata::Isa::Avx2)
+        GTEST_SKIP() << "grouped path needs AVX-512";
+    const size_t nh = 32, nkv = 8, hd = 64, n_kv = 2048;
+    auto q = rnd(nh * hd, 61);
+    auto k = rnd(n_kv * nkv * hd, 62);
+    auto v = rnd(n_kv * nkv * hd, 63);
+    kata::AttnArgs a{};
+    a.q = q.data(); a.k_cache = k.data(); a.v_cache = v.data();
+    a.n_kv = n_kv; a.n_heads = nh; a.n_kv_heads = nkv;
+    a.head_dim = hd; a.scale = 1.0f / std::sqrt((float)hd);
+    std::vector<float> out(nh * hd), sc(kata::attention_scratch_floats_grouped(a));
+    a.out = out.data();
+
+    double phases[3] = {0, 0, 0};
+    kata::attention_decode_phases(a, sc.data(), phases);
+    double sum = phases[0] + phases[1] + phases[2];
+    ASSERT_GT(sum, 0.0) << "profiler reported no work at all";
+    ASSERT_GT(phases[0], 0.0) << "score phase never measured";
+    ASSERT_GT(phases[2], 0.0) << "v phase never measured";
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; ++i) kata::attention_decode_grouped(a, sc.data());
+    const double whole =
+        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 5;
+    // Phases exclude only the loop overhead, so they should be close to the call.
+    EXPECT_LT(sum, whole * 1.5);
+    EXPECT_GT(sum, whole * 0.5);
 }

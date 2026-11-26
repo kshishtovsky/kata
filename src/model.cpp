@@ -240,6 +240,7 @@ struct Model::Impl {
     size_t dump_pos = 0;
     bool router_log = std::getenv("KATA_ROUTER") != nullptr;   // KATA_DUMP_POS: which decode position the per-layer dumps capture
     double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
+    double t_attn = 0, t_conv = 0, t_core = 0;
     size_t n_mm = 0;
     struct Tick { double * acc; bool on; std::chrono::steady_clock::time_point t0;
         Tick(double * a, bool o) : acc(a), on(o), t0(std::chrono::steady_clock::now()) {}
@@ -452,7 +453,14 @@ struct Model::Impl {
         a.head_dim = head_dim;
         a.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         a.out = attn_out.data();
-        attention_decode_grouped_mt(a, attn_scratch.data(), pool);
+        {
+            // Narrow timer: the score/softmax/v kernel only. The QKV and wo
+            // projections around it are matmul and already counted in t_mm.
+            const auto c0 = std::chrono::steady_clock::now();
+            attention_decode_grouped_mt(a, attn_scratch.data(), pool);
+            if (prof) t_core += std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - c0).count();
+        }
 
         mm(L.to, n_embd, n_head * head_dim, attn_out.data(), L.wo, attn_out.data());
     }
@@ -896,9 +904,16 @@ struct Model::Impl {
             if (pos == dump_pos && il == 0) dump(("emb"), x.data(), n_embd);
             { Tick tk(&t_norm, prof); rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(L.attn_norm), eps); }
             if (pos == dump_pos) dump(("norm" + std::to_string(il)).c_str(), norm_out.data(), n_embd);
-            { Tick tk(&t_mix, prof);
-              if (L.attn) attention(il, L, norm_out, pos);
-              else shortconv(il, L, norm_out, attn_out); }
+            {
+                Tick tk(&t_mix, prof);
+                if (L.attn) {
+                    Tick ta(&t_attn, prof);
+                    attention(il, L, norm_out, pos);
+                } else {
+                    Tick tc(&t_conv, prof);
+                    shortconv(il, L, norm_out, attn_out);
+                }
+            }
             if (pos == dump_pos) dump(("mixer" + std::to_string(il)).c_str(), attn_out.data(), n_embd);
 #if defined(__x86_64__) || defined(__i386__)
             vec_add_inplace(x.data(), attn_out.data(), n_embd);
@@ -924,10 +939,12 @@ struct Model::Impl {
         st.pos = pos + 1;
         if (prof) {
             const double tot = t_emb + t_mix + t_ffn + t_lm + t_norm;
+            std::fprintf(stderr, "[prof] attn_core %7.2f ms | attn_total %7.2f | conv %7.2f ms\n", t_core, t_attn, t_conv);
             std::fprintf(stderr, "[prof] mm %7.2f ms in %zu calls (%.1f us/call), quantize %5.2f ms\n", t_mm, n_mm, n_mm ? 1000.0*t_mm/n_mm : 0.0, t_q);
             std::fprintf(stderr, "[prof] total %7.2f ms | mix %7.2f (%4.1f%%) | ffn %7.2f (%4.1f%%) | lm %6.2f (%4.1f%%) | norm %5.2f (%4.1f%%) | emb %5.2f\n",
                          tot, t_mix, 100*t_mix/tot, t_ffn, 100*t_ffn/tot, t_lm, 100*t_lm/tot, t_norm, 100*t_norm/tot, t_emb);
-            t_emb = t_mix = t_ffn = t_lm = t_norm = t_mm = t_q = 0; n_mm = 0;
+            t_emb = t_mix = t_ffn = t_lm = t_norm = t_mm = t_q = 0;
+            t_attn = t_conv = t_core = 0; n_mm = 0;
         }
         return logits.data();
     }
