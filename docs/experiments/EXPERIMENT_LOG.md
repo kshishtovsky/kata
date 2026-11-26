@@ -53,6 +53,7 @@
 | EXP-0050 | Perplexity stand (teacher-forced NLL) | PASSED | baseline PPL 11.8221 (2048 tok) / 18.5469 (8192 tok); int8 V 11.6715 / 18.2293, i.e. no quality loss |
 | EXP-0051 | MoE experts to q3_K: per-tensor quality probe | FAILED (down) / NEEDS_RESEARCH (gate+up) | `ffn_down_exps` → q3_K costs **+6.20% PPL** on 24 chunks (all 24 worse), 12x the 0.5% gate — not adopted; ~0.5% of token time anyway, so it was never a speed lever. `gate/up` → q3_K measured **-5.24%** (better on 24/24, reproduced on upstream llama.cpp -4.09%), q5_K +0.79%, q4_K +0.00%; sign contradicts bit count, so not adopted |
 
+| EXP-0052 | Prefill: is there really a gap to llama.cpp? (length sweep) | PASSED | kata is FASTER at every length: 512 483 vs 443 (1.09x), 2048 551 vs 439 (1.26x), 8192 482 vs 398 (1.21x), 16384 400 vs 355 (1.13x), 32768 286 vs 277 (1.03x); the gap the plan assumed does not exist, TTFT is absolute and still 114 s at 32k |
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
 **Status:** PASSED for the compute-bound regime, NEEDS_RESEARCH for DRAM-bound.
@@ -3303,3 +3304,65 @@ unmodelled mechanism, not of a free lunch. (d) `llama-perplexity` needs
 anomaly above: measure per-tensor error and a task metric first. Independently,
 implement q3_K (type 11) and q5_K (type 13) in kata so quality probes do not
 need a second engine.
+
+## EXP-0052 — Prefill: measuring the gap instead of assuming it
+
+**Status:** PASSED. The gap the plan was built on does not exist.
+
+**Hypothesis under test.** A claim arrived that prefill still trails llama.cpp by
+26% and that this is "the one thing worth taking now, because prefill sets TTFT
+and agent sessions are dominated by it". My own numbers said the opposite at 544
+tokens (477 vs 448 tok/s), but long context had never been measured on kata at
+all, so the claim could have been true past ~8k. Measure before building kernels
+for a gap that may not be there.
+
+**Method.** Same model `/home/medovarov/models/gguf/LFM2.5-24B-A2B-Q4_K_M.gguf`
+(13.52 GiB, 23.97 B), CPU only, 16 threads, `KATA_MAX_THREADS=16`. kata:
+`kata_run --tokens-file <n>.tok --n-ctx n+64`, timed from its own
+`prefill N tok in X ms = Y tok/s` line, two runs each. llama.cpp:
+`HIP_VISIBLE_DEVICES="" ROCR_VISIBLE_DEVICES="" llama-bench -ngl 0 -t 16 -p
+512,2048,8192,16384,32768 -r 2`. Token files were produced by llama.cpp's own
+tokeniser, so both engines see identical ids.
+
+**Results** (tok/s):
+
+| tokens | kata (2 runs) | llama.cpp pp | kata / llama.cpp |
+|---|---|---|---|
+| 512 | 483.4 / 481.3 | 443.12 ± 0.50 | **1.09x** |
+| 2048 | 546.6 / 556.0 | 438.70 ± 1.12 | **1.26x** |
+| 8192 | 469.8 / 494.6 | 398.14 ± 0.16 | **1.21x** |
+| 16384 | 400.8 / 399.9 | 354.74 ± 0.84 | **1.13x** |
+| 32768 | 286.4 | 277.03 ± 0.05 | **1.03x** |
+
+`llama-bench` labels the backend "ROCm" even with both visibility variables
+empty; the expert cache preflight line shows the GPU is not used, and the
+numbers match the earlier honest CPU baseline (441-453 tok/s at 512), so this is
+a CPU comparison.
+
+**What this changes.** kata is ahead at every measured length and the lead
+narrows with depth (1.26x at 2k to 1.03x at 32k), which is the expected shape:
+prefill is dominated by the quadratic attention term at long context and both
+engines converge there. So there is no 26% to win, and "take F first" rests on a
+gap that was never measured. The absolute TTFT number is still bad — 32k tokens
+cost 114 s — but that is a property of the machine (78 GB/s, ~1.4 GB of weights
+per token of work), not a deficit against llama.cpp.
+
+**Where the remaining prefill time goes** (from earlier profiling, unchanged):
+at long context attention is the majority of a chunk (`mix` 4.6-8.1 s of which
+attention 4.5-7.7 s), and the score pass runs ~240 GMAC/s against 1100-1800 for
+the GEMM kernels, i.e. instruction-bound. That is the real prefill lever, worth
+roughly 1.4-1.5x at 16-32k, and it is a kernel rewrite rather than a tuning
+pass. It does **not** restore a lead over llama.cpp, because the lead already
+exists — it reduces absolute TTFT.
+
+**Conclusion.** Stop treating prefill as behind. It is the one phase where kata
+is measurably ahead, so any iteration spent there buys absolute latency, not
+parity, and should be justified that way. The decode side (44.6 vs 44.58 tok/s at
+short context, 32.0 vs ~31 at 16k) is where the engines are actually level, so
+that is where relative wins are available.
+
+**Next iteration.** Decode, not prefill: the levers that change work rather than
+bytes are speculative decoding (needs a draft that is actually trained for this
+model — the prompt-lookup draft in EXP-0046 managed 0.08-0.18 tokens per cycle)
+and expert residency (needs the routing heatmap, which has never been measured
+by our own code).
