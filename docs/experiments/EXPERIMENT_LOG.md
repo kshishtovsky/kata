@@ -49,6 +49,7 @@
 | EXP-0046 | Prompt-lookup draft acceptance for speculative decoding | FAILED | greedy acceptance 0.08-0.13 tok/cycle on code, 0.10-0.18 on dialogue, 0.49-1.52 on a copy-heavy prompt; best case 1.49x, typical 0.30-0.80x vs no speculation |
 | EXP-0047 | int8 V cache with per-block fp16 scales | FAILED | decode attention 0.68-0.70x at every depth from 512 to 131072 (8192: 0.880 -> 1.270 ms, 32768: 3.187 -> 4.693 ms); accuracy fine (maxerr 1.4e-03 on max\|out\| 0.29); f32 v already runs 75.5 of 78 GB/s so the 3x dequant ALU is pure loss |
 | EXP-0048 | int4 V cache prototype, and why the prototype disagreed with the engine | NEEDS_RESEARCH | prototype gives i4 1.5-1.6x on the v pass, but the same prototype overstated int8 (1.6x vs the shipped kernel's 0.72x), so only an engine A/B can decide |
+| EXP-0049 | int8 V shipped ON by default at a 1.5% loss; dead-code removal | PASSED | int8 V off by default (`KATA_KVQ` opts in): 4k 24.86 -> 24.45 ms/token, 8k 27.03 -> 26.61. MADV_HUGEPAGE on KV measured 1.6% WORSE and was dropped. Deleted `scores_group`/`scores_kt`/`attention_decode_avx2_grouped_kt`/`kt_*` (183 lines, dead since head-major KV made them unnecessary) |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -3074,3 +3075,44 @@ bytes, but it must be measured inside the engine, in the real per-head walk,
 before it can be called a win.
 
 **Files changed:** none in the repo.
+
+## EXP-0049 — int8 V was on by default; dead attention code removed
+
+**Defect.** EXP-0047 concluded int8 V loses and the code was kept behind
+`v_int8_min_kv`, but the working tree still shipped `v_int8 = true` with
+`v_int8_min_kv = 4096`. Same binary, `KATA_KVQ` 0 vs 4096, generated tokens:
+
+| context | f32 | int8 |
+|---|---|---|
+| 4096 | 24.45 ms/token | 24.86 |
+| 8192 | 26.61 | 27.03 |
+
+A consistent 1.5% loss inherited by every run past 4k context. Now
+`v_int8_min_kv = 0`, the threshold is read once at load instead of per token
+(per-token reads also meant the first positions were never quantised), and the
+quantise work itself is skipped while the cache is off.
+
+**MADV_HUGEPAGE — measured and rejected.** Three paired runs at 16k:
+31.84 / 31.59 / 31.95 ms/token without the hint versus 31.27 / 31.36 / 31.31
+with it, i.e. 1.6% WORSE in every pair. Dropped rather than kept "because it
+should help". The TLB-miss hypothesis for the 35 GB/s score pass does not stand
+on this workload; the pass is ALU-bound, as EXP-0017 and EXP-0047 both found.
+
+**Dead code removed** (183 lines from `src/attn.cpp`, plus the whole `kt_*` API
+from `include/kata/attn.h`, two tests and the `--kt` bench arm):
+`scores_group` (never called; EXP-0015's grouped loop replaced it),
+`scores_kt` + `attention_decode_avx2_grouped_kt` + `attention_decode_grouped_kt`
++ `kt_floats`/`kt_slot`/`kt_write`/`KT_BLK` (EXP-0018's transposed K cache,
+unnecessary once EXP-0045 made the KV walk head-major and DRAM-bound).
+97/97 tests after removal; decode 522 tok 42.27 tok/s, 8k 27.09, 16k
+31.58 ms/token, unchanged from before.
+
+**Verified, not assumed.** The reviewer also claimed the per-head AVX2 fallback
+is broken under head-major strides because `one.base` is an element offset from
+the cache start. That does not reproduce: `/tmp/hm.cpp` compares
+`attention_decode_avx2` against `attention_decode_ref` at hd 64, 2 kv heads,
+300 positions and 8 query heads with head-major strides, and gets maxerr
+2.46e-07.
+
+**Files changed:** `src/model.cpp`, `src/attn.cpp`, `include/kata/attn.h`,
+`tests/test_attn.cpp`, `bench/bench_attn.cpp`.
