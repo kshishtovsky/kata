@@ -50,6 +50,7 @@
 | EXP-0047 | int8 V cache with per-block fp16 scales | FAILED | decode attention 0.68-0.70x at every depth from 512 to 131072 (8192: 0.880 -> 1.270 ms, 32768: 3.187 -> 4.693 ms); accuracy fine (maxerr 1.4e-03 on max\|out\| 0.29); f32 v already runs 75.5 of 78 GB/s so the 3x dequant ALU is pure loss |
 | EXP-0048 | int4 V cache prototype, and why the prototype disagreed with the engine | NEEDS_RESEARCH | prototype gives i4 1.5-1.6x on the v pass, but the same prototype overstated int8 (1.6x vs the shipped kernel's 0.72x), so only an engine A/B can decide |
 | EXP-0049 | int8 V shipped ON by default at a 1.5% loss; dead-code removal | PASSED | int8 V off by default (`KATA_KVQ` opts in): 4k 24.86 -> 24.45 ms/token, 8k 27.03 -> 26.61. MADV_HUGEPAGE on KV measured 1.6% WORSE and was dropped. Deleted `scores_group`/`scores_kt`/`attention_decode_avx2_grouped_kt`/`kt_*` (183 lines, dead since head-major KV made them unnecessary) |
+| EXP-0050 | Perplexity stand (teacher-forced NLL) | PASSED | baseline PPL 11.8221 (2048 tok) / 18.5469 (8192 tok); int8 V 11.6715 / 18.2293, i.e. no quality loss |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -3116,3 +3117,58 @@ the cache start. That does not reproduce: `/tmp/hm.cpp` compares
 
 **Files changed:** `src/model.cpp`, `src/attn.cpp`, `include/kata/attn.h`,
 `tests/test_attn.cpp`, `bench/bench_attn.cpp`.
+
+## EXP-0050 — Perplexity stand and the quality gate that never existed
+
+**Status:** PASSED
+**Date:** 2026-11-26
+
+### Problem
+
+Three lossy directions were proposed (int8 KV, int4 KV, q3_K expert weights) and
+none of them could be judged, because the engine had never measured what a
+change costs in quality. Every previous rejection was a speed rejection.
+
+### Implementation
+
+`Model::perplexity(const uint32_t *, size_t n, size_t n_ctx_chunk, size_t * counted)`
+in `/home/medovarov/kata/src/model.cpp` — teacher-forced NLL in double over the
+last-token logits of each window, scored with `lse = max + log(sum(exp(l - max)))`
+and `nll = lse - logit[target]`. Driver `/home/medovarov/kata/tools/pata_ppl.cpp`,
+target `kata_ppl`. Text tokenised with llama.cpp's tokeniser so the two engines
+see identical tokens; WikiText-2 test split extracted to `/tmp/wt2/`.
+
+Two conventions had to be matched to llama.cpp before the number meant anything:
+the context is NOT cut while the text fits one window (scoring independent 512-token
+windows reported 29.41 where a single 2048 window reports 11.82), and the window
+must be a real 2048 tokens. The stand is deterministic across runs and across
+`KATA_UBATCH` 1..1024 (11.8221 every time), which is what makes it usable as a gate.
+
+### Results
+
+| config | PPL 2048 tok | PPL 8192 tok |
+|---|---|---|
+| kata, int8 V off | 11.8221 | 18.5469 |
+| kata, int8 V on | 11.6715 | 18.2293 |
+| llama.cpp, same text | 11.3497 | not measured |
+
+### Bug found on the way
+
+`KATA_KVQ=1` produced a numerically identical PPL at first, which looked like a
+blind stand. It was a dead feature: `/home/medovarov/kata/src/model.cpp` tested
+`if (v_int8_min_kv > 0 && a.n_kv >= v_int8_min_kv)` **before** `a.n_kv = pos + 1`
+was assigned, so int8 never engaged. Fixed by moving the assignment above the
+gate. Every EXP-0047/0048 engine-level A/B that relied on `KATA_KVQ` was
+therefore comparing float against float — the kernel-level 0.72-0.74x numbers in
+those experiments are unaffected (they set `v_q` directly), but the "engine-level
+wash" claim in EXP-0048 was measuring nothing.
+
+### Conclusion
+
+The gate exists. int8 V passes it, so its rejection stands on speed alone
+(EXP-0047), which is the correct reason. Keep, and use it before every future
+lossy change.
+
+### Next iteration
+
+EXP-0051: q3_K on `ffn_down_exps` only, judged by this stand (accept ≤1% PPL).

@@ -251,6 +251,10 @@ struct Model::Impl {
     size_t dump_pos = 0;
     bool router_log = std::getenv("KATA_ROUTER") != nullptr;   // KATA_DUMP_POS: which decode position the per-layer dumps capture
     double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
+    // MoE sub-phase split (EXP-0051). Instrumented, never re-implemented:
+    // these are the real call sites, so the numbers cannot drift.
+    double moe_router = 0, moe_pack = 0, moe_q8 = 0, moe_gemm = 0, moe_silu = 0, moe_scat = 0;
+    size_t moe_buckets = 0, moe_pairs = 0, moe_dispatch = 0;
     double t_attn = 0, t_conv = 0, t_core = 0;
     size_t n_mm = 0;
     struct Tick { double * acc; bool on; std::chrono::steady_clock::time_point t0;
@@ -482,6 +486,7 @@ struct Model::Impl {
         a.q = q.data();
         a.k_cache = kbase;
         a.v_cache = vbase;
+        a.n_kv = pos + 1;          // must precede the int8 gate below, which reads it
         // int8 v is OFF by default (v_int8_min_kv = 0): EXP-0047 measured the
         // shipped kernel at 0.72-0.74x and a 1.5% whole-token regression at 4-8k.
         // KATA_KVQ=<n> opts in from n cached positions so an int4 experiment can
@@ -492,7 +497,6 @@ struct Model::Impl {
         }
         a.stride_pos = head_dim;
         a.stride_head = n_ctx * head_dim;
-        a.n_kv = pos + 1;
         a.n_heads = n_head;
         a.n_kv_heads = n_head_kv;
         a.head_dim = head_dim;
@@ -529,6 +533,8 @@ struct Model::Impl {
 
         // Selection uses probs + bias; the weight comes from the unbiased prob.
         const float * bias = static_cast<const float *>(L.exp_probs_b);
+        using mclk = std::chrono::steady_clock;
+        const auto m0 = mclk::now();
         auto * sel = d_sel.data();
         for (size_t e = 0; e < n_expert; ++e) sel[e] = { probs[e] + bias[e], static_cast<uint32_t>(e) };
         std::partial_sort(sel, sel + n_expert_used, sel + n_expert,
@@ -550,6 +556,8 @@ struct Model::Impl {
             dump(("moewnorm" + std::to_string(il)).c_str(), wn.data(), n_expert_used);
         }
 
+        if (prof) moe_router += std::chrono::duration<double, std::milli>(mclk::now() - m0).count();
+        const auto m4 = mclk::now();
         // One expert's matrix is a slice of the stacked tensor. The four experts
         // share one activation row, so gate and up go out as one batched call of
         // 8 matvecs instead of 8 separate pool wake-ups (EXP-0021).
@@ -575,6 +583,8 @@ struct Model::Impl {
         }
         // ffn_gate holds the gate results of all experts packed [i*n_ff_exp + j].
         float * gu = d_gu.data();
+        const auto m5 = mclk::now();
+        if (prof) moe_pack += std::chrono::duration<double, std::milli>(m5 - m4).count();
         if (L.t_ge == L.t_ue) {
             mm_batch(L.t_ge, 2 * nu, n_ff_exp, n_embd, gu, wgu, xgu);
         } else {
@@ -586,6 +596,8 @@ struct Model::Impl {
 
         // Down projection: each expert now has a different activation, so those
         // four still share one call, with per-slot quantised copies.
+        const auto m6 = mclk::now();
+        if (prof) moe_gemm += std::chrono::duration<double, std::milli>(m6 - m5).count();
         block_q8_K * aq_down = d_aq_down.data();
         const block_q8_K ** xd = d_xd.data();
         const void ** wd = d_wd.data();
@@ -601,8 +613,12 @@ struct Model::Impl {
                 dump(("xgate" + std::to_string(i)).c_str(), g, n_ff_exp);
             }
         }
+        if (prof) moe_silu += std::chrono::duration<double, std::milli>(mclk::now() - m6).count();
+        const auto m7 = mclk::now();
         float * down = d_down.data();
         mm_batch(L.t_de, nu, n_embd, n_ff_exp, down, wd, xd);
+        if (prof) moe_gemm += std::chrono::duration<double, std::milli>(mclk::now() - m7).count();
+        ++moe_buckets; moe_pairs += nu;
 
         if (!dump_dir.empty() && il == 2) {
             for (size_t i = 0; i < nu; ++i) {
@@ -817,6 +833,8 @@ struct Model::Impl {
     void moe_ffn_rows(size_t il, const Layer & L, size_t m) {
         const float * bias = static_cast<const float *>(L.exp_probs_b);
         float * probs = mprobs.data();
+        using mclk = std::chrono::steady_clock;
+        const auto m0 = mclk::now();
         gemm_f32_mt(m, n_expert, n_embd, probs, n_expert,
                     static_cast<const float *>(L.gate_inp), pnorm.data(), pool);
         for (size_t i = 0; i < m * n_expert; ++i)
@@ -845,6 +863,7 @@ struct Model::Impl {
             }
         }
 
+        const auto m1 = mclk::now();
         // Prefix sums for linear counting sort (zero comparison overhead)
         uint32_t total = 0;
         for (size_t e = 0; e < n_expert; ++e) {
@@ -861,6 +880,7 @@ struct Model::Impl {
             }
         }
 
+        const auto m2 = mclk::now();
         block_q8_K * aq_g = maq_g.data();
         block_q8_K * aq_d = maq_d.data();
         float * gout = mgout.data();
@@ -882,15 +902,29 @@ struct Model::Impl {
             if (c == 0) continue;
             const size_t first = m_offsets[e];
 
+            const auto e0 = mclk::now();
             for (size_t i = 0; i < c; ++i) ptok[i] = pairs[first + i].token;
             q8_rows_gather_mt(pnorm.data(), ptok, c, n_embd, aq_g);
+            const auto e1 = mclk::now();
+            moe_q8 += std::chrono::duration<double, std::milli>(e1 - e0).count();
             mmn(L.t_ge, n_ff_exp, n_embd, gout, n_ff_exp, bg + e * sb_g, aq_g, c);
             mmn(L.t_ue, n_ff_exp, n_embd, uout, n_ff_exp, bu + e * sb_u, aq_g, c);
+            const auto e2 = mclk::now();
+            moe_gemm += std::chrono::duration<double, std::milli>(e2 - e1).count();
             silu_mul_mt(gout, uout, c * n_ff_exp);
             q8_rows_mt(gout, c, n_ff_exp, aq_d);
+            const auto e3 = mclk::now();
+            moe_silu += std::chrono::duration<double, std::milli>(e3 - e2).count();
             mmn(L.t_de, n_embd, n_ff_exp, dout, n_embd, bd + e * sb_d, aq_d, c);
             for (size_t i = 0; i < c; ++i) pw[i] = pairs[first + i].weight;
             scatter_add(dout, ptok, pw, c, n_embd, pexpacc.data());
+            moe_scat += std::chrono::duration<double, std::milli>(mclk::now() - e3).count();
+            ++moe_buckets;
+            moe_pairs += c;
+        }
+        if (prof) {
+            moe_router += std::chrono::duration<double, std::milli>(m1 - m0).count();
+            moe_pack += std::chrono::duration<double, std::milli>(m2 - m1).count();
         }
         // pexpacc is the accumulator, so the copy into pffn_out is the only
         // hand-off the caller needs; it is 4.5 MB per layer at ubatch 544.
@@ -987,9 +1021,15 @@ struct Model::Impl {
             const double tot = t_emb + t_mix + t_ffn + t_lm + t_norm;
             std::fprintf(stderr, "[prof] attn_core %7.2f ms | attn_total %7.2f | conv %7.2f ms\n", t_core, t_attn, t_conv);
             std::fprintf(stderr, "[prof] mm %7.2f ms in %zu calls (%.1f us/call), quantize %5.2f ms\n", t_mm, n_mm, n_mm ? 1000.0*t_mm/n_mm : 0.0, t_q);
+            std::fprintf(stderr, "[moe] router %.2f | pack %.2f | q8gather %.2f | gemm %.2f | silu+q8 %.2f | scatter %.2f ms"
+                                 "  (buckets %zu, pairs %zu, ffn %.2f ms)\n",
+                         moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_scat,
+                         moe_buckets, moe_pairs, t_ffn);
             std::fprintf(stderr, "[prof] total %7.2f ms | mix %7.2f (%4.1f%%) | ffn %7.2f (%4.1f%%) | lm %6.2f (%4.1f%%) | norm %5.2f (%4.1f%%) | emb %5.2f\n",
                          tot, t_mix, 100*t_mix/tot, t_ffn, 100*t_ffn/tot, t_lm, 100*t_lm/tot, t_norm, 100*t_norm/tot, t_emb);
             t_emb = t_mix = t_ffn = t_lm = t_norm = t_mm = t_q = 0;
+            moe_router = moe_pack = moe_q8 = moe_gemm = moe_silu = moe_scat = 0;
+            moe_buckets = moe_pairs = moe_dispatch = 0;
             t_attn = t_conv = t_core = 0; n_mm = 0;
         }
         return logits.data();
@@ -1091,6 +1131,39 @@ void Model::reset() {
 }
 
 const float * Model::forward(uint32_t token, ModelState & st) { return p_->forward(token, st); }
+
+double Model::perplexity(const uint32_t * tokens, size_t n, size_t n_ctx_chunk, size_t * counted) {
+    if (n < 2) return 0.0;
+    if (n_ctx_chunk < 2) throw std::runtime_error("kata: perplexity chunk too small");
+    n_ctx_chunk = std::min(n_ctx_chunk, p_->n_ctx);
+    ModelState st;
+    double sum_nll = 0.0;
+    size_t cnt = 0;
+    // While the text fits one window the context is never cut, which is the
+    // only way the number is comparable between two builds. Longer inputs are
+    // scored in independent windows and the cuts cost real probability, so keep
+    // the benchmark text inside the window.
+    for (size_t start = 0; start < n; start += n_ctx_chunk) {
+        const size_t end = std::min(n, start + n_ctx_chunk);
+        Model::reset();
+        st.pos = 0;
+        for (size_t i = start; i < end; ++i) {
+            const float * lg = p_->forward(tokens[i], st);
+            if (i + 1 >= end) continue;         // no target inside this chunk
+            // log-softmax NLL of the next token, in double to keep the sum honest
+            float mx = lg[0];
+            for (size_t v = 1; v < n_vocab_; ++v) mx = std::max(mx, lg[v]);
+            double se = 0.0;
+            for (size_t v = 0; v < n_vocab_; ++v) se += std::exp(double(lg[v]) - double(mx));
+            const double lse = double(mx) + std::log(se);
+            sum_nll += lse - double(lg[tokens[i + 1]]);
+            ++cnt;
+        }
+    }
+    if (counted) *counted = cnt;
+    if (cnt == 0) return 0.0;
+    return std::exp(sum_nll / double(cnt));
+}
 
 const float * Model::prefill(const uint32_t * tokens, size_t n, ModelState & st) {
     return p_->prefill(tokens, n, st);

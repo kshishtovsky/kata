@@ -30,6 +30,12 @@ public:
     // 128k-wide lm_head, and computing them would cost more than the model.
     const float * prefill(const uint32_t * tokens, size_t n, ModelState & st);
 
+    // Teacher-forced negative log-likelihood over tokens[1 .. n-1], each chunk
+    // of n_ctx tokens scored in a fresh context (the llama.cpp perplexity
+    // convention, so the two are comparable). Returns the mean of
+    // exp(-log p) over counted tokens and reports the token count.
+    double perplexity(const uint32_t * tokens, size_t n, size_t n_ctx_chunk, size_t * counted = nullptr);
+
     size_t n_vocab() const { return n_vocab_; }
     size_t n_embd() const { return n_embd_; }
     size_t n_layer() const { return n_layer_; }

@@ -40,6 +40,9 @@ if(KATA_COVERAGE)
   target_link_options(kata_core PUBLIC --coverage)
 endif()
 
+add_executable(kata_ppl tools/pata_ppl.cpp)
+target_link_libraries(kata_ppl PRIVATE kata_core)
+
 add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv PRIVATE kata_core)
 
