@@ -12,6 +12,11 @@ uint16_t f32_to_f16(float f);
 void quantize_row_q8_0(const float * x, block_q8_0 * y, size_t n);
 void quantize_row_q4_0(const float * x, block_q4_0 * y, size_t n);
 void dequantize_row_q4_0(const block_q4_0 * x, float * y, size_t n);
+// int8 KV quantisation: one f16 scale per VQ_BLK (32) values, which is Q8_0's
+// block size. Kept separate from Q8_0 blocks because KV needs the scale and the
+// codes in two arrays: the v pass streams codes and reads a scale per 32 values,
+// so interleaving them would put 34-byte blocks in the byte stream.
+void quantize_row_i8(const float * x, int8_t * q, uint16_t * scales, size_t n);
 
 // Independent scalar reference, used to validate every SIMD path.
 // ggml-compatible: iscale = -127/max, so the extreme value lands on -127.

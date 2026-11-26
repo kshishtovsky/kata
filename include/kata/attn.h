@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace kata {
@@ -27,7 +28,14 @@ struct AttnArgs {
     // contiguously (EXP-0045: 45 -> 75 GB/s).
     size_t stride_pos = 0;   // 0 means n_kv_heads * head_dim
     size_t stride_head = 0;  // 0 means head_dim
+    // Optionally int8 v cache (EXP-0047). Null keeps the float32 path. When set,
+    // v_q holds the same layout as v_cache but as int8 with one f16 scale per
+    // VQ_BLK values, so the v pass reads a quarter of the bytes -- it is a pure
+    // weighted sum, so this is the one pass where less bytes is directly faster.
+    const int8_t * v_q = nullptr;
+    const uint16_t * v_scale = nullptr;
 };
+inline constexpr size_t VQ_BLK = 32;  // values per int8 scale
 
 void attention_decode_ref(const AttnArgs & a, float * scratch);
 void attention_decode_avx2(const AttnArgs & a, float * scratch);

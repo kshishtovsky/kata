@@ -194,6 +194,15 @@ struct Model::Impl {
 
     // Per-layer attention slabs, then everything else, all float32.
     std::vector<float> k_cache, v_cache;   // [n_layer][n_ctx][n_head_kv*head_dim]
+    // int8 copy of v_cache, same head-major layout, one f16 scale per VQ_BLK
+    // values. Only v is quantised: k feeds the softmax, where an 8-bit rounding
+    // changes which token wins, while v is a weighted sum (EXP-0047).
+    std::vector<int8_t> v_q;
+    std::vector<uint16_t> v_scale;
+    bool v_int8 = true;
+    // 0 disables it, N enables it from N cached positions. Env override so both
+    // arms run from one binary (the machine drifts by >5% between builds).
+    size_t v_int8_min_kv = 4096;
     std::vector<float> conv_state;         // [n_layer][l_cache-1][n_embd]
     std::vector<float> x, norm_out, q, k, v, attn_out, bcx;
     std::vector<float> ffn_gate, ffn_up, ffn_down;
@@ -257,7 +266,12 @@ struct Model::Impl {
     void alloc() {
         const size_t kv = n_head_kv * head_dim;
         k_cache.assign(n_layer * n_ctx * kv, 0.0f);
+        // shortcut: with int8 v the float32 cache is only needed by prefill, so
+        // it is allocated but never written in decode. Drop it once prefill has
+        // its own int8 path.
         v_cache.assign(n_layer * n_ctx * kv, 0.0f);
+        v_q.assign(n_layer * n_ctx * kv, 0);
+        v_scale.assign(n_layer * n_ctx * kv / VQ_BLK, 0);
         conv_state.assign(n_layer * (l_cache - 1) * n_embd, 0.0f);
         x.assign(n_embd, 0.0f);
         norm_out.assign(n_embd, 0.0f);
@@ -444,17 +458,32 @@ struct Model::Impl {
         // (EXP-0045: 45 -> 75 GB/s on the same walk).
         float * kbase = k_cache.data() + il * n_ctx * kv;
         float * vbase = v_cache.data() + il * n_ctx * kv;
+        const size_t base_off = il * n_ctx * kv;
         for (size_t h = 0; h < n_head_kv; ++h) {
             std::memcpy(kbase + (h * n_ctx + pos) * head_dim, k.data() + h * head_dim,
                         head_dim * sizeof(float));
             std::memcpy(vbase + (h * n_ctx + pos) * head_dim, v.data() + h * head_dim,
                         head_dim * sizeof(float));
+            // v_q/(v_scale) index the whole [layer][kv_head][position] slab, so
+            // the quantiser sees a contiguous 64-value row per position.
+            const size_t voff = (h * n_ctx + pos) * head_dim;
+            quantize_row_i8(v.data() + h * head_dim, v_q.data() + base_off + voff,
+                            v_scale.data() + (base_off + voff) / VQ_BLK, head_dim);
         }
 
         AttnArgs a{};
         a.q = q.data();
         a.k_cache = kbase;
         a.v_cache = vbase;
+        // int8 v only pays past the point where the v pass stops fitting in
+        // cache: at 512 tokens it is 8 MB and the dequant cost outweighs the
+        // bytes saved (-13%), at 16k it is 268 MB and it wins (+7%). EXP-0049
+        // measured the crossover between 4k and 8k.
+        if (const char * e = std::getenv("KATA_KVQ")) v_int8_min_kv = std::strtoul(e, nullptr, 10);
+        if (v_int8 && a.n_kv >= v_int8_min_kv && v_int8_min_kv > 0) {
+            a.v_q = v_q.data() + base_off;
+            a.v_scale = v_scale.data() + base_off / VQ_BLK;
+        }
         a.stride_pos = head_dim;
         a.stride_head = n_ctx * head_dim;
         a.n_kv = pos + 1;
@@ -1050,6 +1079,8 @@ void Model::reset() {
     Impl & m = *p_;
     std::fill(m.k_cache.begin(), m.k_cache.end(), 0.0f);
     std::fill(m.v_cache.begin(), m.v_cache.end(), 0.0f);
+    std::fill(m.v_q.begin(), m.v_q.end(), 0);
+    std::fill(m.v_scale.begin(), m.v_scale.end(), 0);
     std::fill(m.conv_state.begin(), m.conv_state.end(), 0.0f);
 }
 

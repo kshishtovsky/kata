@@ -1,4 +1,5 @@
 #include "kata/quant.h"
+#include "kata/attn.h"
 
 #include <algorithm>
 #include <cmath>
@@ -290,6 +291,23 @@ float vec_dot_q4_K_q8_K_ref(size_t n, const block_q4_K * x, const block_q8_K * y
         }
     }
     return sum;
+}
+
+void quantize_row_i8(const float * x, int8_t * q, uint16_t * scales, size_t n) {
+    // Symmetric, one scale per 32 values: the v pass multiplies by a probability,
+    // so a per-block scale costs one broadcast per 32 elements and nothing else.
+    for (size_t b = 0; b < n / VQ_BLK; ++b) {
+        const float * xb = x + b * VQ_BLK;
+        float amax = 0.0f;
+        for (size_t i = 0; i < VQ_BLK; ++i) amax = std::max(amax, std::fabs(xb[i]));
+        const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+        const float id = 1.0f / d;
+        scales[b] = f32_to_f16(d);
+        for (size_t i = 0; i < VQ_BLK; ++i) {
+            const float v = xb[i] * id;
+            q[b * VQ_BLK + i] = static_cast<int8_t>(v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : std::lrint(v)));
+        }
+    }
 }
 
 } // namespace kata

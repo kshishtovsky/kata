@@ -2,6 +2,7 @@
 
 #include "kata/cpu.h"
 #include "kata/pool.h"
+#include "kata/simd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -439,6 +440,52 @@ void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const 
 }
 
 
+// int8 variant of v_group: identical arithmetic, but v arrives as int8 plus one
+// f16 scale per VQ_BLK values. The v pass is a pure weighted sum, so it is bound
+// by the bytes it reads and nothing else -- EXP-0049 measured 3.5-4x on the pass
+// at equal GB/s.
+template <int G, int NZ>
+__attribute__((target("avx512f,avx512vl,avx512bw,fma")))
+void v_group_q8(const AttnArgs & a, const float * p, size_t hd, size_t base, const float * inv,
+                float * out) {
+    const size_t stride = pos_stride(a);
+    // Scale index of the first value this group reads, then one step per block
+    // as the position loop advances.
+    const size_t s0 = (base) / VQ_BLK;
+    const size_t sstep = stride / VQ_BLK;
+    const size_t bmax = hd / VQ_BLK;
+    __m512 acc[G][NZ];
+    for (int h = 0; h < G; ++h)
+        for (int j = 0; j < NZ; ++j) acc[h][j] = _mm512_setzero_ps();
+
+    for (size_t t = 0; t < a.n_kv; ++t) {
+        const int8_t * v = a.v_q + t * stride + base;
+        const uint16_t * sc = a.v_scale + t * sstep + s0;
+        __m512 pv[G];
+        for (int h = 0; h < G; ++h) pv[h] = _mm512_set1_ps(p[h * a.n_kv + t]);
+        for (size_t b = 0; b < bmax; ++b) {
+            // Fold the block scale into the probability once per block instead of
+            // multiplying the dequantised v: that removes one mul per 16 values,
+            // a third of the dequant overhead.
+            const float d = f16_fast(sc[b]);
+            __m512 pvd[G];
+            for (int h = 0; h < G; ++h) pvd[h] = _mm512_mul_ps(pv[h], _mm512_set1_ps(d));
+            for (size_t j = 0; j < VQ_BLK / 16; ++j) {
+                const size_t iz = b * (VQ_BLK / 16) + j;
+                if (iz >= NZ) break;
+                const __m128i raw = _mm_loadu_si128((const __m128i *)(v + b * VQ_BLK + j * 16));
+                const __m512 vv = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(raw));
+                for (int h = 0; h < G; ++h) acc[h][iz] = _mm512_fmadd_ps(pvd[h], vv, acc[h][iz]);
+            }
+        }
+    }
+    for (int h = 0; h < G; ++h) {
+        const __m512 iv = _mm512_set1_ps(inv[h]);
+        for (int j = 0; j < NZ; ++j)
+            _mm512_storeu_ps(out + h * hd + j * 16, _mm512_mul_ps(acc[h][j], iv));
+    }
+}
+
 // Score pass over the transposed k cache: the vector lanes are positions, the
 // accumulators are the four query heads of one kv group. No reduction step and
 // no transpose at the end -- a lane already holds the finished dot product.
@@ -562,11 +609,21 @@ void attention_decode_avx2_grouped_range(const AttnArgs & a, float * scratch, si
             phase_us[1] += std::chrono::duration<double, std::micro>(t_v - t_soft).count();
         }
         // head_dim / 16 is compile-time per case so the accumulators stay in zmm.
-        switch (hd / 16) {
-        case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        case 2: v_group<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+        // The int8 cache changes only how v is fetched, not the arithmetic.
+        if (a.v_q != nullptr && hd % VQ_BLK == 0) {
+            switch (hd / 16) {
+            case 1: v_group_q8<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            case 2: v_group_q8<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            case 3: v_group_q8<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            default: v_group_q8<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            }
+        } else {
+            switch (hd / 16) {
+            case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            case 2: v_group<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
+            }
         }
         if (probe) {
             phase_us[2] += std::chrono::duration<double, std::micro>(clk::now() - t_v).count();

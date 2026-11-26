@@ -47,6 +47,7 @@
 | EXP-0044 | Phase profiler measured inside the real grouped kernel | PASSED | profiler covered code the kernel no longer ran; corrected split at 8k is FFN 49%, attention core 24%, shortconv 14%, lm_head 10%; KV walk at 49.2 GB/s of 78 |
 | EXP-0045 | Head-major KV cache `[kv_head][position][head_dim]` | PASSED | KV walk 45.0 -> 73.3 GB/s at 8k (1.63x) and 44.4 -> 74.1 at 32k; decode 8k 26.9 -> 37.2 tok/s, 16k 32.0, 512 unchanged 44.6; prefill 25k 336 tok/s; layouts agree bit-exactly |
 | EXP-0046 | Prompt-lookup draft acceptance for speculative decoding | FAILED | greedy acceptance 0.08-0.13 tok/cycle on code, 0.10-0.18 on dialogue, 0.49-1.52 on a copy-heavy prompt; best case 1.49x, typical 0.30-0.80x vs no speculation |
+| EXP-0047 | int8 V cache with per-block fp16 scales | FAILED | decode attention 0.68-0.70x at every depth from 512 to 131072 (8192: 0.880 -> 1.270 ms, 32768: 3.187 -> 4.693 ms); accuracy fine (maxerr 1.4e-03 on max\|out\| 0.29); f32 v already runs 75.5 of 78 GB/s so the 3x dequant ALU is pure loss |
 
 ## EXP-0001 — q4_0 x q8_0 GEMV kernel
 
@@ -2989,3 +2990,48 @@ model or a trained head; that is a separate, much larger experiment, and at 5-18
 acceptance it is not justified by the current numbers.
 
 **Files changed:** `bench/bench_spec.cpp` (new), `CMakeLists.txt`.
+
+## EXP-0047 — int8 V cache
+
+**Hypothesis.** The v pass is bandwidth-bound, so storing V as int8 blocks with
+one fp16 scale per 32 values should cut its bytes 4x and make decode attention
+materially cheaper.
+
+**Implementation.** `quantize_row_i8` (symmetric, `d = amax/127`, scales kept in
+a separate array so the pass streams codes only), `v_group_q8<G,NZ>` beside the
+f32 `v_group`, `const int8_t * v_q` / `const uint16_t * v_scale` on `AttnArgs`,
+and a `v_int8_min_kv` threshold in the engine (`KATA_KVQ` overrides it, 0
+disables) so both arms run from one binary.
+
+**Result: FAILED.** Same decode call, same data, 20 iterations, 16 threads:
+
+| n_kv | f32 | int8 | ratio |
+|---|---|---|---|
+| 512 | 0.043 ms | 0.077 ms | 0.56x |
+| 2048 | 0.225 | 0.315 | 0.71x |
+| 8192 | 0.880 | 1.270 | 0.69x |
+| 32768 | 3.187 | 4.693 | 0.68x |
+| 131072 | 12.322 | 17.739 | 0.69x |
+
+Accuracy was never the problem: `maxerr 1.386e-03` against `max|out| 0.290`,
+about 0.5%. Folding the block scale into the probability to save one multiply
+per 16 values changed nothing (0.61-0.70x).
+
+**Why.** A 16-value int8 chunk costs load 16 B -> `vpmovsxbd` -> `vcvtdq2ps` ->
+`vfmadd`, roughly three times the instructions of one f32 load plus `vfmadd`,
+and the f32 pass already moves 75.5 of the machine's ~78 GB/s. The stream is
+latency-limited, not bandwidth-limited, at the sizes a decode step touches, so
+removing bytes buys nothing and the dequant ALU is pure loss.
+
+**Kept anyway.** The code is correct, tested (`Attn.Int8VCacheMatchesFloatCache`)
+and defaults OFF; it is the only path that can reach an int4 V cache later, and
+int4 removes twice the bytes for the same dequant cost.
+
+**Caveat on earlier numbers.** A `KATA_PROF` run appeared to show 25k
+`attn_core` dropping 15.32 -> 9.43 ms. That compared against a build from a
+different commit; the machine drifts more than 5% between builds, so only
+same-binary A/B counts.
+
+**Files changed:** `include/kata/attn.h`, `include/kata/quant.h`,
+`src/quant.cpp`, `src/attn.cpp`, `src/model.cpp`, `tests/test_attn.cpp`.
+

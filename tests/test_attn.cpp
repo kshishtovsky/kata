@@ -3,6 +3,7 @@
 #include "kata/attn.h"
 #include "kata/cpu.h"
 #include "kata/pool.h"
+#include "kata/quant.h"
 #include <chrono>
 #include "kata/simd.h"
 
@@ -338,6 +339,9 @@ TEST(Attn, PhaseProfilerCoversTheWholeKernel) {
     std::vector<float> out(nh * hd), sc(kata::attention_scratch_floats_grouped(a));
     a.out = out.data();
 
+    // Warm up first: the first call pays page faults on a freshly allocated
+    // 4 MB scratch, which made this comparison flaky before any int8 change.
+    for (int i = 0; i < 3; ++i) kata::attention_decode_grouped(a, sc.data());
     double phases[3] = {0, 0, 0};
     kata::attention_decode_phases(a, sc.data(), phases);
     double sum = phases[0] + phases[1] + phases[2];
@@ -346,9 +350,9 @@ TEST(Attn, PhaseProfilerCoversTheWholeKernel) {
     ASSERT_GT(phases[2], 0.0) << "v phase never measured";
 
     const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < 5; ++i) kata::attention_decode_grouped(a, sc.data());
+    for (int i = 0; i < 30; ++i) kata::attention_decode_grouped(a, sc.data());
     const double whole =
-        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 5;
+        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 30;
     // Phases exclude only the loop overhead, so they should be close to the call.
     EXPECT_LT(sum, whole * 1.5);
     EXPECT_GT(sum, whole * 0.5);
@@ -412,5 +416,49 @@ TEST(Attn, WriteKvHeadMajorRoundTrips) {
         size_t touched = 0;
         for (float x : km) touched += x != 0.0f ? 1 : 0;
         EXPECT_EQ(touched, n_kv_heads * hd);
+    }
+}
+
+// EXP-0047: the int8 v cache must agree with the float32 one to within the
+// quantisation error (the v pass is a weighted sum, so the error is one 8-bit
+// rounding per value, not an accumulation).
+TEST(Attn, Int8VCacheMatchesFloatCache) {
+    struct Case { size_t nh, nkvh, hd, n_kv; };
+    for (const Case & c : {Case{32, 8, 64, 1}, Case{32, 8, 64, 37}, Case{32, 8, 64, 256},
+                           Case{16, 4, 32, 129}}) {
+        const size_t kv = c.nkvh * c.hd;
+        const std::vector<float> vpm = rnd(c.n_kv * kv, 11);
+        const std::vector<float> q = rnd(c.nh * c.hd, 12);
+        const std::vector<float> kpm = rnd(c.n_kv * kv, 13);
+        std::vector<int8_t> vq(vpm.size());
+        std::vector<uint16_t> vs(vpm.size() / kata::VQ_BLK);
+        kata::quantize_row_i8(vpm.data(), vq.data(), vs.data(), vpm.size());
+
+        kata::AttnArgs a{};
+        a.q = q.data();
+        a.k_cache = kpm.data();
+        a.v_cache = vpm.data();
+        a.n_kv = c.n_kv;
+        a.n_heads = c.nh;
+        a.n_kv_heads = c.nkvh;
+        a.head_dim = c.hd;
+        a.scale = 1.0f / std::sqrt(static_cast<float>(c.hd));
+        std::vector<float> want(c.nh * c.hd), got(c.nh * c.hd);
+        a.out = want.data();
+        std::vector<float> s1(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s1.data());
+
+        a.out = got.data();
+        a.v_q = vq.data();
+        a.v_scale = vs.data();
+        std::vector<float> s2(kata::attention_scratch_floats_grouped(a));
+        kata::attention_decode_grouped(a, s2.data());
+
+        float amax = 1e-9f;
+        for (float f : want) amax = std::max(amax, std::fabs(f));
+        for (size_t i = 0; i < got.size(); ++i)
+            ASSERT_NEAR(got[i], want[i], 3e-2f * amax)
+                << "nh=" << c.nh << " nkvh=" << c.nkvh << " hd=" << c.hd << " n_kv=" << c.n_kv
+                << " i=" << i;
     }
 }
