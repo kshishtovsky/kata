@@ -199,10 +199,12 @@ struct Model::Impl {
     // changes which token wins, while v is a weighted sum (EXP-0047).
     std::vector<int8_t> v_q;
     std::vector<uint16_t> v_scale;
-    bool v_int8 = true;
-    // 0 disables it, N enables it from N cached positions. Env override so both
-    // arms run from one binary (the machine drifts by >5% between builds).
-    size_t v_int8_min_kv = 4096;
+    // OFF by default: EXP-0047 measured int8 V at 0.72-0.74x in the shipped
+    // kernel and a 1.5% whole-token regression at 4-8k context. The code stays
+    // because int4 V removes twice the bytes for the same dequant ALU, but it
+    // must not be reachable by accident. KATA_KVQ=<n> turns it on from n cached
+    // positions, 0 disables.
+    size_t v_int8_min_kv = 0;
     std::vector<float> conv_state;         // [n_layer][l_cache-1][n_embd]
     std::vector<float> x, norm_out, q, k, v, attn_out, bcx;
     std::vector<float> ffn_gate, ffn_up, ffn_down;
@@ -265,6 +267,9 @@ struct Model::Impl {
 
     void alloc() {
         const size_t kv = n_head_kv * head_dim;
+        // Read once here, not per token: the cache must be quantised from the
+        // first token or the first few positions would be read from stale zeros.
+        if (const char * e = std::getenv("KATA_KVQ")) v_int8_min_kv = std::strtoul(e, nullptr, 10);
         k_cache.assign(n_layer * n_ctx * kv, 0.0f);
         // shortcut: with int8 v the float32 cache is only needed by prefill, so
         // it is allocated but never written in decode. Drop it once prefill has
@@ -466,21 +471,22 @@ struct Model::Impl {
                         head_dim * sizeof(float));
             // v_q/(v_scale) index the whole [layer][kv_head][position] slab, so
             // the quantiser sees a contiguous 64-value row per position.
-            const size_t voff = (h * n_ctx + pos) * head_dim;
-            quantize_row_i8(v.data() + h * head_dim, v_q.data() + base_off + voff,
-                            v_scale.data() + (base_off + voff) / VQ_BLK, head_dim);
+            if (v_int8_min_kv > 0) {
+                const size_t voff = (h * n_ctx + pos) * head_dim;
+                quantize_row_i8(v.data() + h * head_dim, v_q.data() + base_off + voff,
+                                v_scale.data() + (base_off + voff) / VQ_BLK, head_dim);
+            }
         }
 
         AttnArgs a{};
         a.q = q.data();
         a.k_cache = kbase;
         a.v_cache = vbase;
-        // int8 v only pays past the point where the v pass stops fitting in
-        // cache: at 512 tokens it is 8 MB and the dequant cost outweighs the
-        // bytes saved (-13%), at 16k it is 268 MB and it wins (+7%). EXP-0049
-        // measured the crossover between 4k and 8k.
-        if (const char * e = std::getenv("KATA_KVQ")) v_int8_min_kv = std::strtoul(e, nullptr, 10);
-        if (v_int8 && a.n_kv >= v_int8_min_kv && v_int8_min_kv > 0) {
+        // int8 v is OFF by default (v_int8_min_kv = 0): EXP-0047 measured the
+        // shipped kernel at 0.72-0.74x and a 1.5% whole-token regression at 4-8k.
+        // KATA_KVQ=<n> opts in from n cached positions so an int4 experiment can
+        // reuse the plumbing without anyone inheriting the loss by accident.
+        if (v_int8_min_kv > 0 && a.n_kv >= v_int8_min_kv) {
             a.v_q = v_q.data() + base_off;
             a.v_scale = v_scale.data() + base_off / VQ_BLK;
         }
