@@ -1625,6 +1625,7 @@ on its own. `q4_K_scale_min` is still 3.7% and is the next target there.
 |---|---|
 | per-token decode loop (no batching) | 21 |
 | EXP-0023 AVX2 batched GEMM | 113-127 |
+| EXP-0061 | Instruction audit of the q4_K VNNI tile (55% of peak) | PASSED | broadcast per `vpdpbusd` caps the shape at 50% of peak; VRN 16/4, float epilogue and broadcast forms all measured worse |
 | + VNNI microkernel | 130.5 |
 | + vectorised weight unpack | 143.0-145.7 |
 
