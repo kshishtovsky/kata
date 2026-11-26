@@ -367,43 +367,6 @@ void scores_8x(const AttnArgs & a, const float * q, size_t base, size_t t0, size
     for (int i = 0; i < 8; ++i) out[i] *= scale;
 }
 
-// G query heads share one kv head. Walking the kv head once and scoring all G
-// against the same k block removes the G-fold re-read of K, which the phase
-// split showed was 256 MiB per token at 32k for 64 MiB of actual data.
-// Accumulators: NT positions x G heads; NT=2, G=4 -> 8 ymm, fits with room.
-template <int G, int NT>
-__attribute__((target("avx2,fma")))
-void scores_group(const AttnArgs & a, const float * q, size_t base, size_t t0, size_t hd,
-                  const float * scale, float * out, float * mx) {
-    const size_t stride = pos_stride(a);
-    const float * k0 = a.k_cache + t0 * stride + base;
-    __m256 acc[NT][G];
-    for (int j = 0; j < NT; ++j)
-        for (int h = 0; h < G; ++h) acc[j][h] = _mm256_setzero_ps();
-
-    size_t i = 0;
-    for (; i + 8 <= hd; i += 8) {
-        __m256 kv[NT];
-        for (int j = 0; j < NT; ++j) kv[j] = _mm256_loadu_ps(k0 + j * stride + i);
-        for (int h = 0; h < G; ++h) {
-            const __m256 qv = _mm256_loadu_ps(q + h * hd + i);
-            for (int j = 0; j < NT; ++j) acc[j][h] = _mm256_fmadd_ps(qv, kv[j], acc[j][h]);
-        }
-    }
-    for (int j = 0; j < NT; ++j) {
-        for (int h = 0; h < G; ++h) {
-            __m128 t = _mm_add_ps(_mm256_castps256_ps128(acc[j][h]), _mm256_extractf128_ps(acc[j][h], 1));
-            t = _mm_hadd_ps(t, t);
-            t = _mm_hadd_ps(t, t);
-            float sc = _mm_cvtss_f32(t);
-            for (size_t z = i; z < hd; ++z) sc += q[h * hd + z] * k0[j * stride + z];
-            sc *= scale[h];
-            out[h * a.n_kv + t0 + j] = sc;
-            mx[h] = std::max(mx[h], sc);
-        }
-    }
-}
-
 // G heads sharing one kv head: weighted sum of v. NZ is a compile-time zmm
 // count on purpose: with a runtime bound the accumulator array lives on the
 // stack and GCC emits one kmovw per spill reload, which profiling showed as 35%
@@ -483,30 +446,6 @@ void v_group_q8(const AttnArgs & a, const float * p, size_t hd, size_t base, con
         const __m512 iv = _mm512_set1_ps(inv[h]);
         for (int j = 0; j < NZ; ++j)
             _mm512_storeu_ps(out + h * hd + j * 16, _mm512_mul_ps(acc[h][j], iv));
-    }
-}
-
-// Score pass over the transposed k cache: the vector lanes are positions, the
-// accumulators are the four query heads of one kv group. No reduction step and
-// no transpose at the end -- a lane already holds the finished dot product.
-// Downsides recorded in EXP-0018: no q reuse across head_dim (a broadcast per
-// dim per head) and the k write in decode is head_dim strided stores.
-template <int NP>
-__attribute__((target("avx512f,avx512vl,fma")))
-void scores_kt(const float * q, const float * kt_row0, size_t hd, size_t /*n_kv*/, size_t stride_d,
-               float scale, float * out) {
-    __m512 acc[4];
-    for (int h = 0; h < 4; ++h) acc[h] = _mm512_setzero_ps();
-    const float * col = kt_row0;
-    for (size_t d = 0; d < hd; ++d, col += stride_d) {
-        const __m512 kv = _mm512_loadu_ps(col);
-        for (int h = 0; h < 4; ++h)
-            acc[h] = _mm512_fmadd_ps(_mm512_set1_ps(q[h * hd + d]), kv, acc[h]);
-    }
-    for (int h = 0; h < 4; ++h) {
-        alignas(64) float lane[16];
-        _mm512_store_ps(lane, _mm512_mul_ps(acc[h], _mm512_set1_ps(scale)));
-        for (int j = 0; j < NP; ++j) out[j * 4 + h] = lane[j];
     }
 }
 
@@ -637,71 +576,6 @@ void attention_decode_avx2_grouped(const AttnArgs & a, float * scratch, float * 
     attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, mx_out, sum_out, nullptr);
 }
 
-__attribute__((target("avx512f,avx512vl,avx2,fma")))
-void attention_decode_avx2_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
-    const size_t hd = a.head_dim;
-    const size_t g = a.n_heads / a.n_kv_heads;
-    if (g != 4 || hd != 64) { attention_decode_avx2_grouped_range(a, scratch, 0, a.n_kv_heads, nullptr, nullptr, nullptr); return; }
-
-    alignas(64) float mxv[4], inv[4];
-    for (size_t h = 0; h < 4; ++h) mxv[h] = -INFINITY;
-    const size_t blocks = (a.n_kv + KT_BLK - 1) / KT_BLK;
-
-    for (size_t gb = 0; gb < a.n_kv_heads; ++gb) {
-        const size_t base = gb * head_stride(a);
-        const float * q = a.q + gb * 4 * hd;
-        float * p = scratch;
-
-        for (size_t blk = 0; blk < blocks; ++blk) {
-            const size_t t0 = blk * KT_BLK;
-            const size_t n = std::min(KT_BLK, a.n_kv - t0);
-            const float * row = kt + ((gb * blocks + blk) * hd) * KT_BLK;
-            if (n == KT_BLK) {
-                alignas(64) float tile[4 * 16];
-                for (size_t off = 0; off < KT_BLK; off += 16) {
-                    scores_kt<16>(q, row + off, hd, a.n_kv, KT_BLK, a.scale, tile);
-                    for (size_t j = 0; j < 16; ++j)
-                        for (int h = 0; h < 4; ++h) {
-                            const float sc = tile[j * 4 + h];
-                            p[h * a.n_kv + t0 + off + j] = sc;
-                            mxv[h] = std::max(mxv[h], sc);
-                        }
-                }
-            } else {
-                for (size_t j = 0; j < n; ++j)
-                    for (int h = 0; h < 4; ++h) {
-                        const size_t hi = gb * 4 + h;
-                        const float * k = a.k_cache + (t0 + j) * pos_stride(a) + base;
-                        const float sc = dot_avx2(a.q + hi * hd, k, hd) * a.scale;
-                        p[h * a.n_kv + t0 + j] = sc;
-                        mxv[h] = std::max(mxv[h], sc);
-                    }
-            }
-        }
-
-        for (size_t h = 0; h < 4; ++h) inv[h] = 1.0f / softmax_exp_inplace(p + h * a.n_kv, a.n_kv, mxv[h]);
-        switch (hd / 16) {
-        case 1: v_group<4, 1>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        case 2: v_group<4, 2>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        case 3: v_group<4, 3>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        default: v_group<4, 4>(a, p, hd, base, inv, a.out + gb * 4 * hd); break;
-        }
-    }
-}
-
-void attention_decode_grouped_kt(const AttnArgs & a, float * scratch, const float * kt) {
-#if defined(__x86_64__) || defined(__i386__)
-    // The kt score pass needs zmm (positions are the lanes), so it is gated on
-    // real AVX-512, not on VNNI, which it never uses.
-    if (cpu_isa() == Isa::Avx512Vnni || cpu_isa() == Isa::Avx512) {
-        attention_decode_avx2_grouped_kt(a, scratch, kt);
-        return;
-    }
-#else
-    (void)kt;
-#endif
-    attention_decode_grouped(a, scratch);
-}
 
 #else
 void attention_decode_avx2(const AttnArgs & a, float * scratch) {
