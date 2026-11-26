@@ -61,6 +61,12 @@ target_link_libraries(kata_run PRIVATE kata_core)
 
 add_executable(bench_real_weights bench/bench_real_weights.cpp)
 add_executable(bench_k4 bench/bench_k4.cpp)
+add_executable(peak_bench tools/peak_bench.cpp)
+target_link_libraries(peak_bench PRIVATE pthread)
+
+add_executable(bench_msweep bench/bench_msweep.cpp)
+target_link_libraries(bench_msweep PRIVATE kata_core)
+
 add_executable(bench_gemm bench/bench_gemm.cpp)
 target_link_libraries(bench_real_weights PRIVATE kata_core ${CMAKE_DL_LIBS})
 target_link_libraries(bench_k4 PRIVATE kata_core ${CMAKE_DL_LIBS})

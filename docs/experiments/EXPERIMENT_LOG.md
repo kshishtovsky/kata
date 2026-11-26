@@ -3438,3 +3438,100 @@ so wins there are real relative wins. The remaining structural option is
 speculative decoding with a draft that is actually trained for this model — the
 prompt-lookup draft reached 0.08-0.18 tokens per cycle (EXP-0046), so only a
 real draft changes the arithmetic.
+
+## EXP-0054 — Two diagnostics: MoE GEMM vs m, and the 32k attention decomposition
+
+**Status:** PASSED (measurement). Both diagnostics were demanded before choosing
+between flash-prefill, MoE tiling and int8 attention; both changed the picture.
+
+**Why.** EXP-0052 showed prefill is ahead of `llama.cpp` at every length, which
+answers "are we behind" but not "how far from the machine". Peak was unknown, so
+every percentage in the journal so far had a made-up denominator.
+
+### Peak (frozen, now `tools/peak_bench.cpp`, CI-checked)
+
+AVX-512 FMA and int8 VNNI, 16 threads, `taskset -c 0-15`, checked with `perf stat`
+instruction counts rather than arithmetic:
+
+| | 1 thread | 16 threads | per core |
+|---|---|---|---|
+| fp32 FMA | 165 GFLOP/s | **2642 GFLOP/s** | 165 |
+| int8 VNNI (`vpdpbusd`) | 311 GMAC/s | **4975 GMAC/s** | 311 |
+
+The first attempt reported 57 GFLOP/s for every thread count. Same defect as
+`vt5`/`vt7`: a runtime loop bound over `a[]` lets GCC keep the accumulators in
+memory, turning the peak into a load-store benchmark. Compile-time unroll fixed
+it; `tools/peak_bench.cpp` exits 2 if the 16-thread numbers drift >10% from these
+frozen values, so the bug cannot come back silently.
+
+### Diagnostic 1 — MoE GEMM vs m (`bench/bench_msweep.cpp`)
+
+`llama.cpp`-style expert buckets are small, so the question was whether the 21.5%
+of peak measured at 32k is a tile-size defect or an m-dependence.
+
+| m | expert_gate (n=1536) | attn_o (n=2048) | dense_up (n=11776) |
+|---|---|---|---|
+| 34 | 1596 GMAC/s (32%) | 1598 (32%) | 2122 (43%) |
+| 128 | 2348 (47%) | 2273 (46%) | 3142 (63%) |
+| 512 | 2344 (47%) | 2259 (45%) | 3171 (64%) |
+| 2048 | 2359 (47%) | 2294 (46%) | 3146 (63%) |
+| 8192 | 2357 (47%) | 2165 (44%) | 2991 (60%) |
+
+Two findings. First, **the loss is not small-m**: the table is flat from m=128 to
+m=8192, so bucket sizes near 34 cost only 15 points and nothing at all above 128.
+Second, **it is n**: the same kernel reaches 47% at n=1536/2048 and 63% at
+n=11776, i.e. the kernel is limited by how much work one weight band does per
+activation tile. 47% at n=2048 is also *not* the 21.5% seen end-to-end, so roughly
+half of the prefill FFN time is not in this kernel at all.
+
+### The rest of the FFN is glue (`[moe]` counters, now printed for prefill)
+
+Per 1024-token chunk, steady state: `router 67 | pack 0.2 | q8gather 72 |
+gemm 546 | silu+q8 82 | scatter 365 ms` of a 1204 ms `ffn` phase. So the GEMMs are
+546 ms and **the surrounding glue is 586 ms** — as much again. Scatter alone is
+365 ms: 2.0 GB of read-modify-write for 32768 tokens, which at 78 GB/s should take
+0.03 s, measured 3.7 GB/s because `scatter_add` is single-threaded and
+scattered writes defeat write combining.
+
+### Diagnostic 2 — 32k attention decomposition
+
+`[attn]` counters per chunk, summed over a full 32768-token run
+(`prefill 32768 tok in 140691 ms`, `attn core 60006 ms`):
+
+| stage | ms | share of the run |
+|---|---|---|
+| qkv projections | 1271 | 0.9% |
+| prep (per-head norm + RoPE + KV write) | 614 | 0.4% |
+| **core (QK + softmax + PV)** | **60006** | **42.7%** |
+| o_proj | 2859 | 2.0% |
+
+Inside the core, from a matched microbenchmark (`/tmp/fl/ac.cpp`, same G=4/HD=64
+structure, phases switched off): **QK 76%**, PV 57%, exp/softmax ≈ 0. So the 60 s
+is the score pass. `exp128_ps` is not the problem — an earlier iteration already
+replaced `std::exp` there.
+
+QK effective rate: 21.99 TMAC of score work over 45.6 s ≈ **480 GMAC/s ≈ 18% of
+the fp32 peak**, single reduction chain per head per position.
+
+**Ceiling.** Perfect kernels, zero overhead: attention core on fp32 peak 16.6 s +
+everything else on VNNI peak 17.6 s = **34.2 s**, against 136-141 s measured, so
+the engine is at ~25% of its own floor. Nesting matters: "22.0 s with int8
+everywhere" is a utopian figure and must be read as such.
+
+**Corrections recorded because they were wrong before this measurement.**
+
+1. The "26% prefill deficit" was 336 tok/s at n=25070 against 453 tok/s at n=512.
+   Different lengths. At equal length kata is 1.03-1.26x ahead.
+2. "114 s at 32k is a property of the machine" was a conclusion without a
+   denominator. With the floor it is 4x above physics, and 43% of it is one
+   quadratic stage.
+3. `453` vs `443` for `llama.cpp` pp512 is run-to-run spread of one binary
+   (three consecutive runs: 443.20, 450.40, 452.77), not two benchmarks.
+4. The MoE GEMM's 21.5%-of-peak at 32k is *not* a small-m artefact; the kernel is
+   flat in m and loses to n. The remaining half of the FFN time is glue.
+
+**What this changes.** The two largest absolute targets on 32k prefill are the
+attention score pass (45.6 s, 18% of fp32 peak, quadratic) and the MoE glue
+(586 ms per 1024 tokens = 18.7 s per 32k run, of which scatter is 11.7 s and is a
+pure engineering fix). Kernel tiling is third: 47% at n=2048 means at most a 2x
+there, and it is the hardest of the three.

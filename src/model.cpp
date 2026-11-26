@@ -255,6 +255,10 @@ struct Model::Impl {
     // these are the real call sites, so the numbers cannot drift.
     double moe_router = 0, moe_pack = 0, moe_q8 = 0, moe_gemm = 0, moe_silu = 0, moe_scat = 0;
     size_t moe_buckets = 0, moe_pairs = 0, moe_dispatch = 0;
+    // Prefill attention decomposition: the 32k profile puts 45% of a 136 s run here,
+    // and "attention is slow" is not actionable until QKV, prep, core and O-proj are
+    // separated -- the core is the only part a tiled kernel can fix.
+    double a_qkv = 0, a_prep = 0, a_core_t = 0, a_out = 0;
     double t_attn = 0, t_conv = 0, t_core = 0;
     // Expert routing heat: how many (token, expert) selections land on each
     // expert, per MoE layer. This is the input to any residency decision, and
@@ -793,11 +797,17 @@ struct Model::Impl {
     void attention_rows(size_t il, const Layer & L, size_t m, size_t pos0) {
         const size_t qw = n_head * head_dim;
         const size_t kvw = n_head_kv * head_dim;
+        const auto at0 = std::chrono::steady_clock::now();
         q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
         mmn(L.tq, qw, n_embd, pq.data(), qw, L.wq, paq.data(), m);
         mmn(L.tk, kvw, n_embd, pk.data(), kvw, L.wk, paq.data(), m);
         mmn(L.tv, kvw, n_embd, pv.data(), kvw, L.wv, paq.data(), m);
 
+        if (prof) {
+            a_qkv += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - at0).count();
+        }
+        const auto at1 = std::chrono::steady_clock::now();
         // Per-head norm happens before RoPE, at row granularity, so it is one
         // call over m*n_head rows.
         rms_norm(m * n_head, head_dim, pq.data(), pq.data(), static_cast<const float *>(L.q_norm), eps);
@@ -811,11 +821,25 @@ struct Model::Impl {
             write_kv_head_major(kbase, vbase, pos, n_ctx, n_head_kv, head_dim,
                                 pk.data() + i * kvw, pv.data() + i * kvw);
         }
+        if (prof) {
+            a_prep += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - at1).count();
+        }
+        const auto at2 = std::chrono::steady_clock::now();
         attention_prefill_mt(pq.data(), m, kbase, vbase, pos0, n_head, n_head_kv,
                           head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)),
                           pattn.data(), pool, head_dim, n_ctx * head_dim);
+        if (prof) {
+            a_core_t += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - at2).count();
+        }
+        const auto at3 = std::chrono::steady_clock::now();
         q8_rows_mt(pattn.data(), m, qw, paq.data());
         mmn(L.to, n_embd, qw, pattn.data(), n_embd, L.wo, paq.data(), m);
+        if (prof) {
+            a_out += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - at3).count();
+        }
     }
 
     void dense_ffn_rows(size_t /*il*/, const Layer & L, size_t m) {
@@ -976,6 +1000,17 @@ struct Model::Impl {
                     std::chrono::steady_clock::now() - t_start).count();
                 std::fprintf(stderr, "[prefill] chunk %zu tok in %.2f ms = %.1f tok/s\n", m, ms, 1000.0 * m / ms);
                 std::fprintf(stderr, "[phase] emb %.1f norm %.1f mix %.1f (attn %.1f conv %.1f) res %.1f ffn %.1f\n", t_emb_s,t_norm_s,t_mix_s,t_attn_s,t_conv_s,t_res_s,t_ffn_s);
+                // The moe_* counters are filled by moe_ffn_rows; printing them per
+                // chunk is what tells "the GEMM is slow" apart from "the glue around
+                // it is slow", which is the same accounting mistake that hid the
+                // dispatch cost on the decode path for three iterations.
+                std::fprintf(stderr, "[moe] router %.1f | pack %.1f | q8gather %.1f | gemm %.1f | silu+q8 %.1f | scatter %.1f ms (buckets %zu, pairs %zu)\n",
+                             moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_scat, moe_buckets, moe_pairs);
+                moe_router = moe_pack = moe_q8 = moe_gemm = moe_silu = moe_scat = 0;
+                moe_buckets = moe_pairs = 0;
+                std::fprintf(stderr, "[attn] qkv %.1f | prep(norm+rope+kv) %.1f | core %.1f | o_proj %.1f ms\n",
+                             a_qkv, a_prep, a_core_t, a_out);
+                a_qkv = a_prep = a_core_t = a_out = 0;
             }
         }
         st.pos += n;
