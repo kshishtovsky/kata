@@ -3544,3 +3544,4 @@ lossless ceiling on the score pass is 1.6x, not 5.5x, quadratic) and the MoE glu
 here as "a pure engineering fix" was disproven in EXP-0055 -- it runs at 63 of a
 77 GB/s replicated ceiling, so it is already at the memory wall). Kernel tiling is
 third: 47% at n=2048 means at most a 2x there, and it is the hardest of the three.
+| EXP-0070 | q3_K on MoE gate/up experts | REJECTED | PPL −4.5% on WikiText-2 but +3.1% on source code; reconstruction error 2.1x worse than q4_K, so the gain is corpus-specific noise |
