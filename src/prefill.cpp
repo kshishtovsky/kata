@@ -397,15 +397,19 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
 
                 if (__builtin_expect(!any_max, 1)) {
                     // Common path (99.5% of positions): running max does not change.
-                    // Evaluate all 4 exponents in a single SIMD vector pass.
+                    // Evaluate all 4 exponents in a single SIMD vector pass, then
+                    // broadcast each lane STRAIGHT FROM THE REGISTER. Storing the
+                    // four floats to the stack and reloading them as scalars is a
+                    // 16-byte store followed by 4-byte loads from inside it, i.e. a
+                    // partial store-forwarding stall on every position; measured as
+                    // 36.8% of the whole kernel (EXP-0066 addendum).
                     const __m128 sc_v = _mm_set_ps(sc[3], sc[2], sc[1], sc[0]);
                     const __m128 m_v  = _mm_set_ps(m[3],  m[2],  m[1],  m[0]);
-                    alignas(16) float e[4];
-                    _mm_store_ps(e, exp128_ps(_mm_sub_ps(sc_v, m_v)));
-
+                    const __m128 eps  = exp128_ps(_mm_sub_ps(sc_v, m_v));
                     for (size_t h = 0; h < G; ++h) {
-                        s[h] += e[h];
-                        const __m512 ev = _mm512_set1_ps(e[h]);
+                        const __m128 hv = _mm_shuffle_ps(eps, eps, (int)(_MM_SHUFFLE(h, h, h, h)));
+                        s[h] += _mm_cvtss_f32(hv);
+                        const __m512 ev = _mm512_broadcastss_ps(hv);
                         for (int r = 0; r < 4; ++r) acc[h][r] = _mm512_fmadd_ps(ev, vv[r], acc[h][r]);
                     }
                 } else {
