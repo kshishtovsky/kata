@@ -1,4 +1,5 @@
 #include "kata/model.h"
+#include "kata/prof.h"
 #include "kata/shortconv.h"
 
 #include <algorithm>
@@ -251,9 +252,11 @@ struct Model::Impl {
     size_t dump_pos = 0;
     bool router_log = std::getenv("KATA_ROUTER") != nullptr;   // KATA_DUMP_POS: which decode position the per-layer dumps capture
     double t_emb = 0, t_mix = 0, t_ffn = 0, t_lm = 0, t_norm = 0, t_mm = 0, t_q = 0;
+    double t_tot = 0;
     // MoE sub-phase split (EXP-0051). Instrumented, never re-implemented:
     // these are the real call sites, so the numbers cannot drift.
-    double moe_router = 0, moe_pack = 0, moe_q8 = 0, moe_gemm = 0, moe_silu = 0, moe_scat = 0;
+    double moe_router = 0, moe_pack = 0, moe_q8 = 0, moe_gemm = 0, moe_silu = 0, moe_scat = 0,
+           moe_down = 0;
     size_t moe_buckets = 0, moe_pairs = 0, moe_dispatch = 0;
     // Prefill attention decomposition: the 32k profile puts 45% of a 136 s run here,
     // and "attention is slow" is not actionable until QKV, prep, core and O-proj are
@@ -947,9 +950,11 @@ struct Model::Impl {
             const auto e3 = mclk::now();
             moe_silu += std::chrono::duration<double, std::milli>(e3 - e2).count();
             mmn(L.t_de, n_embd, n_ff_exp, dout, n_embd, bd + e * sb_d, aq_d, c);
+            const auto e4 = mclk::now();
+            moe_down += std::chrono::duration<double, std::milli>(e4 - e3).count();
             for (size_t i = 0; i < c; ++i) pw[i] = pairs[first + i].weight;
             scatter_add(dout, ptok, pw, c, n_embd, pexpacc.data());
-            moe_scat += std::chrono::duration<double, std::milli>(mclk::now() - e3).count();
+            moe_scat += std::chrono::duration<double, std::milli>(mclk::now() - e4).count();
             ++moe_buckets;
             moe_pairs += c;
         }
@@ -977,8 +982,14 @@ struct Model::Impl {
                 const Layer & L = layers[il];
                 a=NS(); std::memcpy(pprev.data(), px.data(), m * n_embd * sizeof(float));
                 rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.attn_norm), eps); t_norm_s+=NS()-a;
-                a=NS(); if (L.attn) { attention_rows(il, L, m, pos0); t_attn_s+=NS()-a; }
-                else { shortconv_rows(il, L, m); t_conv_s+=NS()-a; } t_mix_s+=NS()-a;
+                // One measurement window, then split by kind. Taking a second
+                // clock read for t_mix_s made mix > attn + conv by two NS()
+                // calls per layer (the "sum of stages exceeds the total" case
+                // the reconciler exists to catch).
+                a=NS();
+                if (L.attn) { attention_rows(il, L, m, pos0); t_attn_s+=NS()-a; }
+                else { shortconv_rows(il, L, m); t_conv_s+=NS()-a; }
+                t_mix_s+=NS()-a;
                 a=NS(); for (size_t i = 0; i < m * n_embd; ++i) px[i] = pprev[i] + pattn[i]; t_res_s+=NS()-a;
 
                 a=NS(); rms_norm(m, n_embd, pnorm.data(), px.data(), static_cast<const float *>(L.ffn_norm), eps); t_norm_s+=NS()-a;
@@ -1004,13 +1015,35 @@ struct Model::Impl {
                 // chunk is what tells "the GEMM is slow" apart from "the glue around
                 // it is slow", which is the same accounting mistake that hid the
                 // dispatch cost on the decode path for three iterations.
-                std::fprintf(stderr, "[moe] router %.1f | pack %.1f | q8gather %.1f | gemm %.1f | silu+q8 %.1f | scatter %.1f ms (buckets %zu, pairs %zu)\n",
-                             moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_scat, moe_buckets, moe_pairs);
-                moe_router = moe_pack = moe_q8 = moe_gemm = moe_silu = moe_scat = 0;
+                std::fprintf(stderr, "[moe] router %.1f | pack %.1f | q8gather %.1f | gemm %.1f | silu+q8 %.1f | down %.1f | scatter %.1f ms (buckets %zu, pairs %zu)\n",
+                             moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_down, moe_scat, moe_buckets, moe_pairs);
                 moe_buckets = moe_pairs = 0;
                 std::fprintf(stderr, "[attn] qkv %.1f | prep(norm+rope+kv) %.1f | core %.1f | o_proj %.1f ms\n",
                              a_qkv, a_prep, a_core_t, a_out);
+                // The stage split must add up to the chunk. The loose ends are
+                // real: the lm_head of the last chunk and the per-layer glue are
+                // charged to neither, so the sum is allowed to be a couple of
+                // percent short of the wall clock, never over it.
+                const double stages = t_emb_s + t_norm_s + t_mix_s + t_res_s + t_ffn_s;
+                const StageCheck sc = check_stages(stages, ms, 0.05);
+                print_stage_check("prefill-chunk", sc);
+                // The MoE sub-phases must add up to the FFN they sit in. This is
+                // the check that would have caught moe_scat containing the
+                // down-projection for three iterations.
+                const double moe_parts = moe_router + moe_pack + moe_q8 + moe_gemm +
+                                         moe_silu + moe_down + moe_scat;
+                if (t_ffn_s > 1.0) {
+                    const StageCheck mc = check_stages(moe_parts, t_ffn_s, 0.15);
+                    print_stage_check("moe-subphases", mc);
+                }
+                // And the attention split must add up to the attention time it
+                // was measured inside, or "core is 42%" is read off a broken pie.
+                if (t_attn_s > 1.0) {
+                    const StageCheck ac = check_stages(a_qkv + a_prep + a_core_t + a_out, t_attn_s, 0.15);
+                    print_stage_check("attn-subphases", ac);
+                }
                 a_qkv = a_prep = a_core_t = a_out = 0;
+                moe_router = moe_pack = moe_q8 = moe_gemm = moe_silu = moe_down = moe_scat = 0;
             }
         }
         st.pos += n;
@@ -1019,6 +1052,7 @@ struct Model::Impl {
 
     const float * forward(uint32_t token, ModelState & st) {
         if (st.pos >= n_ctx) throw std::runtime_error("kata: context full");
+        const auto t_token0 = std::chrono::steady_clock::now();
         const size_t pos = st.pos;
         { Tick tk(&t_emb, prof); embed(token); }
         for (size_t il = 0; il < n_layer; ++il) {
@@ -1059,18 +1093,24 @@ struct Model::Impl {
         rms_norm(1, n_embd, norm_out.data(), x.data(), static_cast<const float *>(out_norm), eps);
         { Tick tk(&t_lm, prof); mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd, norm_out.data()); }
         st.pos = pos + 1;
+        t_tot = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_token0).count();
         if (prof) {
             const double tot = t_emb + t_mix + t_ffn + t_lm + t_norm;
             std::fprintf(stderr, "[prof] attn_core %7.2f ms | attn_total %7.2f | conv %7.2f ms\n", t_core, t_attn, t_conv);
             std::fprintf(stderr, "[prof] mm %7.2f ms in %zu calls (%.1f us/call), quantize %5.2f ms\n", t_mm, n_mm, n_mm ? 1000.0*t_mm/n_mm : 0.0, t_q);
-            std::fprintf(stderr, "[moe] router %.2f | pack %.2f | q8gather %.2f | gemm %.2f | silu+q8 %.2f | scatter %.2f ms"
+            std::fprintf(stderr, "[moe] router %.2f | pack %.2f | q8gather %.2f | gemm %.2f | silu+q8 %.2f | down %.2f | scatter %.2f ms"
                                  "  (buckets %zu, pairs %zu, ffn %.2f ms)\n",
-                         moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_scat,
+                         moe_router, moe_pack, moe_q8, moe_gemm, moe_silu, moe_down, moe_scat,
                          moe_buckets, moe_pairs, t_ffn);
             std::fprintf(stderr, "[prof] total %7.2f ms | mix %7.2f (%4.1f%%) | ffn %7.2f (%4.1f%%) | lm %6.2f (%4.1f%%) | norm %5.2f (%4.1f%%) | emb %5.2f\n",
                          tot, t_mix, 100*t_mix/tot, t_ffn, 100*t_ffn/tot, t_lm, 100*t_lm/tot, t_norm, 100*t_norm/tot, t_emb);
+            // Decode is whole-token: every nanosecond belongs to exactly one of
+            // these five stages, so the tolerance is tight on purpose. If a new
+            // per-token cost is added outside them, this fails instead of
+            // silently inflating "mix".
+            const StageCheck dc = check_stages(tot, t_tot, 0.02);
+            print_stage_check("decode-token", dc);
             t_emb = t_mix = t_ffn = t_lm = t_norm = t_mm = t_q = 0;
-            moe_router = moe_pack = moe_q8 = moe_gemm = moe_silu = moe_scat = 0;
             moe_buckets = moe_pairs = moe_dispatch = 0;
             t_attn = t_conv = t_core = 0; n_mm = 0;
         }

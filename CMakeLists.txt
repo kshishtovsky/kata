@@ -87,13 +87,13 @@ if(NOT GTest_FOUND)
   add_executable(kata_tests EXCLUDE_FROM_ALL)
   target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_shortconv.cpp
     tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp
-    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp)
+    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp)
   target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
   target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
 else()
   enable_testing()
   add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_shortconv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp
-    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp)
+    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp)
   target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
 endif()
 
