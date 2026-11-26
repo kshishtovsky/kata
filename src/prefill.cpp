@@ -335,7 +335,7 @@ namespace {
 // heads. Accumulators are 4 heads x 4 zmm (head_dim 64) = 16 of 32 zmm.
 // Scores for the 4 heads are computed in parallel with AVX-512 and normalized
 // via fast vector exp128_ps in the common non-max-update path.
-__attribute__((target("avx512f,avx512vl,avx512bw,avx2,fma")))
+__attribute__((target("avx512f,avx512vl,avx512bw,avx512dq,avx2,fma")))
 void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                     const float * v_cache, size_t n_kv_begin, size_t n_heads,
                     size_t n_kv_heads, float scale, float * out,
@@ -364,14 +364,31 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                 const float * vp = v_cache + p * kv_stride + kvh * hstride;
                 _mm_prefetch(reinterpret_cast<const char *>(vp + 4 * kv_stride), _MM_HINT_T0);
 
-                float sc[4];
-                for (size_t h = 0; h < G; ++h) {
-                    const float * qq = qv[h];
-                    __m512 a = _mm512_mul_ps(_mm512_loadu_ps(qq), k0);
-                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 16), k1, a);
-                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 32), k2, a);
-                    a = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 48), k3, a);
-                    sc[h] = _mm512_reduce_add_ps(a) * scale;
+                // One 4-way horizontal reduce instead of four serial ones. Each
+                // _mm512_reduce_add_ps is ~6 dependent uops and there were four of
+                // them per (row, position, group), i.e. 553 M per 1024-token chunk
+                // at a 16k prefix. Packing the four dot products into one xmm
+                // costs the same shuffles once and feeds exp128_ps directly.
+                alignas(16) float sc[4];
+                {
+                    __m512 a[G];
+                    for (size_t h = 0; h < G; ++h) {
+                        const float * qq = qv[h];
+                        __m512 v = _mm512_mul_ps(_mm512_loadu_ps(qq), k0);
+                        v = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 16), k1, v);
+                        v = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 32), k2, v);
+                        a[h] = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 48), k3, v);
+                    }
+                    const __m256 s0 = _mm256_add_ps(_mm512_castps512_ps256(a[0]), _mm512_extractf32x8_ps(a[0], 1));
+                    const __m256 s1 = _mm256_add_ps(_mm512_castps512_ps256(a[1]), _mm512_extractf32x8_ps(a[1], 1));
+                    const __m256 s2 = _mm256_add_ps(_mm512_castps512_ps256(a[2]), _mm512_extractf32x8_ps(a[2], 1));
+                    const __m256 s3 = _mm256_add_ps(_mm512_castps512_ps256(a[3]), _mm512_extractf32x8_ps(a[3], 1));
+                    const __m256 h01 = _mm256_hadd_ps(s0, s1);
+                    const __m256 h23 = _mm256_hadd_ps(s2, s3);
+                    const __m256 q4 = _mm256_hadd_ps(h01, h23);
+                    const __m128 lo = _mm256_castps256_ps128(q4);
+                    _mm_store_ps(sc, _mm_mul_ps(_mm_add_ps(lo, _mm256_extractf128_ps(q4, 1)),
+                                                _mm_set1_ps(scale)));
                 }
 
                 const bool any_max = (sc[0] > m[0]) | (sc[1] > m[1]) | (sc[2] > m[2]) | (sc[3] > m[3]);
