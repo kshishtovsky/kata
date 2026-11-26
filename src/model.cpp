@@ -262,6 +262,9 @@ struct Model::Impl {
     // and "attention is slow" is not actionable until QKV, prep, core and O-proj are
     // separated -- the core is the only part a tiled kernel can fix.
     double a_qkv = 0, a_prep = 0, a_core_t = 0, a_out = 0;
+    // shortconv split: 30 of 40 layers are shortconv, so a single "conv" number
+    // hid whether the cost is the in_proj GEMM, the 3-tap kernel, or out_proj.
+    double t_in_proj = 0, t_conv_core = 0, t_out_proj = 0;
     double t_attn = 0, t_conv = 0, t_core = 0;
     // Expert routing heat: how many (token, expert) selections land on each
     // expert, per MoE layer. This is the input to any residency decision, and
@@ -781,7 +784,10 @@ struct Model::Impl {
         const size_t d_conv = l_cache - 1;
 
         q8_rows_mt(pnorm.data(), m, n_embd, paq.data());
+        const auto c1 = std::chrono::steady_clock::now();
         mmn(L.t_in, nc3, n_embd, pbcx.data(), nc3, L.in_proj, paq.data(), m);
+        const auto c2 = std::chrono::steady_clock::now();
+        if (prof) { t_in_proj += std::chrono::duration<double, std::milli>(c2 - c1).count(); }
 
         float * seq = pbx.data();
         float * hist = conv_state.data() + il * d_conv * nc;
@@ -790,11 +796,15 @@ struct Model::Impl {
         shortconv_bx(pbcx.data(), bx, m, nc);
         shortconv_conv(bx, pbcx.data(), m, nc, l_cache,
                        static_cast<const float *>(L.conv), pconv_out.data());
+        const auto c3 = std::chrono::steady_clock::now();
+        if (prof) { t_conv_core += std::chrono::duration<double, std::milli>(c3 - c2).count(); }
         // Tail of this chunk becomes the history for the next one.
         std::memcpy(hist, seq + m * nc, d_conv * nc * sizeof(float));
 
         q8_rows_mt(pconv_out.data(), m, n_embd, paq.data());
+        const auto c4 = std::chrono::steady_clock::now();
         mmn(L.t_out, n_embd, n_embd, pattn.data(), n_embd, L.out_proj, paq.data(), m);
+        if (prof) { t_out_proj += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c4).count(); }
     }
 
     void attention_rows(size_t il, const Layer & L, size_t m, size_t pos0) {
@@ -1029,6 +1039,9 @@ struct Model::Impl {
                 moe_buckets = moe_pairs = 0;
                 std::fprintf(stderr, "[attn] qkv %.1f | prep(norm+rope+kv) %.1f | core %.1f | o_proj %.1f ms\n",
                              a_qkv, a_prep, a_core_t, a_out);
+                std::fprintf(stderr, "[conv] in_proj %.1f | core %.1f | out_proj %.1f ms\n",
+                             t_in_proj, t_conv_core, t_out_proj);
+                t_in_proj = t_conv_core = t_out_proj = 0;
                 // The stage split must add up to the chunk. The loose ends are
                 // real: the lm_head of the last chunk and the per-layer glue are
                 // charged to neither, so the sum is allowed to be a couple of
