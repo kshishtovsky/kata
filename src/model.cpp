@@ -941,8 +941,17 @@ struct Model::Impl {
             q8_rows_gather_mt(pnorm.data(), ptok, c, n_embd, aq_g);
             const auto e1 = mclk::now();
             moe_q8 += std::chrono::duration<double, std::milli>(e1 - e0).count();
-            mmn(L.t_ge, n_ff_exp, n_embd, gout, n_ff_exp, bg + e * sb_g, aq_g, c);
-            mmn(L.t_ue, n_ff_exp, n_embd, uout, n_ff_exp, bu + e * sb_u, aq_g, c);
+            if (L.t_ge == 12 && L.t_ue == 12) {
+                // gate and up share aq_g: one pack, one fan-out.
+                gemm_q4_K_q8_K_mt2(c, n_ff_exp, n_ff_exp, n_embd, gout, n_ff_exp,
+                                   reinterpret_cast<const block_q4_K *>(bg + e * sb_g),
+                                   uout, n_ff_exp,
+                                   reinterpret_cast<const block_q4_K *>(bu + e * sb_u),
+                                   aq_g, pool);
+            } else {
+                mmn(L.t_ge, n_ff_exp, n_embd, gout, n_ff_exp, bg + e * sb_g, aq_g, c);
+                mmn(L.t_ue, n_ff_exp, n_embd, uout, n_ff_exp, bu + e * sb_u, aq_g, c);
+            }
             const auto e2 = mclk::now();
             moe_gemm += std::chrono::duration<double, std::milli>(e2 - e1).count();
             silu_mul_mt(gout, uout, c * n_ff_exp);

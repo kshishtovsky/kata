@@ -677,6 +677,42 @@ void gemm_q4_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
     });
 }
 
+void gemm_q4_K_q8_K_mt2(size_t m, size_t n_a, size_t n_b, size_t k,
+                        float * out_a, size_t lda, const block_q4_K * w_a,
+                        float * out_b, size_t ldb, const block_q4_K * w_b,
+                        const block_q8_K * a, ThreadPool & pool) {
+    if (m == 0 || (n_a == 0 && n_b == 0)) return;
+    if (cpu_isa() != Isa::Avx512Vnni || k % QK_K != 0) {
+        gemm_q4_K_q8_K_mt(m, n_a, k, out_a, lda, w_a, a, pool);
+        gemm_q4_K_q8_K_mt(m, n_b, k, out_b, ldb, w_b, a, pool);
+        return;
+    }
+    const size_t nb = k / QK_K;
+    const size_t ntile = (m + VTN - 1) / VTN;
+    const unsigned nt = pool.size();
+    std::vector<VaTile> tiles(ntile * nb);
+    const size_t pchunk = (ntile + nt - 1) / nt;
+    pool.run([&](unsigned tid) {
+        const size_t j0 = std::min(ntile, (size_t)tid * pchunk);
+        const size_t j1 = std::min(ntile, j0 + pchunk);
+        if (j0 < j1) pack_a_tiles(a, m, nb, j0, j1, tiles);
+    });
+    // Split the larger of the two matrices' rows across workers; each worker
+    // does the same row range in BOTH matrices, so the tiles it unpacked stay
+    // hot and the pool wakes once.
+    const size_t nbig = std::max(n_a, n_b);
+    const size_t chunk = (nbig + nt - 1) / nt;
+    pool.run([&](unsigned tid) {
+        const size_t lo = std::min(nbig, (size_t)tid * chunk);
+        const size_t hi = std::min(nbig, lo + chunk);
+        if (lo >= hi) return;
+        if (lo < n_a) q4_K_vnni_rows(tiles.data(), ntile, m, nb, std::min(hi, n_a) - lo,
+                                     w_a + lo * nb, out_a + lo, lda);
+        if (lo < n_b && n_b) q4_K_vnni_rows(tiles.data(), ntile, m, nb, std::min(hi, n_b) - lo,
+                                            w_b + lo * nb, out_b + lo, ldb);
+    });
+}
+
 void gemm_q6_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
                        const block_q6_K * w, const block_q8_K * a, ThreadPool & pool) {
     const unsigned nt = pool.size();

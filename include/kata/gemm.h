@@ -40,4 +40,13 @@ void gemm_q4_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
 void gemm_q6_K_q8_K_mt(size_t m, size_t n, size_t k, float * out, size_t ldc,
                        const block_q6_K * w, const block_q8_K * a, ThreadPool & pool);
 
+// Two q4_K matrices that share the SAME activation tile, in one fan-out and one
+// pack. The MoE gate and up projections of one expert are exactly this: same
+// aq_g, two weight matrices, two outputs. Two separate _mt calls packed the same
+// tiles twice and woke the pool twice.
+void gemm_q4_K_q8_K_mt2(size_t m, size_t n_a, size_t n_b, size_t k,
+                        float * out_a, size_t lda, const block_q4_K * w_a,
+                        float * out_b, size_t ldb, const block_q4_K * w_b,
+                        const block_q8_K * a, ThreadPool & pool);
+
 } // namespace kata
