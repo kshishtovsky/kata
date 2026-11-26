@@ -348,7 +348,15 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
         for (size_t g = 0; g < n_heads; g += G) {
             const size_t kvh = g / G;
             const float * qv[G];
-            for (size_t h = 0; h < G; ++h) qv[h] = q + (t * n_heads + g + h) * HD;
+            // q is loop-invariant over the position loop. Re-loading it there cost
+            // 16 zmm loads per position (EXP-0067: isolated shape 79 GMAC/s vs 52
+            // in the engine). Keep it in registers; the registers come out of the
+            // accumulator budget, so acc stays [G][4] and q lives in qr[G][4].
+            __m512 qr[G][4];
+            for (size_t h = 0; h < G; ++h) {
+                qv[h] = q + (t * n_heads + g + h) * HD;
+                for (int r = 0; r < 4; ++r) qr[h][r] = _mm512_loadu_ps(qv[h] + 16 * r);
+            }
             __m512 acc[G][4];
             float m[G], s[G];
             for (size_t h = 0; h < G; ++h) {
@@ -373,11 +381,10 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                 {
                     __m512 a[G];
                     for (size_t h = 0; h < G; ++h) {
-                        const float * qq = qv[h];
-                        __m512 v = _mm512_mul_ps(_mm512_loadu_ps(qq), k0);
-                        v = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 16), k1, v);
-                        v = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 32), k2, v);
-                        a[h] = _mm512_fmadd_ps(_mm512_loadu_ps(qq + 48), k3, v);
+                        __m512 v = _mm512_mul_ps(qr[h][0], k0);
+                        v = _mm512_fmadd_ps(qr[h][1], k1, v);
+                        v = _mm512_fmadd_ps(qr[h][2], k2, v);
+                        a[h] = _mm512_fmadd_ps(qr[h][3], k3, v);
                     }
                     const __m256 s0 = _mm256_add_ps(_mm512_castps512_ps256(a[0]), _mm512_extractf32x8_ps(a[0], 1));
                     const __m256 s1 = _mm256_add_ps(_mm512_castps512_ps256(a[1]), _mm512_extractf32x8_ps(a[1], 1));
