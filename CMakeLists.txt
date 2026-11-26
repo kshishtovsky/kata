@@ -102,3 +102,8 @@ if(KATA_COVERAGE)
 endif()
 
 add_test(NAME unit COMMAND kata_tests)
+
+# QK layout microbenchmark. Frozen: build_qk_layout --selftest is meant to run in
+# make bench, because three iterations were lost to un-frozen oracle numbers.
+add_executable(bench_qk_layout bench/bench_qk_layout.cpp)
+target_compile_options(bench_qk_layout PRIVATE -O3)
