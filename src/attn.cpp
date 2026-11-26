@@ -371,6 +371,10 @@ void scores_8x(const AttnArgs & a, const float * q, size_t base, size_t t0, size
 // count on purpose: with a runtime bound the accumulator array lives on the
 // stack and GCC emits one kmovw per spill reload, which profiling showed as 35%
 // of the kernel.
+// band-limited by measurement: at 16k context this pass runs at 129 GB/s
+// (mostly L3) and 77.6 GB/s end to end over K+V, i.e. at the 78 GB/s STREAM-
+// triad ceiling, so extra ILP does nothing. Measured 0.97x for two chains over
+// one -- no effect; one chain is kept because it is the simpler code.
 template <int G, int NZ>
 __attribute__((target("avx512f,avx512vl,avx512bw,fma")))
 void v_group(const AttnArgs & a, const float * p, size_t hd, size_t base, const float * inv,
