@@ -820,15 +820,21 @@ struct Model::Impl {
 
         float * seq = pbx.data();
         float * hist = conv_state.data() + il * d_conv * nc;
+        std::memcpy(seq, hist, d_conv * nc * sizeof(float));
+        float * bx = seq + d_conv * nc;
+        shortconv_bx(pbcx.data(), bx, m, nc);
         // Keep the whole bx sequence of this chunk: the shortconv state at row i
         // of the chunk is seq[i+1 .. i+d_conv], so a truncate to any position
         // inside the chunk is a memcpy instead of a replay. Without it a
         // speculative rollback would have to re-run L tokens at 22 ms each.
+        //
+        // After the history copy, not before: seq's first d_conv rows held the
+        // previous layer's leftovers, so snapshotting earlier saved garbage as
+        // "history before pos0" and a rollback to the chunk start restored it
+        // (measured max|diff| 12.4 on the replayed token). seq now holds
+        // [history][chunk bx], which is exactly what conv_seq claims to be.
         std::memcpy(conv_seq.data() + il * (ubatch + d_conv) * nc, seq,
                     (m + d_conv) * nc * sizeof(float));
-        std::memcpy(seq, hist, d_conv * nc * sizeof(float));
-        float * bx = seq + d_conv * nc;
-        shortconv_bx(pbcx.data(), bx, m, nc);
         shortconv_conv(bx, pbcx.data(), m, nc, l_cache,
                        static_cast<const float *>(L.conv), pconv_out.data());
         const auto c3 = std::chrono::steady_clock::now();
