@@ -326,5 +326,69 @@ int main(int argc, char ** argv) {
     std::printf("  -> MoE stage on GPU is %.2fx the CPU's\n", 14.20 / t);
     std::printf("  -> whole token would be %.2f ms = %.0f tok/s (CPU total minus ffn plus GPU MoE)\n",
                 22.5 - 14.20 + t, 1000.0 / (22.5 - 14.20 + t));
+
+    // ---- EXP-0086: what the same arithmetic costs as a real pipeline --------
+    //
+    // `t` above is the best case: 3 launches per layer covering all four slabs,
+    // one activation row shared by all of them, no transfer. A real decode has
+    // none of that -- the four experts of a layer sit 6 MB apart inside a
+    // stacked tensor, so the honest grid is one launch per expert matrix, and
+    // the residual stream crosses PCIe twice per layer.
+    //
+    // Arm B adds the launches (12 per layer instead of 3, slab pointers kept).
+    // Arm C adds one H2D of the q8_K row and one D2H of 4x2048 floats per layer,
+    // synchronous, through pinned buffers -- the shape EXP-0081 priced at ~20 us.
+    // The down projection still shares one activation row: with per-expert
+    // activations it would read 4 rows instead of 1, which is 1.2 KB of a
+    // 6.1 MB slab and cannot move the number.
+    {
+        kata::block_q8_K * hx_pin = nullptr;
+        float * hh_out = nullptr;
+        CK(hipHostMalloc((void **)&hx_pin, gate_nb * sizeof(kata::block_q8_K), hipHostMallocDefault));
+        CK(hipHostMalloc((void **)&hh_out, (size_t)rows * n_used * sizeof(float), hipHostMallocDefault));
+        std::memcpy(hx_pin, hx.data(), gate_nb * sizeof(kata::block_q8_K));
+        const int blocks_in = gate_nb * (int)sizeof(kata::block_q8_K);
+        const int blocks_out = (int)((size_t)rows * n_used * sizeof(float));
+
+        auto pass_per_expert = [&](bool xfer) {
+            for (int l = 0; l < n_moe; ++l) {
+                if (xfer) CK(hipMemcpyAsync(dx, hx_pin, blocks_in, hipMemcpyHostToDevice));
+                for (int e = 0; e < n_used; ++e) {
+                    const dim3 g4((unsigned)((rows + rpb4 - 1) / rpb4));
+                    gemv_q4_K_batch<<<g4, bl>>>(lay[l].gate + (size_t)e * rows * gate_nb, dx, dout,
+                                                rows, gate_nb, 1);
+                    gemv_q4_K_batch<<<g4, bl>>>(lay[l].up + (size_t)e * rows * gate_nb, dx, dout,
+                                                rows, gate_nb, 1);
+                    const dim3 g6((unsigned)((dn_rows + rpb6 - 1) / rpb6));
+                    gemv_q6_K_batch<<<g6, bl>>>(lay[l].down + (size_t)e * dn_rows * down_nb, dx,
+                                                dout, dn_rows, down_nb, 1);
+                }
+                if (xfer) CK(hipMemcpyAsync(hh_out, dout, blocks_out, hipMemcpyDeviceToHost));
+                if (xfer) CK(hipDeviceSynchronize());
+            }
+            if (!xfer) CK(hipDeviceSynchronize());
+        };
+
+        pass_per_expert(false);                                  // warm
+        auto bench = [&](auto body) {
+            const double a = now_ms();
+            for (int i = 0; i < 5; ++i) body();
+            return (now_ms() - a) / 5.0;
+        };
+        const double tb = bench([&] { pass_per_expert(false); });
+        const double tc = bench([&] { pass_per_expert(true); });
+        const int launches = n_moe * n_used * 3;
+        std::printf("\nEXP-0086 pipeline, %d launches/token, %.2f GB resident:\n", launches, total_b / 1e9);
+        std::printf("  A grouped, no transfer      %.3f ms\n", t);
+        std::printf("  B per expert, no transfer   %.3f ms (+%.3f = %.1f us x %d launches)\n",
+                    tb, tb - t, 1e3 * (tb - t) / launches, launches);
+        std::printf("  C + H2D/D2H per layer       %.3f ms (+%.3f = %.1f us x %d layers)\n",
+                    tc, tc - tb, 1e3 * (tc - tb) / n_moe, n_moe);
+        std::printf("  -> token: 22.5 - 14.20 + %.3f = %.2f ms = %.1f tok/s (CPU MoE 14.20)\n",
+                    tc, 22.5 - 14.20 + tc, 1e3 / (22.5 - 14.20 + tc));
+        if (!(tc > t)) std::printf("  NOTE: pipeline arm is not slower -- check the transfer path\n");
+        (void)hipHostFree(hx_pin);
+        (void)hipHostFree(hh_out);
+    }
     return 0;
 }
