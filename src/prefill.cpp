@@ -413,8 +413,12 @@ void prefill_group4(const float * q, size_t n_tok, const float * k_cache,
                     const __m128 sc_v = _mm_set_ps(sc[3], sc[2], sc[1], sc[0]);
                     const __m128 m_v  = _mm_set_ps(m[3],  m[2],  m[1],  m[0]);
                     const __m128 eps  = exp128_ps(_mm_sub_ps(sc_v, m_v));
+                    // VPERMILPS with a register index instead of an immediate
+                    // shuffle: _MM_SHUFFLE(h,h,h,h) demands an 8-bit immediate,
+                    // which only exists when the loop is unrolled, so every -O0
+                    // build (coverage) failed to compile this file.
                     for (size_t h = 0; h < G; ++h) {
-                        const __m128 hv = _mm_shuffle_ps(eps, eps, (int)(_MM_SHUFFLE(h, h, h, h)));
+                        const __m128 hv = _mm_permutevar_ps(eps, _mm_set1_epi32((int)h));
                         s[h] += _mm_cvtss_f32(hv);
                         const __m512 ev = _mm512_broadcastss_ps(hv);
                         for (int r = 0; r < 4; ++r) acc[h][r] = _mm512_fmadd_ps(ev, vv[r], acc[h][r]);
