@@ -79,6 +79,11 @@ target_link_libraries(bench_spec PRIVATE kata_core)
 add_executable(bench_batch bench/bench_batch.cpp)
 target_link_libraries(bench_batch PRIVATE kata_core)
 
+# EXP-0072: q4_K GEMV on the GPU. Not part of the C++ build because it needs
+# hipcc; build it by hand:
+#   hipcc -O3 bench/bench_hip_gemv.cpp -o build/bench_hip_gemv \
+#         -I include -L build -lkata_core -lpthread
+
 # Optional : compares our kernels against a local llama.cpp build.
 add_executable(bench_vs_ggml bench/bench_vs_ggml.cpp)
 target_link_libraries(bench_vs_ggml PRIVATE kata_core ${CMAKE_DL_LIBS})
