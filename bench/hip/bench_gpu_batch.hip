@@ -135,6 +135,108 @@ __global__ void gemv_q4_K_batch_b(const kata::block_q4_K * __restrict__ w,
         (void)red;
     }
 }
+// v_dot4_i32_i8 variant: gfx1100 computes four signed-byte MACs per instruction,
+// so the 3270 GMAC/s scalar plateau (EXP-0084) should move ~4x. q4_K's nibbles are
+// 0..15 and fit i8, so `lo = w & 0x0f0f0f0f` and `hi = (w >> 4) & 0x0f0f0f0f` turn
+// one word into two packed int8 groups of four.
+__device__ inline int sdot4(unsigned int a, unsigned int b, int acc) {
+    int r;
+    __asm__ volatile("v_dot4_i32_i8 %0, %1, %2, %3" : "=v"(r) : "v"((int)a), "v"((int)b), "v"(acc));
+    return r;
+}
+
+template <int B>
+__global__ void gemv_q4_K_batch_sdot(const kata::block_q4_K * __restrict__ w,
+                                     const kata::block_q8_K * __restrict__ x,
+                                     float * __restrict__ out,
+                                     int rows, int nb) {
+    const int rpb = nb <= 64 ? (64 / nb) : 1;
+    const int grid_row = blockIdx.x * rpb;
+    const int lane = threadIdx.x & 3;
+    const int group = threadIdx.x >> 2;
+    const int r = group / nb;
+    const int b = group % nb;
+    float acc[B];
+#pragma unroll
+    for (int i = 0; i < B; ++i) acc[i] = 0.0f;
+    if (r < rpb && grid_row + r < rows) {
+        const kata::block_q4_K * base = w + (size_t)(grid_row + r) * nb;
+        for (int bb = b; bb < nb; bb += (nb <= 64 ? nb : 64)) {
+            const kata::block_q4_K & blk = base[bb];
+            const float d = f16_dev(blk.d);
+            const float dmin = f16_dev(blk.dmin);
+            unsigned char sc0, m0, sc1, m1;
+            scale_min_dev(2 * lane + 0, blk.scales, &sc0, &m0);
+            scale_min_dev(2 * lane + 1, blk.scales, &sc1, &m1);
+            const unsigned int * qw = reinterpret_cast<const unsigned int *>(blk.qs + 32 * lane);
+            const int j = 64 * lane;
+            int ilo[B], ihi[B];
+#pragma unroll
+            for (int t = 0; t < B; ++t) { ilo[t] = 0; ihi[t] = 0; }
+            // Two 128-bit loads per group per row. Eight separate 4-byte reads per
+            // group cost 2.3x at B=1 (491 vs 722 GB/s): the byte loop it replaced
+            // was auto-vectorised, 32 scalar loads are not. The instruction itself
+            // is fine -- 12.1 T MAC/s isolated against imad's 3.3.
+            unsigned int y0w[B][8], y1w[B][8];
+#pragma unroll
+            for (int t = 0; t < B; ++t) {
+                const kata::block_q8_K & ab = x[(size_t)t * nb + bb];
+                const uint4 a0 = *reinterpret_cast<const uint4 *>(ab.qs + j);
+                const uint4 a1 = *reinterpret_cast<const uint4 *>(ab.qs + j + 16);
+                const uint4 b0 = *reinterpret_cast<const uint4 *>(ab.qs + j + 32);
+                const uint4 b1 = *reinterpret_cast<const uint4 *>(ab.qs + j + 48);
+                const unsigned int * p0 = reinterpret_cast<const unsigned int *>(&a0);
+                const unsigned int * p1 = reinterpret_cast<const unsigned int *>(&a1);
+                const unsigned int * q0 = reinterpret_cast<const unsigned int *>(&b0);
+                const unsigned int * q1 = reinterpret_cast<const unsigned int *>(&b1);
+#pragma unroll
+                for (int w4 = 0; w4 < 4; ++w4) {
+                    y0w[t][w4] = p0[w4]; y0w[t][w4 + 4] = p1[w4];
+                    y1w[t][w4] = q0[w4]; y1w[t][w4 + 4] = q1[w4];
+                }
+            }
+#pragma unroll
+            for (int wi = 0; wi < 8; ++wi) {
+                const unsigned int word = qw[wi];
+                const unsigned int lo = word & 0x0f0f0f0fu;
+                const unsigned int hi = (word >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+                for (int t = 0; t < B; ++t) {
+                    ilo[t] = sdot4(lo, y0w[t][wi], ilo[t]);
+                    ihi[t] = sdot4(hi, y1w[t][wi], ihi[t]);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < B; ++t) {
+                const kata::block_q8_K & ab = x[(size_t)t * nb + bb];
+                const float da = d * ab.d;
+                const float dmina = dmin * ab.d;
+                const int sy0 = ab.bsums[4 * lane] + ab.bsums[4 * lane + 1];
+                const int sy1 = ab.bsums[4 * lane + 2] + ab.bsums[4 * lane + 3];
+                acc[t] += da * (float)sc0 * (float)ilo[t] - dmina * (float)m0 * (float)sy0;
+                acc[t] += da * (float)sc1 * (float)ihi[t] - dmina * (float)m1 * (float)sy1;
+            }
+        }
+    }
+    __shared__ float gsum[64][B];
+#pragma unroll
+    for (int t = 0; t < B; ++t) {
+        float v = acc[t];
+        v += __shfl_down_sync(0xffffffffull, v, 2);
+        v += __shfl_down_sync(0xffffffffull, v, 1);
+        if (lane == 0) gsum[group][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < rpb && grid_row + threadIdx.x < rows) {
+#pragma unroll
+        for (int t = 0; t < B; ++t) {
+            float s = 0.0f;
+            for (int i = 0; i < (nb < 64 ? nb : 64); ++i) s += gsum[threadIdx.x * nb + i][t];
+            out[(size_t)t * rows + grid_row + threadIdx.x] = s;
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -217,6 +319,26 @@ int main(int argc, char ** argv) {
         if (!(mx / sc < 1e-4)) return 1;
     }
 
+    // The sdot4 arm needs its own gate: a wrong nibble mapping still runs fast.
+    {
+        const dim3 bl(256), gr((unsigned)((rows + 7) / 8));
+        gemv_q4_K_batch_sdot<1><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb);
+        CK(hipDeviceSynchronize());
+        std::vector<float> got(rows);
+        CK(hipMemcpy(got.data(), dout, rows * sizeof(float), hipMemcpyDeviceToHost));
+        std::vector<kata::block_q4_K> hrows(rows * nb);
+        CK(hipMemcpy(hrows.data(), dw, rows * nb * sizeof(kata::block_q4_K), hipMemcpyDeviceToHost));
+        double mx = 0, sc = 0;
+        for (int r = 0; r < 2000; ++r) {
+            const double ref = kata::vec_dot_q4_K_q8_K_ref(nb * kata::QK_K, hrows.data() + (size_t)r * nb, hact.data());
+            mx = std::max(mx, std::fabs(ref - (double)got[(size_t)r]));
+            sc = std::max(sc, std::fabs(ref));
+        }
+        std::printf("verify sdot4 B=1 first 2000 rows: max|diff| %.3e on %.3e (%.1e rel) %s\n",
+                    mx, sc, mx / sc, mx / sc < 1e-4 ? "PASS" : "FAIL");
+        if (!(mx / sc < 1e-4)) return 1;
+    }
+
     const double macs = (double)rows * nb * kata::QK_K;   // MACs per activation row
     std::printf("\n%3s %10s %9s %10s %10s %9s\n", "B", "ms", "GB/s w", "GMAC/s", "ns/token", "vs B=1");
     double base_ns = 0;
@@ -242,6 +364,25 @@ int main(int argc, char ** argv) {
         if (B == 1) base_ns = ns_per_token;
         std::printf("%3d %10.3f %9.1f %10.1f %10.1f %9.2fx\n", B, ms, bytes / 1e6 / ms,
                     macs * B / ms / 1e6, ns_per_token, base_ns / ns_per_token);
+        // same B with v_dot4_i32_i8
+        auto run_sd = [&] {
+            const dim3 bl(256), gr((unsigned)((rows + 7) / 8));
+            switch (B) {
+                case 1: gemv_q4_K_batch_sdot<1><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb); break;
+                case 2: gemv_q4_K_batch_sdot<2><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb); break;
+                case 4: gemv_q4_K_batch_sdot<4><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb); break;
+                case 8: gemv_q4_K_batch_sdot<8><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb); break;
+                default: gemv_q4_K_batch_sdot<16><<<gr, bl>>>((const kata::block_q4_K *)dw, dact, dout, (int)rows, nb); break;
+            }
+            CK(hipDeviceSynchronize());
+        };
+        run_sd();
+        const double a2 = now_ms();
+        for (int i = 0; i < reps; ++i) run_sd();
+        const double ms2 = (now_ms() - a2) / reps;
+        const double ns2 = ms2 * 1e6 / B;
+        std::printf("%3s %10.3f %9.1f %10.1f %10.1f %9.2fx\n", "sdot", ms2, bytes / 1e6 / ms2,
+                    macs * B / ms2 / 1e6, ns2, base_ns / ns2);
     }
 
     // Compute ceiling of this scalar kernel: same shape with the weight block
