@@ -1,12 +1,23 @@
 // EXP-0071: the continuous-batching curve, plus the ceiling that decides whether
 // it is worth having a scheduler at all.
 //
-// The thesis is that one forward pass over B independent rows reads every weight
-// once, so B rows must cost far less than B single-row passes. That is true and
-// it is not the binding constraint: MoE weight traffic grows with the UNION of
-// selected experts, and 64 experts x 4 picks fill that union within 32 rows.
-// This harness measures both numbers so the scheduler's target is a measurement
-// rather than a hope.
+// The thesis is that one forward pass over B rows reads every weight once, so B
+// rows must cost far less than B single-row passes. That is true and it is not
+// the binding constraint: MoE weight traffic grows with the UNION of selected
+// experts, and 64 experts x 4 picks fill that union within 32 rows.
+//
+// KNOWN LIMIT, and it must be read before trusting the speedup column: the
+// batched arm is a B-token causal chunk in ONE shared KV cache, because the
+// cache lives in Model::Impl and ModelState holds only `pos`. Row 0 is a true
+// decode step; row i also attends to rows 0..i-1, so its hidden state is mixed
+// with its neighbours' and its expert choices are more correlated than
+// independent sequences would be -- which flatters the union column. The work
+// per row (bytes read, FMAs) still matches a real batch within B/prefix, so the
+// curve bounds what a scheduler can deliver rather than predicting it. Verified
+// in /tmp/bprobe: row 0 changes by 0.0 when row 1's token changes, row 1 changes
+// by 53.7% of max logit when row 0's token changes. Making it a real batch needs
+// the KV cache owned per sequence first (671 MB per sequence at 16k).
+// shortcut: B rows share one cache, revisit when per-sequence KV lands
 //
 // Build: cmake --build build --target bench_batch
 // Run:   KATA_MAX_THREADS=16 ./build/bench_batch <model.gguf> <tokens.bin>
