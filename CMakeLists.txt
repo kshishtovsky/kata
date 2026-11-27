@@ -46,6 +46,9 @@ target_link_libraries(kata_ppl PRIVATE kata_core)
 add_executable(kata_heat tools/kata_heat.cpp)
 target_link_libraries(kata_heat PRIVATE kata_core)
 
+add_executable(kata_place tools/kata_place.cpp)
+target_link_libraries(kata_place PRIVATE kata_core)
+
 add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv PRIVATE kata_core)
 
@@ -95,13 +98,17 @@ if(NOT GTest_FOUND)
   add_executable(kata_tests EXCLUDE_FROM_ALL)
   target_sources(kata_tests PRIVATE tests/test_quant.cpp tests/test_gemv.cpp tests/test_shortconv.cpp
     tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp
-    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp)
+    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp
+    tests/test_routing.cpp
+    tests/test_gguf.cpp)
   target_include_directories(kata_tests PRIVATE ${GTEST_INCLUDE_DIRS})
   target_link_libraries(kata_tests PRIVATE kata_core ${GTEST_LIBRARIES})
 else()
   enable_testing()
   add_executable(kata_tests EXCLUDE_FROM_ALL tests/test_quant.cpp tests/test_gemv.cpp tests/test_shortconv.cpp tests/test_pool.cpp tests/test_norm.cpp tests/test_rope.cpp
-    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp)
+    tests/test_sampler.cpp tests/test_attn.cpp tests/test_gemm.cpp tests/test_prefill.cpp tests/test_prof.cpp
+    tests/test_routing.cpp
+    tests/test_gguf.cpp)
   target_link_libraries(kata_tests PRIVATE kata_core GTest::gtest_main)
 endif()
 

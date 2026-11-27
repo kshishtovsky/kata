@@ -184,6 +184,7 @@ struct Model::Impl {
     size_t n_head = 0, n_head_kv = 0, head_dim = 0;
     size_t n_ff = 0, n_ff_exp = 0;
     size_t n_expert = 0, n_expert_used = 0;
+    size_t n_moe_layer = 0;   // MoE layers actually present (38 for LFM2.5)
     float eps = 1e-5f, rope_base = 1e4f;
     size_t l_cache = 3;  // kernel width of the shortconv
     bool sigmoid_gate = true;
@@ -280,6 +281,12 @@ struct Model::Impl {
     // expert, per MoE layer. This is the input to any residency decision, and
     // it costs one increment where the pair is already counted (m_counts).
     std::vector<uint64_t> heat;
+    // Per-decode-step routing record (EXP-0078). Empty unless armed.
+    std::vector<uint32_t> rec;      // [step][moe_layer][n_expert_used]
+    size_t rec_moe_index = 0;       // MoE layer counter within the current step
+    // Armed flag, because `rec` is empty right after routing_record_start():
+    // gating the resize on !rec.empty() meant the record never grew at all.
+    bool rec_armed = false;
     size_t n_mm = 0;
     struct Tick { double * acc; bool on; std::chrono::steady_clock::time_point t0;
         Tick(double * a, bool o) : acc(a), on(o), t0(std::chrono::steady_clock::now()) {}
@@ -570,6 +577,11 @@ struct Model::Impl {
         if (!heat.empty()) {
             uint64_t * hrow = heat.data() + il * n_expert;
             for (size_t i = 0; i < nu; ++i) ++hrow[sel[i].second];
+        }
+        if (rec_armed && rec_moe_index < n_moe_layer) {
+            uint32_t * slot = rec.data() + rec.size() - n_moe_layer * nu + rec_moe_index * nu;
+            for (size_t i = 0; i < nu; ++i) slot[i] = sel[i].second;
+            ++rec_moe_index;
         }
         float * w = d_w.data();
         float wsum = 0.0f;
@@ -1135,6 +1147,12 @@ struct Model::Impl {
 
     const float * forward(uint32_t token, ModelState & st) {
         if (st.pos >= n_ctx) throw std::runtime_error("kata: context full");
+        // One record slot per MoE layer, appended as a zero row per step so a
+        // partially-built step can still be identified and dropped.
+        if (rec_armed) {
+            rec_moe_index = 0;
+            rec.resize(rec.size() + n_moe_layer * n_expert_used, 0xffffffffu);
+        }
         const auto t_token0 = std::chrono::steady_clock::now();
         const size_t pos = st.pos;
         { Tick tk(&t_emb, prof); embed(token); }
@@ -1279,6 +1297,13 @@ void Model::load(const std::string & path, size_t n_ctx) {
             L.down = require(f, p + "ffn_down.weight"); L.td = type_of(f, p + "ffn_down.weight");
         }
     }
+    // Counted AFTER L.moe is assigned: doing it next to the metadata reads (or
+    // right after resize) saw all-false layers, so n_moe_layer stayed 0 and the
+    // routing record silently produced nothing (EXP-0078).
+    m.n_moe_layer = 0;
+    for (const Layer & L : m.layers) if (L.moe) ++m.n_moe_layer;
+    n_moe_layer_ = m.n_moe_layer;
+
     if (const char * d = std::getenv("KATA_DUMP")) m.dump_dir = d;
     m.alloc();
     n_vocab_ = m.n_vocab;
@@ -1301,6 +1326,34 @@ const float * Model::forward(uint32_t token, ModelState & st) { return p_->forwa
 void Model::heatmap_start() {
     Impl & m = *p_;
     m.heat.assign(m.n_layer * m.n_expert, 0);
+}
+
+void Model::routing_record_start() {
+    Impl & m = *p_;
+    m.rec.clear();
+    m.rec_moe_index = 0;
+    m.rec_armed = true;
+}
+
+std::vector<Model::TokenRouting> Model::routing_record_take() {
+    Impl & m = *p_;
+    const size_t per_step = m.n_moe_layer * m.n_expert_used;
+    std::vector<TokenRouting> out;
+    if (per_step == 0) { m.rec.clear(); return out; }
+    out.reserve(m.rec.size() / per_step);
+    for (size_t off = 0; off + per_step <= m.rec.size(); off += per_step) {
+        TokenRouting r;
+        r.expert.assign(m.rec.begin() + off, m.rec.begin() + off + per_step);
+        r.n_moe_layer = m.n_moe_layer;
+        r.n_expert_used = m.n_expert_used;
+        // A step that did not fill every slot is incomplete; drop it rather
+        // than report a token that chose no expert in some layer.
+        if (std::find(r.expert.begin(), r.expert.end(), 0xffffffffu) != r.expert.end()) continue;
+        out.push_back(std::move(r));
+    }
+    m.rec.clear();
+    m.rec_armed = false;
+    return out;
 }
 
 std::vector<uint64_t> Model::heatmap_take() {

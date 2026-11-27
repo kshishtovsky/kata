@@ -61,10 +61,24 @@ public:
     std::vector<uint64_t> heatmap_take();
     size_t n_expert() const { return n_expert_; }
 
+    // Per-token routing record (EXP-0078): one entry per decode step, listing
+    // the experts that ONE token chose in each MoE layer. The pooled heatmap
+    // above averages over a prompt and cannot answer whether the 152 expert
+    // selections a token makes are independently spread (low variance) or
+    // clumped (a single unlucky token could stall a hybrid CPU/GPU schedule).
+    struct TokenRouting {
+        std::vector<uint32_t> expert;   // [n_moe_layer * n_expert_used]
+        size_t n_moe_layer = 0;
+        size_t n_expert_used = 0;
+    };
+    void routing_record_start();
+    std::vector<TokenRouting> routing_record_take();
+    size_t n_moe_layer_count() const { return n_moe_layer_; }
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;
-    size_t n_vocab_ = 0, n_embd_ = 0, n_layer_ = 0, n_expert_ = 0;
+    size_t n_vocab_ = 0, n_embd_ = 0, n_layer_ = 0, n_expert_ = 0, n_moe_layer_ = 0;
 };
 
 } // namespace kata
