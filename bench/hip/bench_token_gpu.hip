@@ -399,8 +399,41 @@ int main(int argc, char ** argv) {
     next_format:;
     }
 
+    // Per-bucket timing: an aggregate hides a slow small bucket behind the bulk one.
+    {
+        std::printf("\nper-bucket:\n");
+        for (const auto & sd : dev) {
+            auto one = [&] {
+                kata::block_q8_K * x = dact[sd.nb];
+                const int rpb = sd.q6 ? (sd.nb <= 32 ? 32 / sd.nb : 1) : (sd.nb <= 64 ? 64 / sd.nb : 1);
+                const dim3 gr((unsigned)((sd.rows_n + rpb - 1) / rpb));
+                if (sd.q6) gemv_q6_K_batch<<<gr, bl>>>((const kata::block_q6_K *)sd.rows, x, dout, sd.rows_n, sd.nb, 1);
+                else gemv_q4_K_batch<<<gr, bl>>>((const kata::block_q4_K *)sd.rows, x, dout, sd.rows_n, sd.nb, 1);
+                CK(hipDeviceSynchronize());
+            };
+            one();
+            const double a = now_ms();
+            for (int i = 0; i < 5; ++i) one();
+            const double ms = (now_ms() - a) / 5;
+            size_t b = 0;
+            for (size_t k = 0; k < bucket_keys.size(); ++k)
+                if (&dev[k] == &sd)
+                    for (const auto & sl : buckets[bucket_keys[k]]) b += sl.rows * sl.row_b;
+            std::printf("  %s nb=%2d rows=%7d %7.1f MB %7.3f ms %6.1f GB/s\n",
+                        sd.q6 ? "q6" : "q4", sd.nb, sd.rows_n, b / 1e6, ms, b / 1e6 / ms);
+        }
+    }
+
     token_pass();                                        // warm
-    const int reps = 5;
+    // Per-rep print: the card's clocks ramp with sustained load, and a single
+    // 5-rep average taken cold reads ~29% slower than one taken warm, which is
+    // exactly the gap between two runs of this same binary.
+    for (int i = 0; i < 10; ++i) {
+        const double a = now_ms();
+        token_pass();
+        std::printf("  rep %2d: %.3f ms  %.1f GB/s\n", i, now_ms() - a, stream_b / 1e6 / (now_ms() - a));
+    }
+    const int reps = 20;
     const double t = [&] {
         const double a = now_ms();
         for (int i = 0; i < reps; ++i) token_pass();
