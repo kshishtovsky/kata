@@ -185,6 +185,98 @@ __global__ void gemv_q4_K_kernel(const kata::block_q4_K * __restrict__ w,
     }
 }
 
+
+// q6_K: 210 bytes per 256 values -- ql[128], qh[64], scales[16] (int8), d (f16).
+// Layout per the reference (src/quant.cpp:38): two halves of 128 values; within
+// a half, byte l holds sub-block scales that alternate every 16 values, so
+// lane*4/16 picks a single is per lane and the four q-slots read sc[is+0],
+// sc[is+2], sc[is+4], sc[is+6].
+//
+// 8 threads per super-block, each owning 4 consecutive l values in both halves
+// (16 values per half, 32 per super-block). 32 super-blocks per 256-thread
+// block, so nb <= 32 packs whole rows -- cols = 2048 gives nb = 8, i.e. 4 rows.
+//
+// Kept in integers per scale group: q in [-32,31] and y in [-127,127] make a
+// 4-term accumulation fit in int comfortably, and the scale multiply happens
+// once per group instead of once per value. That is the same trick that made
+// the CPU VNNI version work (EXP-0029) after the naive form failed.
+__global__ void gemv_q6_K_kernel(const kata::block_q6_K * __restrict__ w,
+                                 const kata::block_q8_K * __restrict__ x,
+                                 float * __restrict__ out,
+                                 int rows, int nb) {
+    const int lane = threadIdx.x & 7;      // 8 threads per super-block
+    const int group = threadIdx.x >> 3;    // 0..31
+    const int rpb = nb <= 32 ? (32 / nb) : 1;
+
+    int row, b;
+    if (nb <= 32) {
+        row = blockIdx.x * rpb + group / nb;
+        b = group % nb;
+    } else {
+        row = blockIdx.x;
+        b = group;
+    }
+    const bool active = nb <= 32 ? (group < rpb * nb && row < rows) : (b < nb);
+
+    float acc = 0.0f;
+    if (active) {
+        for (int bb = b; bb < nb; bb += (nb <= 32 ? nb : 32)) {
+            const kata::block_q6_K & blk = w[(size_t)row * nb + bb];
+            const kata::block_q8_K & ab = x[bb];
+            const float d = f16_dev(blk.d) * ab.d;
+
+            const int is = lane >> 2;          // 0 or 1, the 16-value sub-block pair
+            const int l0 = lane * 4;
+            float blk_sum = 0.0f;
+
+            for (int half = 0; half < 2; ++half) {
+                const unsigned char * ql = blk.ql + half * 64;
+                const unsigned char * qh = blk.qh + half * 32;
+                const signed char * q8 = ab.qs + half * 128;
+                int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int l = l0 + k;
+                    const unsigned char qlb = ql[l];
+                    const unsigned char qhb = qh[l];
+                    const int q1 = (int)((qlb & 0x0f) | (((qhb >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0x0f) | (((qhb >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((qlb >> 4) | (((qhb >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32] >> 4) | (((qhb >> 6) & 3) << 4)) - 32;
+                    a0 += q1 * (int)q8[l + 0];
+                    a1 += q2 * (int)q8[l + 32];
+                    a2 += q3 * (int)q8[l + 64];
+                    a3 += q4 * (int)q8[l + 96];
+                }
+                const signed char * sc = blk.scales + half * 8;
+                blk_sum += (float)sc[is + 0] * (float)a0 + (float)sc[is + 2] * (float)a1
+                         + (float)sc[is + 4] * (float)a2 + (float)sc[is + 6] * (float)a3;
+            }
+            acc += d * blk_sum;
+            if (nb <= 32) break;
+        }
+    }
+
+    for (int off = 4; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffull, acc, off);
+
+    __shared__ float gsum6[32];
+    if (lane == 0) gsum6[group] = acc;
+    __syncthreads();
+
+    if (threadIdx.x < (nb <= 32 ? rpb : 1)) {
+        const int r = threadIdx.x;
+        float s = 0.0f;
+        if (nb <= 32) {
+            const int gr = blockIdx.x * rpb + r;
+            if (gr >= rows) return;
+            for (int i = 0; i < nb; ++i) s += gsum6[r * nb + i];
+            out[gr] = s;
+        } else {
+            for (int i = 0; i < 32; ++i) s += gsum6[i];
+            out[blockIdx.x] = s;
+        }
+    }
+}
+
 // Ground truth in double. Comparing two float implementations cannot say which
 // is right -- an early gate at 1e-4 relative flagged 11 rows and was wrong: the
 // GPU was CLOSER to this reference than the CPU arm on those rows. Rows whose
@@ -253,36 +345,45 @@ int main(int argc, char ** argv) {
     //     764 GB/s ceiling;
     //   * all 64 experts -- a token activates 4, so charging all of them
     //     overstates the traffic by 16x.
+    // "--all": stream the weights one decode token actually reads, in one timed
+    // sweep, both formats. This is the number that decides whether a GPU backend
+    // is worth building, so it is measured rather than extrapolated.
+    //
+    // Two traps, both of which produced absurd numbers on the first attempt:
+    //   * best-of-N per tensor -- a 13.6 MB tensor fits in the 80 MB Infinity
+    //     Cache, so reps 2..N are cache hits and it reported 2485 GB/s against a
+    //     764 GB/s ceiling. The sweep times every tensor once per rep and rotates
+    //     the start offset.
+    //   * all 64 experts -- a token activates 4, so charging all of them
+    //     overstates the traffic by 16x, and charging 1 understates it by 4x.
     if (argc >= 3 && std::strcmp(argv[2], "--all") == 0) {
         const bool moe = argc >= 4 && std::strcmp(argv[3], "--moe") == 0;
-        struct Item { const kata::GgufTensor * t; size_t cols, rows, nb; };
+        struct Item { const kata::GgufTensor * t; size_t cols, rows, nb; uint32_t type; };
         std::vector<Item> items;
-        size_t total_bytes = 0;
+        double bytes_q4 = 0, bytes_q6 = 0, total_bytes = 0;
         for (const auto & c : g.tensors()) {
-            if (c.type != 12 || c.dims.size() < 2) continue;
-            size_t cc = c.dims[0], rr = 1;
-            for (size_t d = 1; d < c.dims.size(); ++d) rr *= c.dims[d];
+            if ((c.type != 12 && c.type != 14) || c.dims.size() < 2) continue;
+            const size_t cc = c.dims[0];
             if (cc % kata::QK_K != 0) continue;
-            // Expert stacks are [cols][ffn][n_expert]: a token activates 4 of 64,
-            // so only 4 experts' rows are read. Charging all 64 overstates the
-            // traffic by 16x; charging one understates it by 4x.
+            size_t rr = 1;
+            for (size_t d = 1; d < c.dims.size(); ++d) rr *= c.dims[d];
             size_t experts = 1;
             if (c.dims.size() == 3) {
                 experts = c.dims[2];
-                if (!moe) rr = c.dims[1] * std::min<size_t>(4, experts);
-                if (!moe) { /* rows below are recomputed from rr */ }
+                rr = c.dims[1] * (moe ? experts : std::min<size_t>(4, experts));
             }
-            items.push_back({&c, cc, rr, cc / kata::QK_K});
-            total_bytes += c.n_bytes / experts * (moe ? experts : std::min<size_t>(4, experts));
+            items.push_back({&c, cc, rr, cc / kata::QK_K, c.type});
+            const double bytes = (double)c.n_bytes / (double)experts * (double)(moe ? experts : std::min<size_t>(4, experts));
+            total_bytes += bytes;
+            if (c.type == 12) bytes_q4 += bytes; else bytes_q6 += bytes;
         }
 
-        // One allocation per tensor, all resident at once, so the sweep below
-        // measures VRAM reads and nothing else (the model is 14.5 GB).
-        struct Res { kata::block_q4_K * w; kata::block_q8_K * x; float * out; dim3 gr; dim3 bl; size_t rows, nb; };
+        struct Res { void * w; kata::block_q8_K * x; float * out; dim3 gr, bl; size_t rows, nb; uint32_t type; };
         std::vector<Res> res(items.size());
         for (size_t i = 0; i < items.size(); ++i) {
             const Item & it = items[i];
-            const size_t n_bytes = it.rows * it.nb * sizeof(kata::block_q4_K);
+            const size_t block = it.type == 12 ? sizeof(kata::block_q4_K) : sizeof(kata::block_q6_K);
+            const size_t n_bytes = it.rows * it.nb * block;
             std::vector<kata::block_q8_K> hx(it.nb);
             std::vector<float> ha(it.cols);
             for (size_t k = 0; k < it.cols; ++k) ha[k] = std::sin(0.001f * (float)k) * 1.7f;
@@ -292,25 +393,28 @@ int main(int argc, char ** argv) {
             hipMalloc(&res[i].out, it.rows * sizeof(float));
             hipMemcpy(res[i].w, g.data(*it.t), n_bytes, hipMemcpyHostToDevice);
             hipMemcpy(res[i].x, hx.data(), it.nb * sizeof(kata::block_q8_K), hipMemcpyHostToDevice);
-            const int rp = it.nb <= 64 ? (64 / (int)it.nb) : 1;
-            res[i].gr = dim3(it.nb <= 64 ? (it.rows + rp - 1) / rp : it.rows);
+            const int per = it.type == 12 ? 64 : 32;
+            const int rp = it.nb <= (size_t)per ? per / (int)it.nb : 1;
+            res[i].gr = dim3(it.nb <= (size_t)per ? (it.rows + rp - 1) / rp : it.rows);
             res[i].bl = dim3(256);
             res[i].rows = it.rows;
             res[i].nb = it.nb;
+            res[i].type = it.type;
         }
 
-        // One launch per tensor is a decode-shaped sweep; the launch overhead is
-        // part of the honest number since the real engine issues them serially too.
         Event e0, e1;
         double best = 1e9;
         for (int rep = 0; rep < 6; ++rep) {
-            // Rotate the start so no single rep is systematically warm on the tail.
             const size_t off = (size_t)rep * 37 % (items.size() ? items.size() : 1);
             hipEventRecord(e0.h);
             for (size_t k = 0; k < items.size(); ++k) {
                 const size_t i = (k + off) % items.size();
-                gemv_q4_K_kernel<<<res[i].gr, res[i].bl>>>(res[i].w, res[i].x, res[i].out,
-                                                           (int)res[i].rows, (int)res[i].nb);
+                if (res[i].type == 12)
+                    gemv_q4_K_kernel<<<res[i].gr, res[i].bl>>>((const kata::block_q4_K *)res[i].w,
+                        res[i].x, res[i].out, (int)res[i].rows, (int)res[i].nb);
+                else
+                    gemv_q6_K_kernel<<<res[i].gr, res[i].bl>>>((const kata::block_q6_K *)res[i].w,
+                        res[i].x, res[i].out, (int)res[i].rows, (int)res[i].nb);
             }
             hipEventRecord(e1.h);
             hipEventSynchronize(e1.h);
@@ -319,13 +423,75 @@ int main(int argc, char ** argv) {
             best = std::min(best, (double)ms);
         }
         const double gbs = total_bytes / (best * 1e6);
-        std::printf("sweep%s: %zu tensors, %.1f MB, %.2f ms -> %.1f GB/s (ceiling 764.3 -> %.0f%%)\n",
+        std::printf("DECODE SWEEP%s: %zu tensors, %.1f MB (q4_K %.0f + q6_K %.0f), %.2f ms\n",
                     moe ? " (all 64 experts)" : " (4 of 64 experts)", items.size(),
-                    total_bytes / 1e6, best, gbs, 100.0 * gbs / 764.3);
-        std::printf("  launches: %zu -> %.1f us each of the %.2f ms\n", items.size(),
-                    1e3 * best / items.size(), best);
+                    total_bytes / 1e6, bytes_q4 / 1e6, bytes_q6 / 1e6, best);
+        std::printf("  %.1f GB/s (ceiling 764.3 -> %.0f%%);  %.1f us per launch\n",
+                    gbs, 100.0 * gbs / 764.3, 1e3 * best / items.size());
+        std::printf("  a decode token's weights alone: %.2f ms -> %.0f tok/s if everything else were free\n",
+                    best, 1e3 / best);
         for (auto & r : res) { hipFree(r.w); hipFree(r.x); hipFree(r.out); }
         return 0;
+    }
+
+    // q6_K single tensor or sweep. Separate entry points rather than a type
+    // switch inside one function, because the two formats need different block
+    // sizes and the comparison logic is identical only in shape.
+    const bool want_q6 = argc >= 3 && std::strcmp(argv[2], "--q6") == 0;
+    if (want_q6) {
+        const char * name = argc >= 4 ? argv[3] : "blk.0.attn_v.weight";
+        const auto * q6 = g.find(name);
+        if (!q6 || q6->type != 14) { std::fprintf(stderr, "no q6_K tensor %s\n", name); return 2; }
+        const size_t cc = q6->dims[0];
+        size_t rr = 1;
+        for (size_t d = 1; d < q6->dims.size(); ++d) rr *= q6->dims[d];
+        const size_t nbb = cc / kata::QK_K;
+        std::printf("tensor %s: %zux%zu q6_K = %.1f MB\n", q6->name.c_str(), rr, cc, q6->n_bytes / 1e6);
+
+        std::vector<float> ha(cc);
+        for (size_t i = 0; i < cc; ++i) ha[i] = std::sin(0.001f * (float)i) * 1.7f + 0.3f * std::cos(0.01f * (float)i);
+        std::vector<kata::block_q8_K> hxx(nbb);
+        kata::quantize_row_q8_K(ha.data(), hxx.data(), cc);
+
+        const auto * hw = static_cast<const kata::block_q6_K *>(g.data(*q6));
+        std::vector<float> ref(rr);
+        for (size_t r = 0; r < rr; ++r) ref[r] = kata::vec_dot_q6_K_q8_K_ref(cc, hw + r * nbb, hxx.data());
+
+        kata::block_q6_K * dw; kata::block_q8_K * dx; float * dout;
+        hipMalloc(&dw, q6->n_bytes); hipMalloc(&dx, nbb * sizeof(kata::block_q8_K)); hipMalloc(&dout, rr * 4);
+        hipMemcpy(dw, hw, q6->n_bytes, hipMemcpyHostToDevice);
+        hipMemcpy(dx, hxx.data(), nbb * sizeof(kata::block_q8_K), hipMemcpyHostToDevice);
+        const int rp6 = nbb <= 32 ? (32 / (int)nbb) : 1;
+        const dim3 gr6(nbb <= 32 ? (rr + rp6 - 1) / rp6 : rr), bl6(256);
+        gemv_q6_K_kernel<<<gr6, bl6>>>(dw, dx, dout, (int)rr, (int)nbb);
+        const auto e6 = hipDeviceSynchronize();
+        if (e6 != hipSuccess) { std::fprintf(stderr, "kernel: %s\n", hipGetErrorString(e6)); return 2; }
+        std::vector<float> gpu6(rr);
+        hipMemcpy(gpu6.data(), dout, rr * 4, hipMemcpyDeviceToHost);
+
+        double ma6 = 0, mr6 = 0;
+        for (size_t r = 0; r < rr; ++r) {
+            ma6 = std::max(ma6, std::fabs((double)gpu6[r] - (double)ref[r]));
+            mr6 = std::max(mr6, std::fabs((double)ref[r]));
+        }
+        const double tol6 = 1e-4 * mr6;
+        std::printf("accuracy vs cpu ref: max|abs| %.3e  largest |row| %.3f  tol %.3e -> %s\n",
+                    ma6, mr6, tol6, ma6 <= tol6 ? "OK" : "FAIL");
+
+        Event a, b2;
+        double best6 = 1e9;
+        for (int r = 0; r < 20; ++r) {
+            hipEventRecord(a.h);
+            gemv_q6_K_kernel<<<gr6, bl6>>>(dw, dx, dout, (int)rr, (int)nbb);
+            hipEventRecord(b2.h);
+            hipEventSynchronize(b2.h);
+            float ms = 0;
+            hipEventElapsedTime(&ms, a.h, b2.h);
+            best6 = std::min(best6, (double)ms);
+        }
+        std::printf("gpu: %.3f ms  %.1f GB/s (ceiling 764.3)\n", best6, q6->n_bytes / (best6 * 1e6));
+        hipFree(dw); hipFree(dx); hipFree(dout);
+        return ma6 <= tol6 ? 0 : 1;
     }
 
     const kata::GgufTensor * t = nullptr;
