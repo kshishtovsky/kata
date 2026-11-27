@@ -58,9 +58,11 @@ int main(int argc, char ** argv) {
     size_t n = std::strtoul(argv[3], nullptr, 10);
     size_t gen = 32;
     double gpu_gbs = 280.0;
+    double handoff_us = 28.0;   // measured, zero-copy: see EXP-0081
     for (int i = 4; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--gen") == 0) gen = std::strtoul(argv[i + 1], nullptr, 10);
         if (std::strcmp(argv[i], "--gpu-gbs") == 0) gpu_gbs = std::strtod(argv[i + 1], nullptr);
+        if (std::strcmp(argv[i], "--handoff-us") == 0) handoff_us = std::strtod(argv[i + 1], nullptr);
     }
 
     try {
@@ -223,7 +225,7 @@ int main(int argc, char ** argv) {
         std::printf("fixed per token: %.0f MB weights + %.0f MB KV at %zu positions (%.2f MB/pos)\n\n",
                     fixed_weight_bytes / 1e6, kv_bytes / 1e6, ctx_positions, kv_bytes_per_pos / 1e6);
         std::printf("%-14s %-8s %-9s %-9s %-9s %-7s\n",
-                    "VRAM budget", "experts", "today", "ideal", "chain", "loss");
+                    "VRAM budget", "experts", "today", "ideal", "chain", "tok/s", "loss");
         // Every layer's work depends on the previous layer on BOTH devices, so a
         // token's cost is the sum over layers of max(cpu_layer, gpu_layer), not
         // max(total cpu, total gpu). The gap between the two is the price of the
@@ -279,16 +281,23 @@ int main(int argc, char ** argv) {
                     t += std::max(cpu_b / cpu_rate, gpu_b / (gpu_gbs * 1e9));
                     if (is_moe) ++il_moe;
                 }
-                chain_sum += t;
+                // One handoff per layer: the layer's two devices cannot start
+                // until both hold the layer input, and neither the next layer
+                // nor the merge can proceed until both finish. Measured at
+                // 28 us with mapped host memory, 33 us with pinned staging.
+                chain_sum += t + m.n_layer() * handoff_us * 1e-6;
             }
             const double today_ms = 1000.0 * today_sum / (double)steps.size();
             const double ideal_ms = 1000.0 * ideal_sum / (double)steps.size();
             const double chain_ms = 1000.0 * chain_sum / (double)steps.size();
-            std::printf("%-14s %-8zu %-9.1f %-9.1f %-9.1f %.2fx\n",
+            std::printf("%-14s %-8zu %-9.1f %-9.1f %-9.1f %-8.1f %.2fx\n",
                         b.label, nres, today_ms, ideal_ms, chain_ms,
-                        chain_ms / std::max(ideal_ms, 1e-9));
+                        1000.0 / std::max(chain_ms, 1e-9), chain_ms / std::max(ideal_ms, 1e-9));
         }
-        std::printf("\ngpu-gbs %.0f assumed; CPU %.1f GB/s (achieved in a real decode)\n", gpu_gbs, cpu_rate / 1e9);
+        std::printf("\ngpu-gbs %.0f assumed; CPU %.1f GB/s (achieved in a real decode); "
+                    "handoff %.0f us x %zu layers = %.2f ms/token\n",
+                    gpu_gbs, cpu_rate / 1e9, handoff_us, m.n_layer(),
+                    m.n_layer() * handoff_us * 1e-3);
         std::printf("spread = max per-token CPU bytes vs mean, over the %zu captured steps\n",
                     rec.size());
     } catch (const std::exception & e) {
