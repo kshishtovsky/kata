@@ -3545,3 +3545,4 @@ here as "a pure engineering fix" was disproven in EXP-0055 -- it runs at 63 of a
 77 GB/s replicated ceiling, so it is already at the memory wall). Kernel tiling is
 third: 47% at n=2048 means at most a 2x there, and it is the hardest of the three.
 | EXP-0070 | q3_K on MoE gate/up experts | REJECTED | PPL −4.5% on WikiText-2 but +3.1% on source code; reconstruction error 2.1x worse than q4_K, so the gain is corpus-specific noise |
+| EXP-0071 | Continuous batching: measured curve and its ceiling | PASSED (measurement) | 3.09x total throughput at B=16 on a 16k prefix (31.7 -> 98.4 rows/s), 4.16x at B=32; naive B x forward() does not scale at all (31.3 ms/row at every B); achieved bandwidth peaks at 52.3 GB/s at B=16 and falls to 41.3 at B=64 because selected experts saturate at all 64, so the target batch is 8-16; batched B=1 is 1.7x slower than decode and must stay on GEMV |

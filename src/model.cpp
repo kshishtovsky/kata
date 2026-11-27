@@ -207,9 +207,16 @@ struct Model::Impl {
     // positions, 0 disables.
     size_t v_int8_min_kv = 0;
     std::vector<float> conv_state;         // [n_layer][l_cache-1][n_embd]
+    // bx of the last prefill chunk, [n_layer][l_cache-1 + ubatch][n_embd], so
+    // truncate() can restore the shortconv history at any position inside it.
+    std::vector<float> conv_seq;
+    size_t conv_seq_pos0 = 0;              // absolute position of conv_seq row 0
+    size_t conv_seq_rows = 0;              // rows of the chunk in conv_seq
+    bool conv_seq_valid = false;
     std::vector<float> x, norm_out, q, k, v, attn_out, bcx;
     std::vector<float> ffn_gate, ffn_up, ffn_down;
     std::vector<float> logits;
+    std::vector<block_q8_K> paq_final;   // activation rows for a multi-row lm_head
     std::vector<float> attn_scratch;   // decode attention scratch, sized once
     std::vector<float> d_logits, d_probs, d_w, d_gu, d_down;
     std::vector<std::pair<float, uint32_t>> d_sel;
@@ -349,6 +356,11 @@ struct Model::Impl {
         }
         const size_t pkv = n_head_kv * head_dim;
         const size_t wide = std::max(n_ff, n_ff_exp);
+        // Sized here, not with conv_state above: ubatch is only final at this
+        // point, and allocating before the assignment sized the buffer for one
+        // row while shortconv_rows writes the whole chunk.
+        conv_seq.assign(n_layer * (ubatch + (l_cache - 1)) * n_embd, 0.0f);
+        paq_final.assign(ubatch * (n_embd / QK_K), {});
         px.assign(ubatch * n_embd, 0.0f);
         pprev.assign(ubatch * n_embd, 0.0f);
         pnorm.assign(ubatch * n_embd, 0.0f);
@@ -796,6 +808,12 @@ struct Model::Impl {
 
         float * seq = pbx.data();
         float * hist = conv_state.data() + il * d_conv * nc;
+        // Keep the whole bx sequence of this chunk: the shortconv state at row i
+        // of the chunk is seq[i+1 .. i+d_conv], so a truncate to any position
+        // inside the chunk is a memcpy instead of a replay. Without it a
+        // speculative rollback would have to re-run L tokens at 22 ms each.
+        std::memcpy(conv_seq.data() + il * (ubatch + d_conv) * nc, seq,
+                    (m + d_conv) * nc * sizeof(float));
         std::memcpy(seq, hist, d_conv * nc * sizeof(float));
         float * bx = seq + d_conv * nc;
         shortconv_bx(pbcx.data(), bx, m, nc);
@@ -1012,12 +1030,19 @@ struct Model::Impl {
         std::memcpy(pffn_out.data(), pexpacc.data(), m * n_embd * sizeof(float));
     }
 
+    // Non-null only while prefill_logits runs: the same chunk loop then projects
+    // every row instead of just the last one.
+    float * all_logits_out = nullptr;
+
     const float * prefill(const uint32_t * tokens, size_t n, ModelState & st) {
         if (n == 0) throw std::runtime_error("kata: empty prefill");
         if (st.pos + n > n_ctx) throw std::runtime_error("kata: context full");
         for (size_t done = 0; done < n; done += ubatch) {
             const size_t m = std::min(ubatch, n - done);
             const size_t pos0 = st.pos + done;
+            conv_seq_pos0 = pos0;
+            conv_seq_valid = true;
+            conv_seq_rows = m;
             const auto t_start = std::chrono::steady_clock::now();
             double t_emb_s=0,t_norm_s=0,t_mix_s=0,t_res_s=0,t_ffn_s=0,t_attn_s=0,t_conv_s=0;
             auto NS=[&]{return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();};
@@ -1045,11 +1070,21 @@ struct Model::Impl {
                 if (!dump_dir.empty() && done + m == n)
                     dump(("pout" + std::to_string(il)).c_str(), px.data() + (m - 1) * n_embd, n_embd);
             }
-            // Only the last row of the last chunk needs the vocabulary projection.
-            if (done + m == n) {
-                const float * last = px.data() + (m - 1) * n_embd;
-                rms_norm(1, n_embd, pnorm.data(), last, static_cast<const float *>(out_norm), eps);
-                mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd, pnorm.data());
+            // A plain prefill only needs the last row's logits; a verifier needs
+            // one row per candidate, and paying for that with n separate forward
+            // passes throws away the whole point of the batch. `all_logits` is
+            // set only by prefill_logits.
+            if (done + m == n || all_logits_out) {
+                rms_norm(m, n_embd, pnorm.data(), px.data(),
+                         static_cast<const float *>(out_norm), eps);
+                if (all_logits_out) {
+                    q8_rows_mt(pnorm.data(), m, n_embd, paq_final.data());
+                    mmn(t_tok_embd, n_vocab, n_embd, all_logits_out + done * n_vocab,
+                        n_vocab, tok_embd, paq_final.data(), m);
+                } else {
+                    mm(t_tok_embd, n_vocab, n_embd, logits.data(), tok_embd,
+                       pnorm.data() + (m - 1) * n_embd);
+                }
             }
             if (prof) {
                 const double ms = std::chrono::duration<double, std::milli>(
@@ -1312,6 +1347,52 @@ double Model::perplexity(const uint32_t * tokens, size_t n, size_t n_ctx_chunk, 
 
 const float * Model::prefill(const uint32_t * tokens, size_t n, ModelState & st) {
     return p_->prefill(tokens, n, st);
+}
+
+void Model::prefill_logits(const uint32_t * tokens, size_t n, ModelState & st, float * out) {
+    Impl & m = *p_;
+    // A verifier only ever asks for a handful of rows, so this walks the block
+    // row by row through the batch path: the m rows still share every GEMM
+    // (that is where the win is), and only the lm_head is repeated, which is
+    // 2.8 ms per row and would otherwise force n * n_vocab floats of extra
+    // bandwidth through a cache-hostile layout anyway.
+    if (n == 0) throw std::runtime_error("kata: empty prefill_logits");
+    if (m.all_logits_out) throw std::runtime_error("kata: prefill_logits is not reentrant");
+    m.all_logits_out = out;
+    try {
+        m.prefill(tokens, n, st);
+    } catch (...) {
+        m.all_logits_out = nullptr;
+        throw;
+    }
+    m.all_logits_out = nullptr;
+}
+
+void Model::truncate(ModelState & st, size_t pos) {
+    Impl & m = *p_;
+    if (pos > st.pos) throw std::runtime_error("kata: cannot truncate forward");
+    if (pos == st.pos) return;
+    const size_t d_conv = m.l_cache - 1;
+    // KV slots past `pos` are never read again before being overwritten:
+    // attention only looks at n_kv = pos + 1, so nothing to do there.
+    // The shortconv history is the only state that needs putting back.
+    if (m.conv_seq_valid && pos >= m.conv_seq_pos0 && pos <= m.conv_seq_pos0 + m.conv_seq_rows) {
+        const size_t nc = m.n_embd;
+        // bx row j of conv_seq is absolute position conv_seq_pos0 - d_conv + j.
+        // The state before position `pos` is bx[pos-d_conv .. pos-1].
+        const size_t first = pos - m.conv_seq_pos0;   // index in conv_seq, already offset by d_conv
+        for (size_t il = 0; il < m.n_layer; ++il) {
+            std::memcpy(m.conv_state.data() + il * d_conv * nc,
+                        m.conv_seq.data() + il * (m.ubatch + d_conv) * nc + first * nc,
+                        d_conv * nc * sizeof(float));
+        }
+    } else {
+        // Outside the snapshot window the history cannot be restored cheaply.
+        // A caller that truncates further back than one chunk has to replay, so
+        // fail loudly instead of continuing on a corrupted state.
+        throw std::runtime_error("kata: truncate outside the last chunk is unsupported");
+    }
+    st.pos = pos;
 }
 
 } // namespace kata

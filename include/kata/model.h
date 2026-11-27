@@ -31,6 +31,19 @@ public:
     // 128k-wide lm_head, and computing them would cost more than the model.
     const float * prefill(const uint32_t * tokens, size_t n, ModelState & st);
 
+    // Same pass, but keeps the logits of EVERY row so a verifier can compare a
+    // drafted block against the target's greedy choice at each position. Costs
+    // n * n_vocab floats (a 8 x 128k block is 4 MB) and one extra lm_head per
+    // row, so it is only for verification, never for a plain prefill.
+    // `out` must hold n * n_vocab() floats; out[i*n_vocab + v] is row i.
+    void prefill_logits(const uint32_t * tokens, size_t n, ModelState & st, float * out);
+
+    // Rewinds the sequential state to `pos`. The KV cache needs no work (slots
+    // past `pos` are simply overwritten), but the shortconv ring buffers and the
+    // RNG-free position counter must be put back, or a rejected speculative tail
+    // silently corrupts the continuation.
+    void truncate(ModelState & st, size_t pos);
+
     // Teacher-forced negative log-likelihood over tokens[1 .. n-1], each chunk
     // of n_ctx tokens scored in a fresh context (the llama.cpp perplexity
     // convention, so the two are comparable). Returns the mean of

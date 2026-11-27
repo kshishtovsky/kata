@@ -76,6 +76,9 @@ target_link_libraries(bench_gemm PRIVATE kata_core)
 add_executable(bench_spec bench/bench_spec.cpp)
 target_link_libraries(bench_spec PRIVATE kata_core)
 
+add_executable(bench_batch bench/bench_batch.cpp)
+target_link_libraries(bench_batch PRIVATE kata_core)
+
 # Optional : compares our kernels against a local llama.cpp build.
 add_executable(bench_vs_ggml bench/bench_vs_ggml.cpp)
 target_link_libraries(bench_vs_ggml PRIVATE kata_core ${CMAKE_DL_LIBS})

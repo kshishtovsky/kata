@@ -1,0 +1,13 @@
+{
+  "slug": "speculative-draft-spike",
+  "stage": "analysis",
+  "goal": "Добавить ограниченный spike speculative decoding для LFM2.5-24B-A2B с двумя кандидатами draft LFM2.5 230M и 1.2B: проверить совместимость GGUF/token IDs, реализовать exact greedy verification, измерить acceptance и end-to-end throughput; не расширять решение при отсутствии выигрыша.",
+  "startedAt": "2026-11-26T23:55:13.003Z",
+  "updatedAt": "2026-11-26T23:55:13.024Z",
+  "history": [
+    {
+      "stage": "analysis",
+      "at": "2026-11-26T23:55:13.003Z"
+    }
+  ]
+}
