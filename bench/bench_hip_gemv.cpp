@@ -85,19 +85,19 @@ __global__ void gemv_q4_K_kernel(const kata::block_q4_K * __restrict__ w,
                                  int rows, int nb) {
     const int lane = threadIdx.x & 3;      // which 32-byte group of qs
     const int group = threadIdx.x >> 2;    // 0..63
-    const int nsb = nb * 8 / 2;            // super-blocks are one per 8 groups... see below
-    (void)nsb;
 
+    // Two layouts, both reduced inside the block:
+    //   nb <= 64  a block covers rpb whole rows, group g owns (g/nb, g%nb)
+    //   nb >  64  a block covers ONE row, group g owns super-blocks g, g+64, ...
+    const int rpb = nb <= 64 ? (64 / nb) : 1;
     int row, b;
     if (nb <= 64) {
-        row = group / nb;
+        row = blockIdx.x * rpb + group / nb;
         b = group % nb;
     } else {
         row = blockIdx.x;
         b = group;
     }
-    const int rpb = nb <= 64 ? (64 / nb) : 1;
-    if (nb <= 64) row += blockIdx.x * rpb;
 
     float acc = 0.0f;
     bool active = nb <= 64 ? (group < rpb * nb && row < rows) : (b < nb);
@@ -183,6 +183,38 @@ __global__ void gemv_q4_K_kernel(const kata::block_q4_K * __restrict__ w,
             out[blockIdx.x] = s;
         }
     }
+}
+
+// Ground truth in double. Comparing two float implementations cannot say which
+// is right -- an early gate at 1e-4 relative flagged 11 rows and was wrong: the
+// GPU was CLOSER to this reference than the CPU arm on those rows. Rows whose
+// dot product nearly cancels are where float order shows up, and only a higher
+// precision reference can separate "different rounding" from "wrong".
+double vec_dot_q4_K_q8_K_double(size_t n, const kata::block_q4_K * x, const kata::block_q8_K * y) {
+    double sum = 0.0;
+    for (size_t b = 0; b < n / kata::QK_K; ++b) {
+        const double d = (double)kata::f16_to_f32(x[b].d) * y[b].d;
+        const double dmin = (double)kata::f16_to_f32(x[b].dmin) * y[b].d;
+        int is = 0;
+        const uint8_t * q = x[b].qs;
+        for (int j = 0; j < kata::QK_K; j += 64) {
+            uint8_t sc, m;
+            long long a1 = 0, a2 = 0, s1 = 0, s2 = 0;
+            kata::q4_K_scale_min(is + 0, x[b].scales, &sc, &m);
+            for (int l = 0; l < 32; ++l) {
+                a1 += (long long)(q[l] & 0x0f) * y[b].qs[j + l];
+                a2 += (long long)(q[l] >> 4) * y[b].qs[j + 32 + l];
+                s1 += y[b].qs[j + l];
+                s2 += y[b].qs[j + 32 + l];
+            }
+            sum += d * (double)sc * (double)a1 - dmin * (double)m * (double)s1;
+            kata::q4_K_scale_min(is + 1, x[b].scales, &sc, &m);
+            sum += d * (double)sc * (double)a2 - dmin * (double)m * (double)s2;
+            q += 32;
+            is += 2;
+        }
+    }
+    return sum;
 }
 
 struct Event {
@@ -349,14 +381,22 @@ int main(int argc, char ** argv) {
     // not bit-exact, so compare relative to the row's magnitude.
     // Per-row relative error is meaningless for rows whose dot product is near
     // zero, so the gate is absolute, scaled by the largest |row| in the output.
-    double max_abs = 0, max_row = 0;
+    // Gate against double truth, not against the other float arm. The two float
+    // arms differ by up to 1.8e-4 relative on rows that nearly cancel, and on
+    // those rows the GPU is the closer one -- so "agrees with the CPU" is the
+    // wrong question and a CPU-relative gate would fail a correct kernel.
+    double max_abs = 0, max_row = 0, err_cpu = 0;
     for (size_t r = 0; r < rows; ++r) {
-        max_abs = std::max(max_abs, std::fabs((double)gpu[r] - (double)cpu[r]));
-        max_row = std::max(max_row, std::fabs((double)cpu[r]));
+        const double tru = vec_dot_q4_K_q8_K_double(cols, host_w + r * nb, host_x.data());
+        max_abs = std::max(max_abs, std::fabs((double)gpu[r] - tru));
+        err_cpu = std::max(err_cpu, std::fabs((double)cpu[r] - tru));
+        max_row = std::max(max_row, std::fabs(tru));
     }
-    const double tol = 1e-4 * max_row;
-    std::printf("accuracy: max|abs| %.3e  largest |row| %.3f  tol %.3e -> %s\n",
-                max_abs, max_row, tol, max_abs <= tol ? "OK" : "FAIL");
+    // f32 accumulation over 256 values per block cannot be expected below a few
+    // ULP of the magnitude, hence 1e-5 relative rather than exact.
+    const double tol = 1e-5 * max_row;
+    std::printf("accuracy: max|abs| vs double %.3e  (cpu arm %.3e)  largest |row| %.3f  tol %.3e -> %s\n",
+                max_abs, err_cpu, max_row, tol, max_abs <= tol ? "OK" : "FAIL");
     const size_t bad = max_abs <= tol ? 0 : 1;
 
     // Timing, best of several runs; the weight array stays in VRAM so this is
