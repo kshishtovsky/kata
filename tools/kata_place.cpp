@@ -127,6 +127,42 @@ int main(int argc, char ** argv) {
             expert_bytes = sum / static_cast<double>(g.u32("lfm2moe.expert_count"));
         }
 
+        // Fixed per-token bytes: all non-expert weights, plus one KV row per
+        // attention layer per position. Both are computed here rather than
+        // hard-coded at 16k, because the run's own prompt length is what the
+        // KV term depends on and a 16k figure in a 1k-token run silently
+        // overstates the buffer by 7x (the mistake EXP-0071 shipped).
+        size_t n_attn_layer = 0;
+        double fixed_weight_bytes = 0;
+        double kv_bytes_per_pos = 0;
+        {
+            kata::GgufFile g;
+            g.open(argv[1]);
+            // Everything that is not an expert matrix is read once per token.
+            for (const kata::GgufTensor & tn : g.tensors()) {
+                if (tn.name.find("_exps.") != std::string::npos) continue;
+                fixed_weight_bytes += (double)tn.n_bytes;
+            }
+            // The kv head count is not a metadata key in this architecture; it
+            // only shows up as attn_k's output width (src/model.cpp does the
+            // same). Guessing the key name is how this threw
+            // "missing key lfm2moe.attention.head_count_kv" the first time.
+            const double n_embd = (double)g.u32("lfm2moe.embedding_length");
+            const double n_head = (double)g.u32("lfm2moe.attention.head_count");
+            const double head_dim = n_embd / n_head;
+            double head_kv = 0;
+            for (const kata::GgufTensor & tn : g.tensors())
+                if (tn.name.find("attn_k.weight") != std::string::npos) {
+                    head_kv = (double)tn.dims[1] / head_dim;
+                    ++n_attn_layer;
+                }
+            if (head_kv == 0) throw std::runtime_error("kata: no attn_k tensor found");
+            // K and V, f32, one row per position per kv head, per attention layer.
+            kv_bytes_per_pos = 2.0 * head_kv * head_dim * 4.0 * (double)n_attn_layer;
+        }
+        const size_t ctx_positions = st.pos;
+        const double kv_bytes = kv_bytes_per_pos * (double)ctx_positions;
+
         // Rank experts pooled across layers -- the residency unit is one expert
         // of one layer, but pooling tells us whether heat is consistent.
         std::vector<uint64_t> pooled(n_expert, 0);
@@ -138,51 +174,66 @@ int main(int argc, char ** argv) {
 
         // Per-token byte cost for a residency set, using the REAL recorded
         // routing of each decode step rather than the pooled average.
-        auto cpu_bytes = [&](const std::vector<char> & resident) {
-            std::vector<double> per_token;
-            per_token.reserve(rec.size());
+        //
+        // `per_layer_cpu_bytes` is what the dependent chain needs: a token's
+        // layer i cannot start its router until every expert of layer i-1 has
+        // finished on BOTH devices, so the token costs sum(max(cpu_i, gpu_i))
+        // over layers, not max(sum(cpu), sum(gpu)). The second form is what a
+        // free-running traffic model computes, and it is an upper bound on
+        // speed that no scheduler can reach.
+        struct StepCost {
+            double all_bytes = 0;
+            std::vector<double> cpu_layer_bytes;   // per MoE layer, for this step
+        };
+        auto step_costs = [&](const std::vector<char> & resident) {
+            std::vector<StepCost> out;
+            out.reserve(rec.size());
             for (const auto & r : rec) {
-                size_t on_cpu = 0;
-                // resident[] is indexed [layer][expert]: expert 7 of layer 3
-                // and expert 7 of layer 4 are different bytes, so indexing by
-                // the bare expert id made every expert look resident and the
-                // curve flat at the all-CPU row.
-                for (size_t il = 0; il < nmoe; ++il)
+                StepCost sc;
+                sc.cpu_layer_bytes.assign(nmoe, 0.0);
+                for (size_t il = 0; il < nmoe; ++il) {
+                    size_t on_cpu = 0;
+                    // resident[] is indexed [layer][expert]: expert 7 of layer 3
+                    // and expert 7 of layer 4 are different bytes, so indexing by
+                    // the bare expert id made every expert look resident and the
+                    // curve flat at the all-CPU row.
                     for (size_t i = 0; i < nu; ++i)
                         if (!resident[il * n_expert + r.expert[il * nu + i]]) ++on_cpu;
-                per_token.push_back(static_cast<double>(on_cpu) * expert_bytes);
+                    sc.cpu_layer_bytes[il] = static_cast<double>(on_cpu) * expert_bytes;
+                    sc.all_bytes += sc.cpu_layer_bytes[il];
+                }
+                out.push_back(std::move(sc));
             }
-            return per_token;
+            return out;
         };
 
         std::printf("model: %zu layers, %zu MoE, %zu experts, %zu active, %.2f MB per expert\n",
                     m.n_layer(), nmoe, n_expert, nu, expert_bytes / 1e6);
         std::printf("decode steps captured: %zu, selections per token: %zu\n\n",
                     rec.size(), nmoe * nu);
-        std::printf("%-14s %-10s %-9s %-9s %-9s %-9s\n",
-                    "VRAM budget", "experts", "CPU MB", "CPU ms", "tok/s", "spread");
-
         const Budget budgets[] = {
             { 0, "0 (now)" }, { 1e9, "1 GB" }, { 2e9, "2 GB" }, { 4e9, "4 GB" },
             { 6e9, "6 GB" }, { 8e9, "8 GB" }, { 12e9, "12 GB" }, { 16e9, "16 GB" },
         };
-        // Per-token non-expert traffic at 16k decode (EXP-0071, from the GGUF):
-        // 591 MB fixed weights + 687 MB KV. Both scale with nothing but context
-        // length and are the first thing a small card should take.
-        const double fixed_mb = 591.0;
+        // 68.3 GB/s is what a real decode achieves on this machine (EXP-0069),
+        // not the 73.5 peak: using the peak makes every plan look better than
+        // the machine can deliver.
+        const double cpu_rate = 68.3e9;
+        const double fixed_bytes = fixed_weight_bytes + kv_bytes;
+        std::printf("fixed per token: %.0f MB weights + %.0f MB KV at %zu positions (%.2f MB/pos)\n\n",
+                    fixed_weight_bytes / 1e6, kv_bytes / 1e6, ctx_positions, kv_bytes_per_pos / 1e6);
+        std::printf("%-14s %-8s %-9s %-9s %-9s %-7s\n",
+                    "VRAM budget", "experts", "today", "ideal", "chain", "loss");
+        // Every layer's work depends on the previous layer on BOTH devices, so a
+        // token's cost is the sum over layers of max(cpu_layer, gpu_layer), not
+        // max(total cpu, total gpu). The gap between the two is the price of the
+        // dependency and it is what decides whether a hybrid is worth building.
         for (const Budget & b : budgets) {
-            // Fill the budget: fixed weights + KV first (they are read EVERY
-            // token, so they are worth more than any expert), then experts by
-            // heat.
             const size_t slots = static_cast<size_t>(m.n_layer() * n_expert);
             std::vector<char> resident(slots, 0);
-            const double fixed_bytes = (fixed_mb + 687.0) * 1e6;
             double left = b.bytes - fixed_bytes;
             size_t nres = 0;
             if (left > 0) {
-                // Placement is per (layer, expert): rank by that layer's own
-                // counts, since expert 7 of layer 3 and of layer 4 are
-                // unrelated bytes.
                 std::vector<std::pair<uint64_t, size_t>> ranked;
                 ranked.reserve(slots);
                 for (size_t il = 0; il < m.n_layer(); ++il)
@@ -199,28 +250,45 @@ int main(int argc, char ** argv) {
                     ++nres;
                 }
             }
-            const std::vector<double> per = cpu_bytes(resident);
-            double sum = 0, mx = 0;
-            for (double v : per) { sum += v; mx = std::max(mx, v); }
-            const double mean = sum / per.size();
-            // CPU time for the remaining expert bytes; the fixed weights and KV
-            // are on the GPU in every row with a budget > 0, and stay on the CPU
-            // in the baseline row.
             const bool gpu_has_fixed = b.bytes > fixed_bytes;
-            const double cpu_mb = mean / 1e6 + (gpu_has_fixed ? 0.0 : fixed_mb + 687.0);
-            const double cpu_ms = cpu_mb / 73.5;
-            const double gpu_ms = gpu_has_fixed
-                ? (fixed_mb + 687.0) / gpu_gbs
-                : 0.0;
-            // Both devices run concurrently and a token waits for the slower
-            // one. Expert work is split by placement, so CPU and GPU each pay
-            // their own share; the token is max(), not sum().
-            const double ms = std::max(cpu_ms, gpu_ms);
-            std::printf("%-14s %-9zu %-9.0f %-9.2f %-9.1f %.0f%%\n",
-                        b.label, nres, cpu_mb, cpu_ms, 1000.0 / std::max(ms, 1e-6),
-                        100.0 * (mx - mean) / std::max(mean, 1e-9));
+            const std::vector<StepCost> steps = step_costs(resident);
+
+            // Fixed bytes are split evenly per layer: an approximation, stated
+            // as one. It matters only for the chain column, where a layer's
+            // fixed share is the floor under its max().
+            const double fixed_per_layer = fixed_bytes / (double)m.n_layer();
+            double today_sum = 0, ideal_sum = 0, chain_sum = 0;
+            for (const StepCost & sc : steps) {
+                today_sum += (sc.all_bytes + fixed_bytes) / cpu_rate;
+                // No dependency: the token waits for the slower device once.
+                const double cpu_tot = (sc.all_bytes + (gpu_has_fixed ? 0.0 : fixed_bytes)) / cpu_rate;
+                const double gpu_tot = gpu_has_fixed ? fixed_bytes / (gpu_gbs * 1e9) : 0.0;
+                ideal_sum += std::max(cpu_tot, gpu_tot);
+                double t = 0;
+                size_t il_moe = 0;
+                for (size_t il = 0; il < m.n_layer(); ++il) {
+                    const double ex = (il_moe < nmoe) ? sc.cpu_layer_bytes[il_moe] : 0.0;
+                    const bool is_moe = (il_moe < nmoe);
+                    // A weight lives on exactly ONE device. Leaving the fixed
+                    // share on the CPU while also charging it to the GPU made
+                    // chain == today for every budget (the CPU term was always
+                    // the larger, so the GPU never won a layer).
+                    const double cpu_b = (gpu_has_fixed ? 0.0 : fixed_per_layer) + ex;
+                    const double gpu_b = (gpu_has_fixed ? fixed_per_layer : 0.0) +
+                                         ((is_moe ? 1.0 : 0.0) * expert_bytes * nu - ex);
+                    t += std::max(cpu_b / cpu_rate, gpu_b / (gpu_gbs * 1e9));
+                    if (is_moe) ++il_moe;
+                }
+                chain_sum += t;
+            }
+            const double today_ms = 1000.0 * today_sum / (double)steps.size();
+            const double ideal_ms = 1000.0 * ideal_sum / (double)steps.size();
+            const double chain_ms = 1000.0 * chain_sum / (double)steps.size();
+            std::printf("%-14s %-8zu %-9.1f %-9.1f %-9.1f %.2fx\n",
+                        b.label, nres, today_ms, ideal_ms, chain_ms,
+                        chain_ms / std::max(ideal_ms, 1e-9));
         }
-        std::printf("\ngpu-gbs %.0f assumed; CPU ceiling 73.5 GB/s measured\n", gpu_gbs);
+        std::printf("\ngpu-gbs %.0f assumed; CPU %.1f GB/s (achieved in a real decode)\n", gpu_gbs, cpu_rate / 1e9);
         std::printf("spread = max per-token CPU bytes vs mean, over the %zu captured steps\n",
                     rec.size());
     } catch (const std::exception & e) {
