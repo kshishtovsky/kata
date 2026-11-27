@@ -625,6 +625,39 @@ int main(int argc, char ** argv) {
                     td, 22.5 - 14.20 + td, 1e3 / (22.5 - 14.20 + td));
         std::printf("  vs arm C 3.663 ms -> %.2fx\n", 3.663 / td);
         if (!(td < 3.663)) std::printf("  NOTE: arm D did not beat C\n");
+
+        // ---- EXP-0088: what a device router would actually buy ------------
+        //
+        // Arm D's remaining cost is 38 waits: the host router sits inside the
+        // layer loop, so each layer needs its experts decided before its
+        // launches. A device router removes the wait entirely -- so measure the
+        // wait by removing it, keeping the launches identical. One sync for the
+        // whole token instead of 38.
+        //
+        // This is a FLOOR, not a router: the activation row is constant across
+        // layers here, which is exactly the dependency a real router would have
+        // to satisfy (layer i's output feeding layer i+1's router). A real
+        // device router must pay one 2048-wide dot per expert per layer, which
+        // is 0.5 MB of weights against this arm's 24 MB/layer -- 2% of the
+        // stream, so the floor is close to the achievable number.
+        auto pass_no_sync = [&] {
+            for (int l = 0; l < n_moe; ++l) {
+                gemv_q4_K_ptrs<<<g4r * n_used, bl>>>(dgate + (size_t)l * n_used, dx, dout, rows, gate_nb, n_used);
+                gemv_q4_K_ptrs<<<g4r * n_used, bl>>>(dup + (size_t)l * n_used, dx, dout, rows, gate_nb, n_used);
+                gemv_q6_K_ptrs<<<g6r * n_used, bl>>>(ddown + (size_t)l * n_used, dx, dsout, dn_rows, down_nb, n_used);
+                weighted_sum<<<(dn_rows + 255) / 256, bl>>>(dsout, n_used, dn_rows, dw, dcomb);
+            }
+            CK(hipDeviceSynchronize());
+        };
+        pass_no_sync();                                // warm
+        const double te = bench(pass_no_sync);
+        std::printf("\nEXP-0088 no per-layer wait (1 sync/token, %d launches):\n", launches_d);
+        std::printf("  E %.3f ms  (D minus per-layer waits: %.3f ms = %.1f us x %d layers)\n",
+                    te, td - te, 1e3 * (td - te) / n_moe, n_moe);
+        std::printf("  -> token: 22.5 - 14.20 + %.3f = %.2f ms = %.1f tok/s\n",
+                    te, 22.5 - 14.20 + te, 1e3 / (22.5 - 14.20 + te));
+        if (!(te < td)) std::printf("  NOTE: removing the waits did not help -- they were overlapped\n");
+
         (void)hipHostFree(hcomb);
         CK(hipFree(dgate));
         CK(hipFree(dup));
